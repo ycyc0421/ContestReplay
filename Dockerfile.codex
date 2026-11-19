@@ -1,0 +1,8 @@
+FROM node:24-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils && rm -rf /var/lib/apt/lists/* \
+    && npm install -g @openai/codex@0.170.0 && codex --version
+WORKDIR /app
+COPY dist/bridge.js ./
+RUN printf '{"type":"module"}\n' > package.json
+USER node
+ENTRYPOINT ["node", "/app/bridge.js"]

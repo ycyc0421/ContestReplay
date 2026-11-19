@@ -1,0 +1,7 @@
+**
+!Dockerfile
+!Dockerfile.codex
+!dist/
+!dist/worker.js
+!dist/wire.js
+!dist/bridge.js

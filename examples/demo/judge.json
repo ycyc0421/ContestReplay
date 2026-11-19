@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "problems": [
+    {
+      "id": "1",
+      "max_points": 3,
+      "accepted_answers": [
+        "3"
+      ]
+    },
+    {
+      "id": "2",
+      "max_points": 5,
+      "accepted_answers": [
+        "12"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "name": "@ycyc0421/contestreplay",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@12.17.0",
+  "bin": {
+    "cr": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "pnpm build && node --test",
+    "test:docker": "pnpm build && CR_TEST_DOCKER=1 node --test test/docker.test.js",
+    "test:codex": "pnpm build && CR_TEST_CODEX=1 node --test test/codex.test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "openai": "^6.0.0",
+    "parse5": "^8.1.1",
+    "smol-toml": "^1.6.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
