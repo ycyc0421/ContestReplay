@@ -1,4 +1,5 @@
-import { writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { rename, rm, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { z } from 'zod';
 import { agentToml, resolveAgentManifest, resolveContest } from './config.js';
@@ -19,8 +20,20 @@ export async function saveAgentManifest(path: string, raw: unknown, store = new 
   return persistAgentManifest(target, manifestProvider(manifest), serializeDocument(manifest, format), store);
 }
 
-export async function persistAgentManifest(target: string, connection: string, serialized: string, store: Connections) {
-  await store.register(connection, target, () => writeFile(target, serialized, { mode: 0o600, flag: 'wx' }));
+export async function persistAgentManifest(target: string, connection: string, serialized: string, store: Connections, overwrite = false) {
+  if (!overwrite) {
+    await store.register(connection, target, () => writeFile(target, serialized, { mode: 0o600, flag: 'wx' }));
+    return target;
+  }
+  await store.register(connection, target, async () => {
+    const tmp = `${target}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(tmp, serialized, { mode: 0o600, flag: 'wx' });
+      await rename(tmp, target);
+    } finally {
+      await rm(tmp, { force: true });
+    }
+  });
   return target;
 }
 

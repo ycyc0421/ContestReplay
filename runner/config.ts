@@ -5,6 +5,7 @@ import { dirname, resolve } from 'node:path';
 import { agentKind, agentNameSchema, manifestProvider, resolveManifest } from './agent-manifest.js';
 import { connectionProtocolSchema, Connections, endpoint } from './connections.js';
 import { builtinModel, codexModel, effectiveFor, efforts, harness, responsesServiceTier, speedTierSchema, type HarnessEnv, type NativeOverride } from './harnesses.js';
+import { ojAccountId, ojHandle, ojPoolName } from './oj-accounts.js';
 import { protocolPresetNames, protocolPresets, resolveProtocolPreset, scoringModes } from './protocol.js';
 import { canonical, documentFormat, parseDocumentText, serializeDocument } from './serialization.js';
 import { z } from 'zod';
@@ -19,10 +20,58 @@ const source = z.strictObject({ name: z.string().trim().min(1), url: z.url({ pro
 const common = { contest_id: id, data_version: version, title: z.string().trim().min(1), source };
 const legacyContest = z.strictObject({ schema_version: z.literal(1), ...common, statement: artifact.required(), judge: artifact.required() });
 export const localBackend = z.strictObject({ kind: z.literal('local'), answers: artifact });
-export const codeforcesBackend = z.strictObject({ kind: z.literal('codeforces'), contest_id: version,
-  handle: z.string().regex(/^[A-Za-z0-9_.-]{1,50}$/), languages: z.record(id, version),
+const remoteLanguageId = z.string().trim().min(1).max(64);
+const remoteProblemTarget = z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9._:/-]+$/);
+const settlementMsSchema = z.number().int().min(1000).max(1_800_000);
+const remoteContestRef = z.union([version, z.string().trim().min(1).max(128)]);
+export const codeforcesBackend = z.strictObject({
+  kind: z.literal('codeforces'),
+  contest_id: version,
+  gym: z.boolean().optional(),
+  handle: z.string().regex(/^[A-Za-z0-9_.-]{1,50}$/).optional(),
+  account_id: ojAccountId.optional(),
+  pool: ojPoolName.optional(),
+  base_url: endpoint.optional(),
+  languages: z.record(id, z.union([version, remoteLanguageId])),
   problem_map: z.record(id, z.string().regex(/^[A-Za-z0-9]{1,12}$/)).optional(),
-  points_known: z.boolean().optional() });
+  points_known: z.boolean().optional(),
+  settlement_ms: settlementMsSchema.optional(),
+});
+export const qojBackend = z.strictObject({
+  kind: z.literal('qoj'),
+  contest_id: remoteContestRef.optional(),
+  account_id: ojAccountId.optional(),
+  pool: ojPoolName.optional(),
+  handle: ojHandle.optional(),
+  base_url: endpoint.optional(),
+  languages: z.record(id, remoteLanguageId),
+  problem_map: z.record(id, remoteProblemTarget).optional(),
+  settlement_ms: settlementMsSchema.optional(),
+});
+export const vjudgeBackend = z.strictObject({
+  kind: z.literal('vjudge'),
+  contest_id: remoteContestRef.optional(),
+  account_id: ojAccountId.optional(),
+  pool: ojPoolName.optional(),
+  handle: ojHandle.optional(),
+  base_url: endpoint.optional(),
+  languages: z.record(id, remoteLanguageId),
+  problem_map: z.record(id, remoteProblemTarget).optional(),
+  settlement_ms: settlementMsSchema.optional(),
+});
+export const hydroBackend = z.strictObject({
+  kind: z.literal('hydro'),
+  base_url: endpoint,
+  domain: z.string().trim().min(1).max(128).optional(),
+  contest_id: z.string().trim().min(1).max(128).optional(),
+  live_contest: z.boolean().optional(),
+  account_id: ojAccountId.optional(),
+  pool: ojPoolName.optional(),
+  handle: ojHandle.optional(),
+  languages: z.record(id, remoteLanguageId),
+  problem_map: z.record(id, remoteProblemTarget).optional(),
+  settlement_ms: settlementMsSchema.optional(),
+});
 const problem = z.strictObject({ id, max_points: version });
 const unique = (problems: { id: string; max_points: number }[]) => new Set(problems.map(p => p.id)).size === problems.length &&
   Number.isSafeInteger(problems.reduce((sum, p) => sum + p.max_points, 0));
@@ -31,13 +80,21 @@ export const contestSchema = z.strictObject({ schema_version: z.literal(2), ...c
   materials: z.strictObject({ entrypoint: artifact.extend({ kind: z.literal('pdf') }),
     attachments: z.array(artifact.extend({ name: id.refine(n => n !== 'problems.pdf') })).max(32).default([]) }),
   problems: z.array(problem).min(1).max(100).refine(unique, 'Invalid problem set').optional(),
-  judge: z.discriminatedUnion('kind', [localBackend, codeforcesBackend]),
+  judge: z.discriminatedUnion('kind', [localBackend, codeforcesBackend, qojBackend, vjudgeBackend, hydroBackend]),
   rules: z.strictObject({
     time_limit_ms: z.number().int().min(1000).max(8 * 60 * 60_000).default(900_000),
     max_submissions: z.number().int().min(1).max(1000).default(100),
     protocol_preset: z.enum(protocolPresetNames).optional(),
     scoring_mode: z.enum(scoringModes).optional(),
   }).default({ time_limit_ms: 900_000, max_submissions: 100 }),
+}).superRefine((value, ctx) => {
+  if (value.judge.kind === 'codeforces' && !value.judge.handle && !value.judge.account_id && !value.judge.pool) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['judge', 'handle'],
+      message: 'Codeforces judge requires at least one of handle, account_id, or pool',
+    });
+  }
 });
 export const judgeSchema = z.strictObject({ schema_version: z.literal(1),
   problems: z.array(problem.extend({ accepted_answers: z.array(z.string().min(1).max(4096).refine(s => s.trim() === s)).min(1) })).min(1).max(100),
@@ -128,19 +185,34 @@ export async function resolveContest(raw: unknown, contestPath: string) {
       !localJudge!.problems.some(q => q.id === p.id && q.max_points === p.max_points)))) throw new Error('Problem IDs/points do not match local judge');
     v.problems ??= localJudge.problems.map(({ id, max_points }) => ({ id, max_points }));
   } else {
-    if (!v.problems || !Object.keys(v.judge.languages).length) throw new Error('Codeforces requires explicit problems and language IDs');
+    if (!v.problems || !Object.keys(v.judge.languages).length) {
+      throw new Error(`${v.judge.kind} requires explicit problems and language IDs`);
+    }
     const mapping = v.judge.problem_map ?? {};
-    if (Object.keys(mapping).some(key => !v.problems!.some(p => p.id === key))) throw new Error('Unknown problem in Codeforces mapping');
+    if (Object.keys(mapping).some(key => !v.problems!.some(p => p.id === key))) {
+      throw new Error(`Unknown problem in ${v.judge.kind} mapping`);
+    }
     const targets = v.problems.map(p => Object.hasOwn(mapping, p.id) ? mapping[p.id]! : p.id);
-    if (new Set(targets).size !== targets.length || targets.some(t => !/^[A-Za-z0-9]{1,12}$/.test(t))) throw new Error('Invalid or duplicate Codeforces target');
+    const targetPattern = v.judge.kind === 'codeforces' ? /^[A-Za-z0-9]{1,12}$/ : /^[A-Za-z0-9._:/-]{1,128}$/;
+    if (new Set(targets).size !== targets.length || targets.some(t => !targetPattern.test(t))) {
+      throw new Error(`Invalid or duplicate ${v.judge.kind} target`);
+    }
   }
   const contest = { ...v, problems: v.problems!, statement: v.materials.entrypoint };
-  const cf = v.judge.kind === 'codeforces' ? v.judge : undefined;
-  const judgeDefinition = v.judge.kind === 'local' ? { kind: v.judge.kind, sha256: v.judge.answers.sha256 } : {
-    kind: v.judge.kind, contest_id: v.judge.contest_id,
-    problem_map: v.problems!.map(p => [p.id, Object.hasOwn(cf?.problem_map ?? {}, p.id) ? cf!.problem_map![p.id] : p.id]),
-    languages: Object.entries(v.judge.languages).sort(([a], [b]) => a.localeCompare(b)),
-  };
+  const judgeDefinition = v.judge.kind === 'local'
+    ? { kind: v.judge.kind, sha256: v.judge.answers.sha256 }
+    : (() => {
+        const remoteJudge = v.judge;
+        const mapping = remoteJudge.problem_map ?? {};
+        return {
+          kind: remoteJudge.kind,
+          ...(remoteJudge.contest_id !== undefined ? { contest_id: remoteJudge.contest_id } : {}),
+          ...(remoteJudge.kind === 'codeforces' && remoteJudge.gym ? { gym: true } : {}),
+          ...(remoteJudge.kind === 'hydro' && remoteJudge.domain !== undefined ? { domain: remoteJudge.domain } : {}),
+          problem_map: v.problems!.map(p => [p.id, Object.hasOwn(mapping, p.id) ? mapping[p.id] : p.id]),
+          languages: Object.entries(remoteJudge.languages).sort(([a], [b]) => a.localeCompare(b)),
+        };
+      })();
   const contestRevision = sha256(JSON.stringify({ materials: [paper.hash, ...v.materials.attachments.map(a => [a.name, a.sha256])],
     problems: v.problems, rules: v.rules, judge: judgeDefinition }));
   return { contest, contestPath, contestRevision, contestDigest: sha256(JSON.stringify(v)), pdf: paper.bytes, attachments,
