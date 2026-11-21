@@ -24,7 +24,7 @@ export const planSchema = z.strictObject({ schema_version: z.literal(2), protoco
   jobs: z.array(z.strictObject({
     image: imageRef, harness: z.enum(['builtin-responses', 'codex']), model_family_id: z.string().optional(),
     agent_path: absPath, agent_id: z.string().min(1), agent_name: z.string().min(1).max(120).optional(),
-    speed_tier: speedTierSchema.optional(), credential_source: z.string().min(1).max(256).optional(),
+    speed_tier: speedTierSchema.optional(), credential_source: z.string().min(1).max(256),
     agent_revision: digest,
     agent_sha256: digest, profile_sha256: digest, native_sha256: digest.optional(), effective_sha256: digest.optional(),
     contest_path: absPath, contest_id: z.string().min(1), data_version: z.number().int().positive(), contest_sha256: digest,
@@ -82,7 +82,7 @@ export async function makePlan(raw: unknown, base: string, getImage = inspectIma
       contest_sha256: input.contestDigest, protocol_preset: resolveProtocolPreset(input.contest.rules),
     });
   }
-  if (new Set(agents.map(a => JSON.stringify([a.entry.agent_id, a.baseRevision]))).size !== agents.length ||
+  if (new Set(agents.map(a => JSON.stringify([a.entry.agent_id, a.baseRevision, a.entry.speed_tier ?? 'standard']))).size !== agents.length ||
       new Set(contests.map(c => JSON.stringify([c.contest_id, c.data_version, c.contest_sha256]))).size !== contests.length) {
     throw new Error('Duplicate Agent or Contest revision in a matrix axis');
   }
@@ -132,7 +132,7 @@ function verifyAgent(job: PlanJob, input: AgentInput, contest: ContestInput['con
   if (input.agent.agent_id !== job.agent_id ||
       input.profile.harness !== job.harness || input.profile.model_family_id !== job.model_family_id ||
       (job.speed_tier ?? 'standard') !== (input.speedTier ?? 'standard') ||
-      (job.credential_source !== undefined && job.credential_source !== credentialSourceFor(input)) ||
+      job.credential_source !== credentialSourceFor(input) ||
       input.profileDigest !== job.profile_sha256 || input.nativeDigest !== job.native_sha256 || input.effectiveDigest !== job.effective_sha256 ||
       agentRevision(input, job.image, protocolDigestForPreset(expectedPreset)) !== job.agent_revision) {
     throw new Error('Agent inputs changed; regenerate the plan');

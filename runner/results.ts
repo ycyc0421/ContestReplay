@@ -94,6 +94,17 @@ const isNonPenalized = (verdict: string) => [
   'pending', 'already_accepted',
   'invalid_submission', 'SKIPPED', 'REJECTED',
 ].includes(verdict);
+const isUnambiguouslyZeroVerdict = (verdict: string) => [
+  'wrong_answer', 'WRONG_ANSWER', 'WA',
+  'time_limit_exceeded', 'TIME_LIMIT_EXCEEDED', 'TLE',
+  'memory_limit_exceeded', 'MEMORY_LIMIT_EXCEEDED', 'MLE',
+  'runtime_error', 'RUNTIME_ERROR', 'RE',
+  'compilation_error', 'COMPILATION_ERROR', 'CE',
+  'presentation_error', 'PE',
+  'idleness_limit_exceeded', 'ILE',
+  'invalid_submission', 'SKIPPED', 'REJECTED',
+  'pending', 'already_accepted',
+].includes(verdict);
 
 export async function exportRun(root: string, id: string): Promise<Result> {
   const directory = join(root, z.uuid().parse(id));
@@ -368,8 +379,13 @@ export function scoreResult(result: Result, mode: ScoringMode = result.scoring_m
   let missingCfWeight = false;
   let lastAcMs = 0;
   let lastImproveMs = 0;
-  const canComputeIoiFromSubs = result.submissions.some(s => typeof s.score === 'number' || typeof s.max_points === 'number')
-    && result.submissions.every(s => !isAccepted(s.verdict) || typeof s.score === 'number' || typeof s.max_points === 'number');
+  const hasCompleteIoiEvidence = result.submissions.every(s => {
+    if (typeof s.score === 'number') return true;
+    if (isAccepted(s.verdict)) return typeof s.max_points === 'number';
+    return isUnambiguouslyZeroVerdict(s.verdict);
+  });
+  const hasAnyIoiScoreEvidence = result.submissions.some(s => typeof s.score === 'number' || (isAccepted(s.verdict) && typeof s.max_points === 'number'));
+  const canComputeIoiFromSubs = hasCompleteIoiEvidence && (hasAnyIoiScoreEvidence || result.score === 0);
 
   for (const [problemId, subs] of byProblem) {
     const ordered = subs.map((s, idx) => ({ s, idx })).sort((a, b) => a.s.elapsed_ms - b.s.elapsed_ms || a.idx - b.idx).map(x => x.s);
@@ -492,7 +508,7 @@ export type RankedEntry = {
 };
 
 export type RankedRow = RankedEntry & {
-  rank: number;
+  rank: number | null;
   variants?: RankedEntry[];
 };
 
@@ -514,16 +530,23 @@ export function rankResults(bundle: unknown, familyOrOpts?: string | RankOptions
   }
   return [...group.values()].map(rows => {
     const mode = opts.scoring ?? rows.find(r => r.scoring_mode)?.scoring_mode ?? 'last_ac';
+    // Rankable entries always sort ahead of entries whose score cannot be recomputed in the selected mode.
     const sorted: RankedEntry[] = rows
       .map(result => {
         const scoring = scoreResult(result, mode);
         return { result, finish_ms: scoring.tie_break_ms, scoring };
       })
-      .sort((a, b) => compareScoredResults(a.scoring, b.scoring) || a.result.run_id.localeCompare(b.result.run_id));
+      .sort((a, b) =>
+        Number(Boolean(a.scoring.scoring_unavailable)) - Number(Boolean(b.scoring.scoring_unavailable)) ||
+        compareScoredResults(a.scoring, b.scoring) ||
+        a.result.run_id.localeCompare(b.result.run_id),
+      );
 
     if (groupBy === 'model') {
       // Policy C: group first by canonical (vendor, requested_model), then deduplicate
       // distinct (agent_id, agent_revision, reasoning_effort, speed_tier) variants within each group.
+      // Because `sorted` places rankable entries first, a rankable variant is always chosen as primary
+      // over an unrankable one; models with only unrankable variants receive rank: null.
       const modelGroups = new Map<string, { seenVariants: Set<string>; variants: RankedEntry[] }>();
       for (const row of sorted) {
         const modelKey = JSON.stringify([(row.result.model.vendor ?? '').toLowerCase(), row.result.model.requested]);
@@ -545,8 +568,11 @@ export function rankResults(bundle: unknown, familyOrOpts?: string | RankOptions
       let rank = 0;
       let index = 0;
       let prev: RankedEntry | undefined;
-      return [...modelGroups.values()].map(({ variants }) => {
+      return [...modelGroups.values()].map<RankedRow>(({ variants }) => {
         const primary = variants[0]!;
+        if (primary.scoring.scoring_unavailable) {
+          return { rank: null, ...primary, variants };
+        }
         index++;
         if (!prev || compareScoredResults(prev.scoring, primary.scoring) !== 0) rank = index;
         prev = primary;
@@ -558,10 +584,13 @@ export function rankResults(bundle: unknown, familyOrOpts?: string | RankOptions
     let rank = 0;
     let index = 0;
     let prev: RankedEntry | undefined;
-    return sorted.flatMap(row => {
+    return sorted.flatMap<RankedRow>(row => {
       const key = JSON.stringify([row.result.agent_id, row.result.agent_revision, row.result.model.speed_tier ?? 'standard']);
       if (seen.has(key)) return [];
       seen.add(key);
+      if (row.scoring.scoring_unavailable) {
+        return [{ rank: null, ...row }];
+      }
       index++;
       if (!prev || compareScoredResults(prev.scoring, row.scoring) !== 0) rank = index;
       prev = row;

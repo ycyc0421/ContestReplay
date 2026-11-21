@@ -32,7 +32,7 @@ export async function cfApi(method: 'user.status' | 'contest.standings', params:
 }
 export async function importCodeforces(contest: number, signal?: AbortSignal) {
   return z.object({ status: z.literal('OK'), result: z.object({ contest: z.object({ name: z.string(), phase: z.literal('FINISHED') }),
-    problems: z.array(z.object({ index: z.string() })).min(1) }) }).parse(await cfApi('contest.standings', {
+    problems: z.array(z.object({ index: z.string(), points: z.number().positive().optional() })).min(1) }) }).parse(await cfApi('contest.standings', {
     contestId: String(contest),
   }, signal)).result;
 }

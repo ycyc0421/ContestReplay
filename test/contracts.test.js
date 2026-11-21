@@ -13,7 +13,7 @@ import { createServer, request as httpRequest } from 'node:http';
 import { connect as netConnect } from 'node:net';
 import { readFile, stat } from 'node:fs/promises';
 import { assertCompatible } from '../dist/plan.js';
-import { checkChatOrMessagesRequest, checkModelRequest, resolveRelayTarget, serveContestChannels } from '../dist/codex.js';
+import { checkChatOrMessagesRequest, checkModelRequest, checkResponsesCompactRequest, resolveRelayTarget, serveContestChannels } from '../dist/codex.js';
 import { protocolForPreset } from '../dist/protocol.js';
 
 test('program judge stays pending without blocking and settles against the received timestamp', async () => {
@@ -81,15 +81,24 @@ test('relay enforces strict route/method/header/model allowlists, maps service_t
   assert.throws(() => resolveRelayTarget('https://api.openai.com/v1', '//evil.example/v1/responses'), /Invalid relay path/);
   assert.throws(() => resolveRelayTarget('https://api.openai.com/v1', 'https://evil.example/v1/responses'), /Invalid relay path/);
 
-  // Chat / Messages model & remote tool/file checks
+  // Chat / Messages model & remote tool/file checks + cross-protocol key rejection + service_tier stripping
   assert.throws(() => checkChatOrMessagesRequest({ model: 'other', messages: [] }, 'expected', '/chat/completions'));
+  assert.throws(() => checkChatOrMessagesRequest({ model: 'expected', input: 'mixed', messages: [] }, 'expected', '/chat/completions'));
+  assert.throws(() => checkChatOrMessagesRequest({ model: 'expected', previous_response_id: 'r1', messages: [] }, 'expected', '/chat/completions'));
+  assert.throws(() => checkChatOrMessagesRequest({ model: 'expected', prompt: 'mixed', messages: [] }, 'expected', '/messages'));
+  assert.throws(() => checkModelRequest({ model: 'expected', input: 'hi', messages: [] }, 'expected'));
   assert.throws(() => checkChatOrMessagesRequest({ model: 'expected', web_search_options: {}, messages: [] }, 'expected', '/chat/completions'));
   assert.throws(() => checkChatOrMessagesRequest({ model: 'expected', tools: [{ type: 'web_search' }], messages: [] }, 'expected', '/chat/completions'));
   assert.throws(() => checkChatOrMessagesRequest({ model: 'expected', messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://evil.test/x.png' } }] }] }, 'expected', '/chat/completions'));
   assert.throws(() => checkChatOrMessagesRequest({ model: 'expected', mcp_servers: [], messages: [] }, 'expected', '/messages'));
   assert.throws(() => checkChatOrMessagesRequest({ model: 'expected', tools: [{ type: 'web_search_20250305', name: 'ws' }], messages: [] }, 'expected', '/messages'));
   assert.throws(() => checkChatOrMessagesRequest({ model: 'expected', messages: [{ role: 'user', content: [{ type: 'document', source: { type: 'url', url: 'https://evil.test/a.pdf' } }] }] }, 'expected', '/messages'));
-  assert.equal(checkChatOrMessagesRequest({ model: 'expected', store: true, messages: [] }, 'expected', '/chat/completions').store, false);
+  const sanitizedChat = checkChatOrMessagesRequest({ model: 'expected', store: true, service_tier: 'priority', messages: [] }, 'expected', '/chat/completions');
+  assert.equal(sanitizedChat.store, false);
+  assert.equal(sanitizedChat.service_tier, undefined);
+  const sanitizedCompact = checkResponsesCompactRequest({ model: 'expected', input: 'hi', store: true, service_tier: 'priority' }, 'expected');
+  assert.equal('store' in sanitizedCompact, false);
+  assert.equal('service_tier' in sanitizedCompact, false);
 
   const seen = [];
   let holdResponsesAfterCompleted = false;
@@ -113,6 +122,12 @@ test('relay enforces strict route/method/header/model allowlists, maps service_t
       res.write(`event: message_start\ndata:${JSON.stringify({ type: 'message_start', message: { id: 'msg-1', model: 'gpt-5.3-codex', usage: { input_tokens: 50, output_tokens: 1 } } })}\n\n`);
       res.write(`event: message_delta\ndata:${JSON.stringify({ type: 'message_delta', usage: { output_tokens: 15 } })}\n\n`);
       res.end(`event: message_stop\ndata:${JSON.stringify({ type: 'message_stop' })}`);
+      return;
+    }
+    if (req.url === '/v1/responses/compact') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'cmp-1', object: 'response.compaction', model: 'gpt-5.3-codex', output: [],
+        usage: { input_tokens: 15, output_tokens: 3 } }));
       return;
     }
     if (req.url === '/v1/responses') {
@@ -143,11 +158,11 @@ test('relay enforces strict route/method/header/model allowlists, maps service_t
   const cf2hPreset = protocolForPreset('cf-2h');
   const close = await serveContestChannels({
     dir: join(dir, 'channels'),
-    profile: { id: 'p', harness: 'codex', api: 'passthrough', model: 'gpt-5.3-codex', service_tier: 'fast',
+    profile: { id: 'p', harness: 'codex', api: 'passthrough', model: 'gpt-5.3-codex', reasoning_effort: 'high', service_tier: 'fast',
       base_url: `http://127.0.0.1:${upstream.address().port}/v1`, api_key_env: 'OPENAI_API_KEY' },
     key: 'relay-secret-token',
     signal: new AbortController().signal,
-    maxTurns: 10,
+    maxTurns: 12,
     requestTimeoutMs: 10_000,
     maxRequestBytes: cf2hPreset.maxRequestBytes,
     sessionArchive: { dir: sessionDir, maxBytes: 1024, onResult: r => { sessionArchiveResult = r; } },
@@ -177,25 +192,29 @@ test('relay enforces strict route/method/header/model allowlists, maps service_t
     req.end();
   });
 
-  // 1. Blocked methods, blocked non-inference routes, and model/tool bypasses produce ZERO upstream calls
+  // 1. Blocked methods, blocked non-inference routes, mixed cross-protocol bodies, and model/tool bypasses produce ZERO upstream calls
   assert.equal((await callSock('DELETE', '/v1/responses')).status, 405);
   assert.equal((await callSock('GET', '/v1/models')).status, 405);
   assert.equal((await callSock('POST', '/v1/files', { model: 'gpt-5.3-codex' })).status, 404);
   assert.equal((await callSock('POST', '/v1/batches', { model: 'gpt-5.3-codex' })).status, 404);
   assert.equal((await callSock('POST', '/v1/../responses', { model: 'gpt-5.3-codex', input: 'hi' })).status, 400);
   assert.equal((await callSock('POST', '/v1/responses/', { model: 'other-model', input: 'hi' })).status, 400);
+  assert.equal((await callSock('POST', '/v1/responses', { model: 'gpt-5.3-codex', input: 'hi', messages: [] })).status, 400);
   assert.equal((await callSock('POST', '/v1/%72esponses', { model: 'gpt-5.3-codex', input: 'hi', tools: [{ type: 'web_search' }] })).status, 400);
   assert.equal((await callSock('POST', '/v1/chat/completions', { model: 'other-model', messages: [] })).status, 400);
+  assert.equal((await callSock('POST', '/v1/chat/completions', { model: 'gpt-5.3-codex', input: 'mixed', messages: [] })).status, 400);
+  assert.equal((await callSock('POST', '/v1/messages', { model: 'gpt-5.3-codex', input: 'mixed', messages: [] })).status, 400);
   assert.equal((await callSock('POST', '/v1/messages', { model: 'gpt-5.3-codex', mcp_servers: [], messages: [] })).status, 400);
   assert.equal(seen.length, 0, 'Rejected requests must never hit upstream');
 
-  // 2. Chat Completions forwards with allowlisted headers only (strips tenant/custom/auth/accept-encoding)
+  // 2. Chat Completions forwards with allowlisted headers only & strips client-supplied service_tier
   const chat = await callSock('POST', '/v1/chat/completions',
-    { model: 'gpt-5.3-codex', messages: [{ role: 'user', content: 'hello' }] },
+    { model: 'gpt-5.3-codex', service_tier: 'priority', messages: [{ role: 'user', content: 'hello' }] },
     { authorization: 'Bearer spoofed', 'x-goog-api-key': 'spoof', 'openai-organization': 'org-x', 'openai-project': 'proj-x',
       'accept-encoding': 'gzip', 'x-forwarded-for': '1.2.3.4', 'x-custom-header': 'drop-me', accept: 'application/json' });
   assert.equal(chat.status, 200);
   assert.equal(seen[0].url, '/v1/chat/completions');
+  assert.equal(seen[0].body.service_tier, undefined);
   assert.equal(seen[0].headers.authorization, 'Bearer relay-secret-token');
   assert.equal(seen[0].headers['x-goog-api-key'], undefined);
   assert.equal(seen[0].headers['openai-organization'], undefined);
@@ -205,26 +224,36 @@ test('relay enforces strict route/method/header/model allowlists, maps service_t
   assert.equal(seen[0].headers['x-custom-header'], undefined);
   assert.equal(seen[0].headers.accept, 'application/json');
 
-  // 3. /v1/messages under passthrough injects x-api-key, forwards anthropic-version, parses `data:` without space & trailing line
+  // 3. /v1/messages under passthrough injects x-api-key, forwards anthropic-version, strips service_tier, parses `data:` without space & trailing line
   const msg = await callSock('POST', '/v1/messages',
-    { model: 'gpt-5.3-codex', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    { model: 'gpt-5.3-codex', service_tier: 'priority', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
     { 'anthropic-version': '2023-06-01' });
   assert.equal(msg.status, 200);
+  assert.equal(seen[1].body.service_tier, undefined);
   assert.equal(seen[1].headers['x-api-key'], 'relay-secret-token');
   assert.equal(seen[1].headers['anthropic-version'], '2023-06-01');
   assert.ok(events.some(e => e.type === 'model_identity' && e.response_id === 'msg-1'));
 
-  // 4. /v1/responses maps service_tier 'fast' -> 'priority' and enforces store:false
-  const resp = await callSock('POST', '/v1/responses', { model: 'gpt-5.3-codex', input: 'hi', store: true });
+  // 4. /v1/responses enforces host service_tier ('fast' -> 'priority'), overrides spoofed reasoning.effort ('low' -> 'high'), and enforces store:false
+  const resp = await callSock('POST', '/v1/responses', { model: 'gpt-5.3-codex', input: 'hi', store: true, service_tier: 'flex', reasoning: { effort: 'low' } });
   assert.equal(resp.status, 200);
   assert.equal(seen[2].body.store, false);
   assert.equal(seen[2].body.service_tier, 'priority');
+  assert.equal(seen[2].body.reasoning.effort, 'high');
+
+  // 4b. /v1/responses/compact strips store and service_tier (does NOT inject store:false) and recognizes response.compaction
+  const compact = await callSock('POST', '/v1/responses/compact', { model: 'gpt-5.3-codex', input: 'hi', store: true, service_tier: 'priority' });
+  assert.equal(compact.status, 200);
+  assert.equal(seen[3].url, '/v1/responses/compact');
+  assert.equal('store' in seen[3].body, false);
+  assert.equal('service_tier' in seen[3].body, false);
+  assert.ok(events.some(e => e.type === 'model_usage' && e.usage.input_tokens === 15));
 
   // 5. Large >48 MiB payload accepted under cf-2h preset (112 MiB cap)
   const bigInput = 'a'.repeat(50 * 1024 * 1024);
   const bigResp = await callSock('POST', '/v1/responses', JSON.stringify({ model: 'gpt-5.3-codex', input: bigInput }));
   assert.equal(bigResp.status, 200);
-  assert.ok(seen[3].bodyLength > 50 * 1024 * 1024);
+  assert.ok(seen[4].bodyLength > 50 * 1024 * 1024);
 
   // 6. Disconnect AFTER response.completed does NOT fault; disconnect BEFORE response.completed DOES fault
   faults.length = 0;
@@ -276,6 +305,121 @@ test('relay enforces strict route/method/header/model allowlists, maps service_t
   const archivedText = await readFile(archivedPath, 'utf8');
   assert.ok(!archivedText.includes('relay-secret-token'));
   assert.ok(archivedText.includes('[REDACTED]'));
+});
+
+test('turn_limit immediately closes submissions, host strips unconfigured service_tier, and session_archive_status distinguishes all 5 states', async t => {
+  const seen = [];
+  const upstream = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    seen.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ id: 'resp-1', object: 'response', model: 'gpt-5.3-codex', status: 'completed', output: [] }));
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  const root = await mkdtemp(join(tmpdir(), 'cr-turn-limit-'));
+  t.after(async () => {
+    upstream.closeAllConnections();
+    await new Promise(resolve => upstream.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  });
+
+  // 1. Unconfigured service_tier strips client-supplied service_tier; turn_limit immediately locks out submit
+  const inputs = await loadInputs('examples/demo/contest.json', 'examples/demo/codex.toml');
+  const events = [];
+  const faults = [];
+  const m = match(inputs, e => events.push(e));
+  let notConnectedRes;
+  const ch1 = await serveContestChannels({
+    dir: join(root, 'c1'),
+    profile: { id: 'p', harness: 'codex', api: 'responses', model: 'gpt-5.3-codex',
+      base_url: `http://127.0.0.1:${upstream.address().port}/v1`, api_key_env: 'OPENAI_API_KEY' },
+    key: 'secret-key',
+    signal: new AbortController().signal,
+    maxTurns: 1,
+    sessionArchive: { dir: join(root, 's1'), onResult: r => { notConnectedRes = r; } },
+    contest: { submit: a => m.submit(a), status: id => m.status(id), close: () => m.close() },
+    event: e => events.push(e),
+    finish: () => {},
+    fault: r => faults.push(r),
+  });
+  const postResp = (sock, body) => new Promise((resolve, reject) => {
+    const req = httpRequest({ socketPath: sock, method: 'POST', path: '/v1/responses', headers: { 'content-type': 'application/json' } }, res => {
+      const chunks = []; res.on('data', c => chunks.push(c)); res.on('end', () => resolve(res.statusCode));
+    });
+    req.on('error', reject);
+    req.end(JSON.stringify(body));
+  });
+  assert.equal(await postResp(join(root, 'c1', 'model.sock'), { model: 'gpt-5.3-codex', input: 't1', service_tier: 'priority' }), 200);
+  assert.equal('service_tier' in seen[0], false, 'Client-supplied service_tier must be stripped when host did not configure one');
+  assert.equal(await postResp(join(root, 'c1', 'model.sock'), { model: 'gpt-5.3-codex', input: 't2' }), 429);
+  assert.deepEqual(faults, ['turn_limit']);
+  // Submission attempted right after turn_limit must be rejected with contest_closed and produce ZERO submission_received events
+  assert.deepEqual(m.submit({ problem_id: '1', answer: '3' }), { verdict: 'contest_closed' });
+  assert.equal(events.filter(e => e.type === 'submission_received').length, 0);
+  assert.equal(m.score(), 0);
+  await ch1();
+  assert.deepEqual(notConnectedRes, { status: 'not_connected', files: [] });
+
+  // 2. Connected + done with 0 files -> 'empty'
+  let emptyRes;
+  const ch2 = await serveContestChannels({
+    dir: join(root, 'c2'),
+    profile: { id: 'p', harness: 'codex', api: 'responses', model: 'gpt-5.3-codex',
+      base_url: `http://127.0.0.1:${upstream.address().port}/v1`, api_key_env: 'OPENAI_API_KEY' },
+    key: 'secret-key', signal: new AbortController().signal,
+    sessionArchive: { dir: join(root, 's2'), onResult: r => { emptyRes = r; } },
+    contest: { submit: () => ({ verdict: 'ok' }), status: () => ({}), close: () => {} },
+    event: () => {}, finish: () => {}, fault: () => {},
+  });
+  await new Promise((resolve, reject) => {
+    const sock = netConnect(join(root, 'c2', 'session.sock'), () => sock.end(JSON.stringify({ done: true }) + '\n'));
+    sock.resume(); sock.on('error', reject); sock.on('close', resolve);
+  });
+  await ch2();
+  assert.deepEqual(emptyRes, { status: 'empty', files: [] });
+
+  // 3. Disconnected without done -> 'failed' and incomplete file discarded
+  let failedRes;
+  const ch3 = await serveContestChannels({
+    dir: join(root, 'c3'),
+    profile: { id: 'p', harness: 'codex', api: 'responses', model: 'gpt-5.3-codex',
+      base_url: `http://127.0.0.1:${upstream.address().port}/v1`, api_key_env: 'OPENAI_API_KEY' },
+    key: 'secret-key', signal: new AbortController().signal,
+    sessionArchive: { dir: join(root, 's3'), onResult: r => { failedRes = r; } },
+    contest: { submit: () => ({ verdict: 'ok' }), status: () => ({}), close: () => {} },
+    event: () => {}, finish: () => {}, fault: () => {},
+  });
+  await new Promise((resolve, reject) => {
+    const sock = netConnect(join(root, 'c3', 'session.sock'), () => {
+      sock.end(JSON.stringify({ path: 'partial.jsonl', data_base64: Buffer.from('incomplete').toString('base64') }) + '\n');
+    });
+    sock.resume(); sock.on('error', reject); sock.on('close', resolve);
+  });
+  await ch3();
+  assert.deepEqual(failedRes, { status: 'failed', files: [] });
+  await assert.rejects(stat(join(root, 's3', 'partial.jsonl')), { code: 'ENOENT' });
+
+  // 4. Exceeding maxBytes -> 'truncated'
+  let truncatedRes;
+  const ch4 = await serveContestChannels({
+    dir: join(root, 'c4'),
+    profile: { id: 'p', harness: 'codex', api: 'responses', model: 'gpt-5.3-codex',
+      base_url: `http://127.0.0.1:${upstream.address().port}/v1`, api_key_env: 'OPENAI_API_KEY' },
+    key: 'secret-key', signal: new AbortController().signal,
+    sessionArchive: { dir: join(root, 's4'), maxBytes: 16, onResult: r => { truncatedRes = r; } },
+    contest: { submit: () => ({ verdict: 'ok' }), status: () => ({}), close: () => {} },
+    event: () => {}, finish: () => {}, fault: () => {},
+  });
+  await new Promise(resolve => {
+    const sock = netConnect(join(root, 'c4', 'session.sock'), () => {
+      sock.end(JSON.stringify({ path: 'big.jsonl', data_base64: Buffer.from('x'.repeat(64)).toString('base64') }) + '\n');
+    });
+    sock.resume(); sock.on('error', () => resolve()); sock.on('close', resolve);
+  });
+  await ch4();
+  assert.equal(truncatedRes.status, 'truncated');
+  assert.deepEqual(truncatedRes.files, ['big.jsonl']);
 });
 
 test('result export omits raw answers/logs, merges by run and ranks Agent revisions', async t => {

@@ -16,7 +16,7 @@ import { agentRevision, type Inputs } from './config.js';
 import { launch, renderPdf, resources, SandboxCleanupError } from './docker.js';
 import { match } from './match.js';
 import { codeforces, type ProgramJudge } from './codeforces.js';
-import { codexConfig, serveContestChannels, type SessionArchiveResult } from './codex.js';
+import { codexConfig, serveContestChannels, type ContestChannelsHandle, type SessionArchiveResult } from './codex.js';
 import type { Infer } from './model.js';
 import { send } from './wire.js';
 import { credentialJson, redactCredentialStream } from './credential-redaction.js';
@@ -31,6 +31,24 @@ function interrupt(signal: AbortSignal): Promise<never> {
     const stop = () => reject(signal.reason);
     if (signal.aborted) stop();
     else signal.addEventListener('abort', stop, { once: true });
+  });
+}
+
+function waitForGraceExit(exited: Promise<number | null>, signal: AbortSignal, ms = 1_500): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  return new Promise<void>(resolve => {
+    const done = () => {
+      if (timer) clearTimeout(timer);
+      if (onAbort) signal.removeEventListener('abort', onAbort);
+      resolve();
+    };
+    onAbort = done;
+    timer = setTimeout(done, ms);
+    timer.unref();
+    signal.addEventListener('abort', done, { once: true });
+    void exited.then(done, done);
   });
 }
 
@@ -208,7 +226,7 @@ export async function runBench(inputs: Inputs, opts: {
   void stoppedPromise.catch(() => {});
   const wait = <T>(p: Promise<T>) => Promise.race([p, stoppedPromise]);
   let stage: string | undefined;
-  let sessionResult: SessionArchiveResult = { status: 'empty', files: [] };
+  let sessionResult: SessionArchiveResult = { status: 'not_connected', files: [] };
   const isCodex = inputs.profile.harness === 'codex';
   let sandbox: Awaited<ReturnType<typeof launch>> | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -216,7 +234,7 @@ export async function runBench(inputs: Inputs, opts: {
   let mcp: ReturnType<typeof createMcp> | undefined;
   let contest: ReturnType<typeof createContest> | undefined;
   let contestMatch: ReturnType<typeof match> | undefined;
-  let closeChannels: (() => Promise<void>) | undefined;
+  let closeChannels: ContestChannelsHandle | undefined;
   let started = false;
   let status: 'completed' | 'void' = 'void';
   let reason = 'runner_error';
@@ -274,18 +292,13 @@ export async function runBench(inputs: Inputs, opts: {
       const task = `You are competing in a timed contest. The attached images are all pages of the complete problem PDF, in order. The original is /inputs/problems.pdf. Optional contest materials are read-only in /inputs/attachments. Use the contest MCP tools: submit, status, finish. ${form} Only submissions are scored. No external resources. Work independently; call finish when done.`;
       sandbox.input.end(task);
       const end = await wait(Promise.race([terminal, sandbox.exited.then(code => code === 0 ? 'agent_ended' : 'sandbox_exited')]));
+      // Immediately lock out further submissions and model inference before waiting for session flush.
+      contestMatch?.close();
+      closeChannels.stopInference();
       reason = end;
       status = ['finish', 'agent_ended', 'turn_limit'].includes(end) ? 'completed' : 'void';
       if (end === 'finish' || end === 'turn_limit') {
-        // Allow a strictly bounded grace window for bridge.js to finish flushing
-        // container session artifacts over /channels/session.sock before force removal.
-        await Promise.race([
-          sandbox.exited,
-          new Promise<void>(resolve => {
-            const grace = setTimeout(resolve, 1_500);
-            opts.signal.addEventListener('abort', () => { clearTimeout(grace); resolve(); }, { once: true });
-          }),
-        ]);
+        await waitForGraceExit(sandbox.exited, opts.signal, 1_500);
       }
     } else {
     if (!opts.infer) throw new RunFailure('missing_model_adapter');
@@ -389,11 +402,22 @@ export async function runBench(inputs: Inputs, opts: {
   } catch (error) {
     if (error instanceof SandboxCleanupError) reason = 'sandbox_cleanup_failed';
     else if (opts.signal.aborted) reason = 'interrupted';
-    else if (deadline.signal.aborted && started) { status = 'completed'; reason = 'time_limit'; }
+    else if (deadline.signal.aborted && started) {
+      status = 'completed';
+      reason = 'time_limit';
+      contestMatch?.close();
+      closeChannels?.stopInference();
+      if (inputs.profile.harness === 'codex' && sandbox) {
+        // Gently signal bridge.js (SIGTERM) and wait up to 1.5s for session flush before force removal.
+        void sandbox.stop(2);
+        await waitForGraceExit(sandbox.exited, opts.signal, 1_500);
+      }
+    }
     else reason = error instanceof RunFailure ? error.message : !started ? 'sandbox_start_failed' : 'runner_error';
   } finally {
-    cleanup.abort();
     contestMatch?.close();
+    closeChannels?.stopInference();
+    cleanup.abort();
     if (timer) clearTimeout(timer);
     let sandboxCleanupFailed = reason === 'sandbox_cleanup_failed';
     try { await sandbox?.close(); }

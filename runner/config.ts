@@ -213,8 +213,18 @@ export async function loadInputs(contestFile: string, agentFile: string, store?:
   return { ...await loadContest(contestFile), ...await loadAgent(agentFile, store) };
 }
 export function revisionFor(profile: AgentProfile, effectiveDigest: string, image: string, protocol: string) {
-  return sha256(canonical({ harness: profile.harness, version: harnessVersion(profile.harness), model: profile.model,
-    endpoint: profile.base_url, api: profile.api, effective_sha256: effectiveDigest, adapter: '0.3.0', image, protocol }));
+  return sha256(canonical({
+    harness: profile.harness,
+    version: harnessVersion(profile.harness),
+    model: profile.model,
+    endpoint: profile.base_url,
+    api: profile.api,
+    ...(profile.speed_tier && profile.speed_tier !== 'standard' ? { speed_tier: profile.speed_tier } : {}),
+    effective_sha256: effectiveDigest,
+    adapter: '0.3.0',
+    image,
+    protocol,
+  }));
 }
 export function agentRevision(inputs: Pick<Awaited<ReturnType<typeof loadAgent>>, 'profile' | 'effectiveDigest'>, image: string, protocol: string) {
   return revisionFor(inputs.profile, inputs.effectiveDigest, image, protocol);

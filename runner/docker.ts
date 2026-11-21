@@ -25,6 +25,12 @@ export class SandboxCleanupError extends Error {
 }
 
 export const resources = Object.freeze({ memory: '256m', cpus: '1', pids: 64, workspace: '32m' });
+export async function stopContainer(id: string, timeoutSec = 2) {
+  const name = `cr-${id}`;
+  try { await docker('docker', ['stop', '-t', String(timeoutSec), name], { timeout: (timeoutSec + 5) * 1000 }); }
+  catch { /* container already exited or removed; close() confirms removal */ }
+}
+
 export async function removeContainer(id: string) {
   const name = `cr-${id}`;
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -80,6 +86,7 @@ export async function launch(id: string, imageId: string, pdfPath: string, signa
     child.once('error', () => resolve(null));
     child.once('close', code => resolve(code));
   });
+  const stop = async (timeoutSec = 2) => { await stopContainer(id, timeoutSec); };
   const close = async () => {
     try { await removeContainer(id); }
     finally {
@@ -88,7 +95,7 @@ export async function launch(id: string, imageId: string, pdfPath: string, signa
       child.kill();
     }
   };
-  return { input: child.stdin, frames: frames(child.stdout), exited, close };
+  return { input: child.stdin, frames: frames(child.stdout), exited, stop, close };
 }
 
 // Render untrusted PDFs inside a networkless image rather than in the host process.

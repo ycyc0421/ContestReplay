@@ -1,7 +1,7 @@
 import { createServer, type IncomingHttpHeaders, type IncomingMessage } from 'node:http';
 import { createServer as socketServer, type Socket } from 'node:net';
 import { constants } from 'node:fs';
-import { chmod, mkdir, open, writeFile, type FileHandle } from 'node:fs/promises';
+import { chmod, mkdir, open, rm, writeFile, type FileHandle } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import { dirname, join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -40,7 +40,7 @@ const ALLOWED_REQUEST_HEADERS = new Set([
 
 const DATA_IMAGE_RE = /^data:image\/(png|jpeg|webp);base64,/;
 
-export type SessionArchiveStatus = 'archived' | 'empty' | 'truncated' | 'failed';
+export type SessionArchiveStatus = 'archived' | 'empty' | 'not_connected' | 'truncated' | 'failed';
 export type SessionArchiveResult = { status: SessionArchiveStatus; files: string[] };
 
 const SESSION_MAX_BYTES = 32 * 1024 * 1024;
@@ -82,7 +82,6 @@ export function resolveRelayTarget(baseUrl: string, reqUrl: string, api?: string
   const qIndex = reqUrl.indexOf('?');
   const rawPath = qIndex === -1 ? reqUrl : reqUrl.slice(0, qIndex);
   const rawSearch = qIndex === -1 ? '' : reqUrl.slice(qIndex);
-  // Reject double slashes anywhere in the path
   if (rawPath.includes('//')) throw new Error('Invalid relay path');
   const trimmedPath = rawPath.length > 1 && rawPath.endsWith('/') ? rawPath.slice(0, -1) : rawPath;
   const rawSegments = trimmedPath.slice(1).split('/');
@@ -110,15 +109,16 @@ export function resolveRelayTarget(baseUrl: string, reqUrl: string, api?: string
   }
   const base = new URL(baseUrl.replace(/\/+$/, ''));
   const basePath = base.pathname.replace(/\/+$/, '');
+  const basePathLower = basePath.toLowerCase();
+  if (ALLOWED_INFERENCE_ROUTES.some(route => basePathLower === route || basePathLower.endsWith(route))) {
+    throw new Error('Base URL must not include a specific inference endpoint path');
+  }
   const target = new URL(`${base.origin}${basePath}${normalizedSubpath}${rawSearch}`);
   if (target.origin !== base.origin) throw new Error('Relay target escaped pinned origin');
   if (basePath && target.pathname !== basePath && !target.pathname.startsWith(`${basePath}/`)) {
     throw new Error('Relay target escaped pinned base path');
   }
-  const targetPathLower = target.pathname.replace(/\/+$/, '').toLowerCase();
-  const isResponsesRoute = normalizedSubpath === '/responses' || normalizedSubpath === '/responses/compact'
-    || targetPathLower.endsWith('/responses') || targetPathLower.endsWith('/responses/compact');
-  return { target, subpath: normalizedSubpath, isResponsesRoute };
+  return { target, subpath: normalizedSubpath };
 }
 function forwardHeaders(incoming: IncomingHttpHeaders, key: string, api: string, subpath: InferenceRoute): Record<string, string> {
   const headers: Record<string, string> = {};
@@ -133,12 +133,6 @@ function forwardHeaders(incoming: IncomingHttpHeaders, key: string, api: string,
   headers.authorization = `Bearer ${key}`;
   if (api === 'anthropic-messages' || subpath === '/messages') headers['x-api-key'] = key;
   return headers;
-}
-function looksLikeResponsesPayload(body: Record<string, unknown>) {
-  return Object.hasOwn(body, 'input') ||
-    Object.hasOwn(body, 'previous_response_id') ||
-    Object.hasOwn(body, 'conversation') ||
-    Object.hasOwn(body, 'prompt');
 }
 function inspectNestedFilesAndImages(obj: unknown, depth = 0) {
   if (depth > 30) throw new Error('Request nesting exceeds limit');
@@ -171,16 +165,51 @@ function inspectNestedFilesAndImages(obj: unknown, depth = 0) {
     inspectNestedFilesAndImages(value, depth + 1);
   }
 }
+function validateResponsesTools(toolsRaw: unknown) {
+  const tools = toolsRaw ?? [];
+  if (!Array.isArray(tools) || tools.some(tool => !tool || typeof tool !== 'object' || !['function', 'custom', 'namespace'].includes((tool as { type?: string }).type ?? ''))) {
+    throw new Error('Remote tools are not allowed: ' + (Array.isArray(tools) ? tools.map(t => (t as { type?: unknown })?.type).filter(t => typeof t === 'string' && /^[a-z_]{1,30}$/.test(t)).join(',') : 'invalid list'));
+  }
+  for (const tool of tools as { type?: string; tools?: unknown }[]) {
+    if (tool.type === 'namespace' && (!Array.isArray(tool.tools) || tool.tools.some((inner: { type?: string }) => !inner || !['function', 'custom'].includes(inner.type ?? '')))) {
+      throw new Error('Remote tools are not allowed in namespaces');
+    }
+  }
+}
 export function checkModelRequest(body: Record<string, unknown>, model: string) {
-  if (body.model !== model || body.previous_response_id || body.conversation || body.background || body.prompt || body.include && !Array.isArray(body.include)) throw new Error('Unsupported model request');
-  const tools = body.tools ?? [];
-  if (!Array.isArray(tools) || tools.some(tool => !tool || !['function', 'custom', 'namespace'].includes(tool.type))) throw new Error('Remote tools are not allowed: ' + (Array.isArray(tools) ? tools.map(t => t?.type).filter(t => typeof t === 'string' && /^[a-z_]{1,30}$/.test(t)).join(',') : 'invalid list'));
-  for (const tool of tools) if (tool.type === 'namespace' && (!Array.isArray(tool.tools) || tool.tools.some((inner: {type?: string}) => !inner || !['function', 'custom'].includes(inner.type ?? '')))) throw new Error('Remote tools are not allowed in namespaces');
+  if (
+    body.model !== model || body.previous_response_id || body.conversation || body.background || body.prompt ||
+    Object.hasOwn(body, 'messages') || body.web_search_options || body.mcp_servers || body.mcp_toolsets ||
+    body.file_ids || body.attachments || (body.include && !Array.isArray(body.include))
+  ) {
+    throw new Error('Unsupported model request');
+  }
+  validateResponsesTools(body.tools);
   inspectNestedFilesAndImages(body.input);
   return { ...body, store: false };
 }
+export function checkResponsesCompactRequest(body: Record<string, unknown>, model: string) {
+  if (
+    body.model !== model || body.previous_response_id || body.conversation || body.background || body.prompt ||
+    Object.hasOwn(body, 'messages') || body.web_search_options || body.mcp_servers || body.mcp_toolsets ||
+    body.file_ids || body.attachments || (body.include && !Array.isArray(body.include))
+  ) {
+    throw new Error('Unsupported model request');
+  }
+  if (body.tools !== undefined) validateResponsesTools(body.tools);
+  inspectNestedFilesAndImages(body.input);
+  const sanitized = { ...body };
+  delete sanitized.store;
+  delete sanitized.service_tier;
+  return sanitized;
+}
 export function checkChatOrMessagesRequest(body: Record<string, unknown>, model: string, route: '/chat/completions' | '/messages') {
-  if (body.model !== model || body.web_search_options || body.mcp_servers || body.mcp_toolsets || body.file_ids || body.attachments || body.background) {
+  if (
+    body.model !== model ||
+    Object.hasOwn(body, 'input') || Object.hasOwn(body, 'previous_response_id') ||
+    Object.hasOwn(body, 'conversation') || Object.hasOwn(body, 'prompt') ||
+    body.web_search_options || body.mcp_servers || body.mcp_toolsets || body.file_ids || body.attachments || body.background
+  ) {
     throw new Error('Unsupported model request');
   }
   if (body.tools !== undefined) {
@@ -205,8 +234,10 @@ export function checkChatOrMessagesRequest(body: Record<string, unknown>, model:
   inspectNestedFilesAndImages(body.messages);
   inspectNestedFilesAndImages(body.system);
   inspectNestedFilesAndImages(body.tools);
-  if (route === '/chat/completions' && body.store !== undefined) return { ...body, store: false };
-  return { ...body };
+  const sanitized: Record<string, unknown> = { ...body };
+  delete sanitized.service_tier;
+  if (route === '/chat/completions' && sanitized.store !== undefined) sanitized.store = false;
+  return sanitized;
 }
 
 function createSessionReceiver(opts: {
@@ -222,62 +253,82 @@ function createSessionReceiver(opts: {
   const openedPaths = new Set<string>();
   let totalDecodedBytes = 0;
   let totalEntries = 0;
-  let status: SessionArchiveStatus = 'empty';
+  let connected = false;
+  let sawDone = false;
+  let truncated = false;
+  let failed = false;
   let active = false;
   let finalized = false;
   const inflight = new Set<Promise<void>>();
 
+  const computeStatus = (): SessionArchiveStatus => {
+    if (truncated) return 'truncated';
+    if (failed) return 'failed';
+    if (!connected) return 'not_connected';
+    if (!sawDone) return 'failed';
+    return archivedFiles.length > 0 ? 'archived' : 'empty';
+  };
+
   const finish = () => {
     if (finalized) return;
     finalized = true;
-    if (status === 'empty' && archivedFiles.length > 0) status = 'archived';
-    opts.onResult?.({ status, files: [...archivedFiles].sort() });
+    opts.onResult?.({ status: computeStatus(), files: [...archivedFiles].sort() });
   };
 
   const server = socketServer(socket => {
     track(socket);
     if (active || stop.signal.aborted) { socket.destroy(); return; }
     active = true;
+    connected = true;
     const task = (async () => {
       let currentPath: string | undefined;
+      let currentDestPath: string | undefined;
       let currentHandle: FileHandle | undefined;
       let currentRedactor: ReturnType<typeof redactCredentialStream> | undefined;
       let writeChain = Promise.resolve();
-      let failed = false;
 
-      const closeCurrentFile = async () => {
-        if (currentRedactor) {
-          currentRedactor.end();
-          currentRedactor = undefined;
-        }
-        await writeChain;
-        if (currentHandle) {
-          await currentHandle.close().catch(() => {});
-          currentHandle = undefined;
-        }
+      const closeCurrentFile = async (commit: boolean) => {
+        const rel = currentPath;
+        const dest = currentDestPath;
+        const handle = currentHandle;
+        const redactor = currentRedactor;
         currentPath = undefined;
+        currentDestPath = undefined;
+        currentHandle = undefined;
+        currentRedactor = undefined;
+        if (!handle) return;
+        try {
+          if (commit && redactor) redactor.end();
+          await writeChain;
+          await handle.close();
+          if (commit && rel) archivedFiles.push(rel);
+          else if (dest) await rm(dest, { force: true }).catch(() => {});
+        } catch (err) {
+          await handle.close().catch(() => {});
+          if (dest) await rm(dest, { force: true }).catch(() => {});
+          throw err;
+        }
       };
 
       const openFile = async (relPath: string) => {
         if (openedPaths.has(relPath)) throw new Error('duplicate_path');
         if (archivedFiles.length >= SESSION_MAX_FILES) {
-          status = 'truncated';
+          truncated = true;
           throw new Error('file_limit');
         }
         const destPath = join(targetDir, ...relPath.split('/'));
         await mkdir(dirname(destPath), { recursive: true, mode: 0o700 });
         const handle = await open(destPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
         openedPaths.add(relPath);
-        archivedFiles.push(relPath);
         currentPath = relPath;
+        currentDestPath = destPath;
         currentHandle = handle;
         let writePos = 0;
         currentRedactor = redactCredentialStream(key, bytes => {
           if (bytes.length === 0) return;
           const copy = Buffer.from(bytes);
           writeChain = writeChain.then(async () => {
-            if (!currentHandle) return;
-            await currentHandle.write(copy, 0, copy.length, writePos);
+            await handle.write(copy, 0, copy.length, writePos);
             writePos += copy.length;
           });
         });
@@ -287,7 +338,7 @@ function createSessionReceiver(opts: {
         const trimmed = rawLine.trim();
         if (!trimmed) return;
         if (++totalEntries > SESSION_MAX_ENTRIES) {
-          status = 'truncated';
+          truncated = true;
           throw new Error('entry_limit');
         }
         let frame: Record<string, unknown>;
@@ -296,21 +347,21 @@ function createSessionReceiver(opts: {
           if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('bad_frame');
           frame = parsed as Record<string, unknown>;
         } catch {
-          status = 'failed';
+          failed = true;
           throw new Error('bad_json');
         }
         if (frame.done === true) {
-          await closeCurrentFile();
-          if (status === 'empty' && archivedFiles.length > 0) status = 'archived';
+          await closeCurrentFile(true);
+          sawDone = true;
           socket.end('{"ok":true}\n');
           return;
         }
         if (typeof frame.path !== 'string' || typeof frame.data_base64 !== 'string' || !isSafeSessionRelPath(frame.path)) {
-          status = 'failed';
+          failed = true;
           throw new Error('invalid_path');
         }
         if (frame.path !== currentPath) {
-          await closeCurrentFile();
+          await closeCurrentFile(true);
           await openFile(frame.path);
         }
         const decoded = Buffer.from(frame.data_base64, 'base64');
@@ -321,7 +372,8 @@ function createSessionReceiver(opts: {
             totalDecodedBytes += allowed;
           }
           currentRedactor?.push(Buffer.from('\n[cr: session archive truncated at byte limit]\n'));
-          status = 'truncated';
+          truncated = true;
+          await closeCurrentFile(true);
           throw new Error('byte_limit');
         }
         totalDecodedBytes += decoded.length;
@@ -338,24 +390,24 @@ function createSessionReceiver(opts: {
             const line = buffer.slice(0, nl);
             buffer = buffer.slice(nl + 1);
             if (Buffer.byteLength(line) > SESSION_MAX_LINE_BYTES) {
-              status = 'failed';
+              failed = true;
               throw new Error('line_too_large');
             }
             await processLine(line);
             nl = buffer.indexOf('\n');
           }
           if (Buffer.byteLength(buffer) > SESSION_MAX_LINE_BYTES) {
-            status = 'failed';
+            failed = true;
             throw new Error('line_too_large');
           }
         }
         if (buffer.trim()) await processLine(buffer);
+        if (!sawDone && !truncated) failed = true;
       } catch {
-        failed = true;
-        if (status === 'empty' || status === 'archived') status = 'failed';
+        if (!truncated) failed = true;
         socket.destroy();
       } finally {
-        await closeCurrentFile().catch(() => { if (!failed) status = 'failed'; });
+        await closeCurrentFile(false).catch(() => { failed = true; });
         active = false;
       }
     })();
@@ -366,20 +418,30 @@ function createSessionReceiver(opts: {
   return {
     server,
     async finalize() {
-      await Promise.race([Promise.allSettled([...inflight]), new Promise(resolve => setTimeout(resolve, 1_500))]);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          Promise.allSettled([...inflight]),
+          new Promise<void>(resolve => { timer = setTimeout(resolve, 1_500); timer.unref(); }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
       finish();
     },
     result: (): SessionArchiveResult => ({
-      status: status === 'empty' && archivedFiles.length > 0 ? 'archived' : status,
+      status: computeStatus(),
       files: [...archivedFiles].sort(),
     }),
   };
 }
 
+export type ContestChannelsHandle = (() => Promise<void>) & { stopInference: () => void };
+
 export async function serveContestChannels(opts: { dir: string; profile: Antigravity; key: string; signal: AbortSignal;
   native?: NativeOverride; maxTurns?: number; requestTimeoutMs?: number; maxRequestBytes?: number;
   sessionArchive?: { dir: string; maxBytes?: number; onResult?: (result: SessionArchiveResult) => void };
-  contest: Pick<ReturnType<typeof match>, 'submit' | 'status' | 'close'>; event: EventSink; finish: () => void; fault: (reason: string) => void }) {
+  contest: Pick<ReturnType<typeof match>, 'submit' | 'status' | 'close'>; event: EventSink; finish: () => void; fault: (reason: string) => void }): Promise<ContestChannelsHandle> {
   const { dir, profile, key, signal, contest, event } = opts;
   const maxTurns = opts.maxTurns ?? protocol.maxTurns;
   const requestTimeoutMs = opts.requestTimeoutMs ?? protocol.requestTimeoutMs;
@@ -410,7 +472,13 @@ export async function serveContestChannels(opts: { dir: string; profile: Antigra
       return;
     }
     if (finished || current.aborted || inFlight) { reject(429, 'Model request already in flight or run closed'); return; }
-    if (calls >= maxTurns) { opts.fault('turn_limit'); reject(429, 'Run model request limit reached'); return; }
+    if (calls >= maxTurns) {
+      finished = true;
+      contest.close();
+      opts.fault('turn_limit');
+      reject(429, 'Run model request limit reached');
+      return;
+    }
     inFlight = true;
     void (async () => {
       const headers = forwardHeaders(req.headers, key, profile.api, resolved.subpath);
@@ -431,24 +499,37 @@ export async function serveContestChannels(opts: { dir: string; profile: Antigra
         event({ type: 'model_request_rejected', reason: error instanceof Error && !(error instanceof SyntaxError) ? error.message : 'Invalid JSON' });
         opts.fault('invalid_model_request'); reject(400, 'Disallowed request'); return;
       }
+      // Dispatch strictly by canonical route — never allow payload sniffing to switch validators.
       let checked: Record<string, unknown>;
-      const isResponses = resolved.isResponsesRoute || looksLikeResponsesPayload(parsedJson);
+      const isResponsesRoute = resolved.subpath === '/responses' || resolved.subpath === '/responses/compact';
       try {
-        if (isResponses) {
+        if (resolved.subpath === '/responses') {
           checked = checkModelRequest(parsedJson, profile.model);
-          if (resolved.subpath === '/responses') {
-            // Antigravity may omit native verbosity for models absent from its catalog.
-            // Apply the explicitly configured value to the approved Responses request.
-            const verbosity = opts.native?.model_verbosity;
-            if (verbosity) {
-              const text = checked.text;
-              Object.assign(checked, { text: { ...(text && typeof text === 'object' && !Array.isArray(text) ? text : {}), verbosity } });
-            }
-            const mappedServiceTier = responsesServiceTier(profile.service_tier);
-            if (mappedServiceTier) Object.assign(checked, { service_tier: mappedServiceTier });
+          // Host enforces billing tier and configured reasoning effort; never let sandbox spoof them.
+          delete checked.service_tier;
+          const mappedServiceTier = responsesServiceTier(profile.service_tier);
+          if (mappedServiceTier) checked.service_tier = mappedServiceTier;
+          if (profile.reasoning_effort) {
+            const existing = checked.reasoning && typeof checked.reasoning === 'object' && !Array.isArray(checked.reasoning)
+              ? checked.reasoning as Record<string, unknown> : {};
+            checked.reasoning = { ...existing, effort: profile.reasoning_effort };
+          }
+          // Antigravity may omit native verbosity for models absent from its catalog.
+          // Apply the explicitly configured value to the approved Responses request.
+          const verbosity = opts.native?.model_verbosity;
+          if (verbosity) {
+            const text = checked.text;
+            checked.text = { ...(text && typeof text === 'object' && !Array.isArray(text) ? text : {}), verbosity };
+          }
+        } else if (resolved.subpath === '/responses/compact') {
+          checked = checkResponsesCompactRequest(parsedJson, profile.model);
+          if (profile.reasoning_effort && checked.reasoning !== undefined) {
+            const existing = checked.reasoning && typeof checked.reasoning === 'object' && !Array.isArray(checked.reasoning)
+              ? checked.reasoning as Record<string, unknown> : {};
+            checked.reasoning = { ...existing, effort: profile.reasoning_effort };
           }
         } else {
-          checked = checkChatOrMessagesRequest(parsedJson, profile.model, resolved.subpath as '/chat/completions' | '/messages');
+          checked = checkChatOrMessagesRequest(parsedJson, profile.model, resolved.subpath);
         }
       } catch (error) {
         event({ type: 'model_request_rejected', reason: error instanceof Error ? error.message : 'Disallowed request' });
@@ -493,10 +574,10 @@ export async function serveContestChannels(opts: { dir: string; profile: Antigra
               observed = true;
               event({ type: 'model_identity', turn, model: value.model, response_id: value.id });
             }
-            if (isResponses && typeof value.model === 'string' && value.model !== profile.model && /^gpt-.*-\d{4}-\d{2}-\d{2}$/.test(profile.model)) {
+            if (isResponsesRoute && typeof value.model === 'string' && value.model !== profile.model && /^gpt-.*-\d{4}-\d{2}-\d{2}$/.test(profile.model)) {
               opts.fault('unexpected_model');
             }
-            if (record.type === 'response.completed' || record.object === 'response') {
+            if (record.type === 'response.completed' || record.object === 'response' || record.object === 'response.compaction') {
               completed = true;
               if (value.usage) event({ type: 'model_usage', turn, usage: value.usage });
             } else if (record.object === 'chat.completion') {
@@ -581,12 +662,13 @@ export async function serveContestChannels(opts: { dir: string; profile: Antigra
     : undefined;
 
   const servers: Endpoint[] = [relay, mcp, ...(sessionReceiver ? [sessionReceiver.server] : [])];
-  const close = async () => {
+  const close = (async () => {
     stop.abort();
     await sessionReceiver?.finalize();
     for (const connection of connections) connection.destroy();
     await Promise.all(servers.map(server => new Promise<void>(resolve => server.close(() => resolve()))));
-  };
+  }) as ContestChannelsHandle;
+  close.stopInference = () => { finished = true; };
   try {
     await listen(relay, join(dir, 'model.sock'));
     await listen(mcp, join(dir, 'mcp.sock'));

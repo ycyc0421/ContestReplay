@@ -48,7 +48,7 @@ export async function createContestDocument(root: string, base: string, raw: unk
     if (!problems) {
       const contest = z.number().int().positive().parse(judge.contest_id);
       const imported = await importCodeforces(contest, signal);
-      problems = imported.problems.map(p => ({ id: p.index, max_points: 1 }));
+      problems = imported.problems.map(p => ({ id: p.index, max_points: typeof p.points === 'number' && Number.isFinite(p.points) && p.points >= 1 ? Math.round(p.points) : 1 }));
     }
   }
   const answersPath = join(dirname(target), 'judge.json');

@@ -13,7 +13,7 @@ import { codexConfigServiceTier, codexEffective, responsesServiceTier } from '..
 import { agentRevision, loadAgent, loadContest } from '../dist/config.js';
 import { Connections } from '../dist/connections.js';
 import { agentCatalog } from '../dist/catalog.js';
-import { makePlan, verifyJob, verifyPlan } from '../dist/plan.js';
+import { makePlan, planSchema, verifyJob, verifyPlan } from '../dist/plan.js';
 import { enqueue, summarize } from '../dist/queue.js';
 import { archiveSessionDir } from '../dist/run.js';
 import {
@@ -200,6 +200,24 @@ test('Agent name does not affect agent_revision or invalidate plans, while servi
   const badProtoFile = join(dir, 'bad-proto.json');
   await writeFile(badProtoFile, JSON.stringify({ ...baseDoc, provider: 'anthropic-only', speed_tier: 'standard' }));
   await assert.rejects(loadAgent(badProtoFile, store), /requires a responses or passthrough provider/);
+
+  // Plan requires credential_source (old plans without credential_source are rejected by planSchema)
+  const { credential_source: _missingCred, ...legacyJob } = lockedPlan.jobs[0];
+  assert.throws(() => planSchema.parse({ ...lockedPlan, jobs: [legacyJob] }));
+
+  // Two agents with the same id & effective config but different speed_tier can coexist in one matrix and have distinct revisions
+  const stdTierFile = join(dir, 'agent-std.json');
+  const fastTierFile = join(dir, 'agent-fast.json');
+  await writeFile(stdTierFile, JSON.stringify({ ...baseDoc, speed_tier: 'standard' }));
+  await writeFile(fastTierFile, JSON.stringify({ ...baseDoc, speed_tier: 'fast' }));
+  const tierMatrixPlan = await makePlan({
+    schema_version: 1,
+    agents: [stdTierFile, fastTierFile],
+    contests: [resolve('examples/demo/contest.json')],
+  }, dir, getImage, store);
+  assert.equal(tierMatrixPlan.jobs.length, 2);
+  assert.notEqual(tierMatrixPlan.jobs[0].agent_revision, tierMatrixPlan.jobs[1].agent_revision);
+  assert.deepEqual(tierMatrixPlan.jobs.map(j => j.speed_tier), ['standard', 'fast']);
 
   // Legacy JSON+TOML wrapper: changing display `name` inside responses.toml does NOT invalidate existing plan,
   // while changing `api_key_env` DOES invalidate it!
@@ -437,17 +455,67 @@ test('results.json v3 export collects telemetry/submissions, reads v1/v2/v3, sco
   assert.equal(nonPen.solved, 1);
   assert.equal(nonPen.penalty_minutes, 10);
 
-  // 2. CF scoring without explicit weights does NOT fabricate 500 pts
+  // 2. CF scoring without explicit weights marks scoring_unavailable and NEVER outranks a rankable CF run (revision & Policy C!)
   const cfLegacy = scoreResult(v2.results[0], 'cf');
   assert.equal(cfLegacy.scoring_unavailable, true);
   assert.equal(cfLegacy.points, 500);
   const cfLegacy100 = scoreResult({ ...v2.results[0], score: 100 }, 'cf');
   assert.equal(cfLegacy100.scoring_unavailable, true);
   assert.equal(cfLegacy100.points, 100);
+  const cfRankable480 = {
+    ...exported,
+    run_id: randomUUID(),
+    agent_id: 'cf-weighted',
+    agent_revision: '7'.repeat(64),
+    model: { requested: 'gpt-5.3-codex', observed: ['gpt-5.3-codex'], vendor: 'openai', reasoning_effort: 'high', speed_tier: 'standard' },
+    score: 500,
+    submissions: [{ id: 's1', problem_id: 'A', elapsed_ms: 600_000, verdict: 'OK', max_points: 500, score: 500 }],
+  };
+  const cfUnrankable500 = {
+    ...exported,
+    run_id: randomUUID(),
+    agent_id: 'cf-legacy-no-weight',
+    agent_revision: '8'.repeat(64),
+    model: { requested: 'gpt-5.3-codex', observed: ['gpt-5.3-codex'], vendor: 'openai', reasoning_effort: 'medium', speed_tier: 'standard' },
+    score: 500,
+    submissions: [{ id: 's1', problem_id: 'A', elapsed_ms: 600_000, verdict: 'OK' }],
+  };
+  const cfRevRank = rankResults(resultBundle([cfUnrankable500, cfRankable480]), { scoring: 'cf', groupBy: 'revision' })[0];
+  assert.equal(cfRevRank[0].rank, 1);
+  assert.equal(cfRevRank[0].result.run_id, cfRankable480.run_id);
+  assert.equal(cfRevRank[0].scoring.points, 480);
+  assert.equal(cfRevRank[1].rank, null);
+  assert.equal(cfRevRank[1].result.run_id, cfUnrankable500.run_id);
+  assert.equal(cfRevRank[1].scoring.scoring_unavailable, true);
+  const cfModelRank = rankResultsGrouped(resultBundle([cfUnrankable500, cfRankable480]), { scoring: 'cf' })[0];
+  assert.equal(cfModelRank.length, 1);
+  assert.equal(cfModelRank[0].rank, 1);
+  assert.equal(cfModelRank[0].result.run_id, cfRankable480.run_id, 'Unrankable 500-pt variant must never displace rankable 480-pt primary');
+  assert.equal(cfModelRank[0].variants.length, 2);
 
-  // 3. IOI partial-only scoring separates tie_break_ms from last_ac_ms
+  // 3. IOI partial-only scoring separates tie_break_ms from last_ac_ms, and missing partial score marks scoring_unavailable (never 40 instead of 100!)
   assert.equal(ioi.tie_break_ms, 240_000);
   assert.equal(ioi.last_ac_ms, undefined);
+  const ioiMissingPartialScore = {
+    ...exported,
+    run_id: randomUUID(),
+    agent_id: 'ioi-incomplete',
+    agent_revision: 'e'.repeat(64),
+    score: 100,
+    max_score: 200,
+    submissions: [
+      { id: 's1', problem_id: 'A', elapsed_ms: 60_000, verdict: 'partial', score: 40, max_points: 100 },
+      { id: 's2', problem_id: 'B', elapsed_ms: 120_000, verdict: 'partial', max_points: 100 },
+    ],
+  };
+  const ioiIncomplete = scoreResult(ioiMissingPartialScore, 'ioi');
+  assert.equal(ioiIncomplete.scoring_unavailable, true);
+  assert.equal(ioiIncomplete.points, 100);
+  const ioiRanked = rankResults(resultBundle([ioiMissingPartialScore, ioiSample]), { scoring: 'ioi' })[0];
+  assert.equal(ioiRanked[0].rank, 1);
+  assert.equal(ioiRanked[0].result.run_id, ioiSample.run_id);
+  assert.equal(ioiRanked[1].rank, null);
+  assert.equal(ioiRanked[1].result.run_id, ioiMissingPartialScore.run_id);
 
   // 4. Policy C groups by (vendor, requested_model) FIRST so identical (agent_id, agent_revision) across vendors are NOT dropped
   const sharedAgentRev = '9'.repeat(64);
