@@ -370,9 +370,10 @@ export function createVjudgeJudge(config: VjudgeJudgeConfig, deps: VjudgeJudgeDe
         redirect: 'manual',
         signal: requestSignal,
       });
-    } catch (err) {
-      if (signal.aborted) throw err;
-      throw new JudgeInfrastructureError('submission_unconfirmed', 'VJudge submit request failed; will not retry', {
+    } catch {
+      // Once POST has entered transport, ANY error (network, timeout, or AbortSignal) leaves
+      // submission state uncertain; ALWAYS surface sanitized submission_unconfirmed!
+      throw new JudgeInfrastructureError('submission_unconfirmed', 'VJudge submit POST did not complete; will not retry', {
         platform: 'vjudge',
       });
     }

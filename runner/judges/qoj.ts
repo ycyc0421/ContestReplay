@@ -73,14 +73,52 @@ function classifyHttpError(status: number, context: string): JudgeInfrastructure
   });
 }
 
+const SKIP_CHALLENGE_TAGS = new Set(['pre', 'code', 'textarea', 'script', 'style']);
+
+function walkNonCodeDom(root: HtmlNode): HtmlNode[] {
+  const out: HtmlNode[] = [];
+  const stack: HtmlNode[] = [root];
+  while (stack.length) {
+    const node = stack.pop()!;
+    if (node.tagName && SKIP_CHALLENGE_TAGS.has(node.tagName.toLowerCase())) continue;
+    out.push(node);
+    const children = node.childNodes;
+    if (children) {
+      for (let i = children.length - 1; i >= 0; i--) {
+        stack.push(children[i]!);
+      }
+    }
+  }
+  return out;
+}
+
 function detectCaptchaOrLogin(markup: string): 'captcha' | 'login' | null {
-  if (/cf-turnstile|g-recaptcha|h-captcha|verify you are human/i.test(markup)) return 'captcha';
-  const nodes = parseHtmlNodes(markup);
-  const hasSubmitForm = nodes.some(
+  const root = parseHtmlNodes(markup)[0];
+  if (!root) return null;
+  const visibleNodes = walkNonCodeDom(root);
+
+  // Detect real captcha/bot-challenge DOM widgets (never scanning <pre>/<code>/<textarea> source blocks!)
+  for (const node of visibleNodes) {
+    const cls = (htmlAttr(node, 'class') ?? '').toLowerCase();
+    const id = (htmlAttr(node, 'id') ?? '').toLowerCase();
+    const src = (htmlAttr(node, 'src') ?? '').toLowerCase();
+    if (
+      /cf-turnstile|g-recaptcha|h-captcha/.test(cls) ||
+      /cf-turnstile|g-recaptcha|h-captcha/.test(id) ||
+      /turnstile|recaptcha|hcaptcha/.test(src)
+    ) {
+      return 'captcha';
+    }
+    if (node.value && /verify you are human|just a moment\.\.\.|ddos-guard/i.test(node.value)) {
+      return 'captcha';
+    }
+  }
+
+  const hasSubmitForm = visibleNodes.some(
     n => n.tagName === 'form' && walkHtml(n).some(c => htmlAttr(c, 'name') === 'answer_answer_editor'),
   );
   if (hasSubmitForm) return null;
-  const hasLoginForm = nodes.some(n => n.tagName === 'form' && /\/login\b/i.test(htmlAttr(n, 'action') ?? ''));
+  const hasLoginForm = visibleNodes.some(n => n.tagName === 'form' && /\/login\b/i.test(htmlAttr(n, 'action') ?? ''));
   return hasLoginForm ? 'login' : null;
 }
 
@@ -215,25 +253,29 @@ export function parseQojSubmissionPage(expectedId: string, body: string): QojSub
     let maxScore: number | undefined;
     let rawVerdict = 'Waiting';
 
-    // Check explicit text verdict ONLY inside the summary result cell (never full HTML / source code!)
-    const cellVerdictMatch = resultCell.match(
-      /\b(Judgement Failed|Judgment Failed|Compile Error|Compilation Error|Accepted|Wrong Answer|Time Limit Exceeded|Memory Limit Exceeded|Runtime Error|Dangerous Syscalls|Output Limit Exceeded|Waiting|Judging|Pending|Compiling)\b/i,
-    );
+    // Strip any numeric score token ("65/100" or bare "65") from resultCell to detect accompanying status text
+    // (e.g. "Unknown Error 100/100" -> statusText = "Unknown Error", which MUST map to judge_error!).
+    const statusText = resultCell
+      .replace(/\b\d+(?:\.\d+)?\s*\/\s*\d+(?:\.\d+)?\b/g, '')
+      .replace(/^\s*\d+(?:\.\d+)?\s*$/, '')
+      .replace(/\s+/g, ' ')
+      .trim();
 
     if (parsedScore.score !== undefined) {
       score = parsedScore.score;
       maxScore = parsedScore.max_score;
-      if (cellVerdictMatch?.[1]) {
-        rawVerdict = cellVerdictMatch[1];
-      } else if (maxScore !== undefined && score >= maxScore) {
-        rawVerdict = 'Accepted';
-      } else if (score > 0) {
-        rawVerdict = 'Partial';
+      if (statusText) {
+        // Preserve explicit status text (including unknown/infra statuses like "Unknown Error") for normalizeVerdict.
+        rawVerdict = statusText;
+      } else if (parsedScore.explicitRatio && maxScore !== undefined && maxScore > 0) {
+        // Only infer verdict from pure score when explicit x/y ratio provides a trusted maxScore.
+        if (score >= maxScore) rawVerdict = 'Accepted';
+        else if (score > 0) rawVerdict = 'Partial';
+        else rawVerdict = 'Wrong Answer';
       } else {
-        rawVerdict = 'Wrong Answer';
+        // Bare score with no explicit verdict and no trusted maxScore MUST NOT be inferred as accepted/partial.
+        rawVerdict = resultCell;
       }
-    } else if (cellVerdictMatch?.[1]) {
-      rawVerdict = cellVerdictMatch[1];
     } else if (resultCell) {
       rawVerdict = resultCell;
     }
@@ -281,6 +323,7 @@ export function parseQojSubmissionListPage(markup: string): QojSubmissionListRes
   const rows: Array<{ id: string; problem_id?: string; submitter?: string }> = [];
   const seen = new Set<string>();
   let recognizedTable = false;
+  let unparseableDataRows = false;
 
   for (const table of nodes) {
     if (table.tagName !== 'table') continue;
@@ -298,12 +341,22 @@ export function parseQojSubmissionListPage(markup: string): QojSubmissionListRes
         headerText.includes('score') ||
         headerText.includes('题目') ||
         headerText.includes('提交'));
-    if (hasSubmissionHeaders || tableClass.includes('submissions')) {
-      recognizedTable = true;
-    }
+    const tableMatches = hasSubmissionHeaders || tableClass.includes('submissions');
+    let dataRowCount = 0;
+    let parsedRowCount = 0;
 
     for (const tr of tableNodes) {
       if (tr.tagName !== 'tr') continue;
+      const tds = (tr.childNodes ?? []).filter(c => c.tagName === 'td');
+      if (!tds.length) continue; // Header row only
+
+      const rowText = tds.map(td => htmlText(td).replace(/\s+/g, ' ').trim()).join(' ').trim();
+      // Recognize explicit empty-list placeholder row (e.g. "No data", "暂无", "No submissions")
+      if (tds.length === 1 && /^(no data|no submissions?|none|empty|暂无.*|没有.*|无)$/i.test(rowText)) {
+        continue;
+      }
+
+      dataRowCount++;
       const anchors = collectAnchors(tr);
       let subId: string | undefined;
       let problemId: string | undefined;
@@ -317,15 +370,26 @@ export function parseQojSubmissionListPage(markup: string): QojSubmissionListRes
         const u = href.match(/\/user\/profile\/([^/?#]+)/);
         if (u?.[1] && !submitter) submitter = decodeURIComponent(u[1]);
       }
-      if (subId && !seen.has(subId)) {
-        seen.add(subId);
+      if (subId) {
+        parsedRowCount++;
+        if (!seen.has(subId)) {
+          seen.add(subId);
+          rows.push({ id: subId, ...(problemId ? { problem_id: problemId } : {}), ...(submitter ? { submitter } : {}) });
+        }
+      }
+    }
+
+    if (tableMatches || parsedRowCount > 0) {
+      if (dataRowCount > 0 && parsedRowCount < dataRowCount) {
+        // Table has non-empty data rows whose submission IDs could not be parsed -> fail closed!
+        unparseableDataRows = true;
+      } else {
         recognizedTable = true;
-        rows.push({ id: subId, ...(problemId ? { problem_id: problemId } : {}), ...(submitter ? { submitter } : {}) });
       }
     }
   }
 
-  return { recognized: recognizedTable, rows };
+  return { recognized: recognizedTable && !unparseableDataRows, rows };
 }
 
 export function parseQojSubmissionList(markup: string): Array<{ id: string; problem_id?: string; submitter?: string }> {
@@ -633,9 +697,10 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
         redirect: 'manual',
         signal: requestSignal,
       });
-    } catch (err) {
-      if (signal.aborted) throw err;
-      throw new JudgeInfrastructureError('submission_unconfirmed', 'QOJ submit POST failed; will not retry', {
+    } catch {
+      // Once POST has entered transport, ANY failure (network, timeout, or AbortSignal) leaves
+      // submission state uncertain; ALWAYS surface sanitized submission_unconfirmed!
+      throw new JudgeInfrastructureError('submission_unconfirmed', 'QOJ submit POST did not complete; will not retry', {
         platform: 'qoj',
       });
     }
@@ -741,15 +806,15 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
     signal: AbortSignal,
   ): Promise<string> {
     for (let attempt = 0; attempt < 4; attempt++) {
-      await delayImpl(1500, signal);
       let list: QojSubmissionListResult;
       try {
+        await delayImpl(1500, signal);
         list = await fetchRecentSubmissions(handle, remoteProblemId, session, signal);
-      } catch (err) {
-        if (signal.aborted) throw err;
+      } catch {
+        // Post-POST correlation interruption (including abort/timeout) MUST return submission_unconfirmed.
         throw new JudgeInfrastructureError(
           'submission_unconfirmed',
-          'Failed to query QOJ submissions list after POST; will not retry',
+          'Failed to confirm QOJ submission after POST; will not retry',
           { platform: 'qoj' },
         );
       }
@@ -862,21 +927,21 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
         }
 
         const body = await resp.text();
-        // Check login / captcha challenge BEFORE parsing summary row so auth/captcha pages are classified accurately.
-        const challenge = detectCaptchaOrLogin(body);
-        if (challenge === 'captcha') {
-          throw new JudgeInfrastructureError('captcha_required', `QOJ returned captcha while polling #${id}`, {
-            platform: 'qoj',
-          });
-        }
-        if (challenge === 'login') {
-          throw new JudgeInfrastructureError('auth_expired', `QOJ session expired while polling #${id}`, {
-            platform: 'qoj',
-          });
-        }
-
+        // Parse the exact summary row FIRST; only inspect login/captcha challenge when no valid summary row is present
+        // (prevents user source code comments from triggering false captcha_required).
         const row = parseQojSubmissionPage(id, body);
         if (!row) {
+          const challenge = detectCaptchaOrLogin(body);
+          if (challenge === 'captcha') {
+            throw new JudgeInfrastructureError('captcha_required', `QOJ returned captcha while polling #${id}`, {
+              platform: 'qoj',
+            });
+          }
+          if (challenge === 'login') {
+            throw new JudgeInfrastructureError('auth_expired', `QOJ session expired while polling #${id}`, {
+              platform: 'qoj',
+            });
+          }
           throw new JudgeInfrastructureError(
             'identity_mismatch',
             `QOJ submission #${id} page missing matching summary row`,

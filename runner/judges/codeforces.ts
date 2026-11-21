@@ -126,7 +126,8 @@ export function cfFormForContest(
   const expectedPath = `${basePath}/${routePrefix(gym)}/${contest}/submit`;
   const submitPageUrl = `${origin}${expectedPath}`;
   const nodes = parseHtmlNodes(markup);
-  const expectedProfilePath = `${basePath}/profile/${handle.toLowerCase()}`;
+  // Preserve case-sensitivity of deployment basePath; ignore case ONLY for the <handle> segment.
+  const profilePrefix = `${basePath}/profile/`;
   const profile = nodes.some(el => {
     if (el.tagName !== 'a') return false;
     const rawHref = htmlAttr(el, 'href');
@@ -137,9 +138,10 @@ export function cfFormForContest(
     } catch {
       return false;
     }
+    if (resolved.origin !== origin || !resolved.pathname.startsWith(profilePrefix)) return false;
+    const handleSegment = resolved.pathname.slice(profilePrefix.length).replace(/\/+$/, '');
     return (
-      resolved.origin === origin &&
-      resolved.pathname.toLowerCase() === expectedProfilePath &&
+      handleSegment.toLowerCase() === handle.toLowerCase() &&
       htmlText(el).trim().toLowerCase() === handle.toLowerCase()
     );
   });
@@ -203,19 +205,29 @@ export function cfReceiptForContest(
   return Number.isSafeInteger(value) && value > 0 ? String(value) : undefined;
 }
 
-function parseCfTimestampSeconds(raw: string): number | undefined {
+interface ParsedCfTimestamp {
+  seconds: number;
+  minutePrecision: boolean;
+}
+
+function parseCfTimestampSeconds(raw: string): ParsedCfTimestamp | undefined {
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
   // Support numeric epoch seconds, ISO-8601, or CF "Nov/21/2026 19:30" / "2026-11-21 19:30:00"
-  if (/^\d{9,11}$/.test(trimmed)) return Number(trimmed);
+  if (/^\d{9,11}$/.test(trimmed)) return { seconds: Number(trimmed), minutePrecision: false };
   const cfDate = trimmed.match(/^([A-Za-z]{3})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
   if (cfDate) {
+    const hasSeconds = cfDate[6] !== undefined;
     const parsed = Date.parse(`${cfDate[1]} ${cfDate[2]}, ${cfDate[3]} ${cfDate[4]}:${cfDate[5]}:${cfDate[6] ?? '00'} UTC`);
-    return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : undefined;
+    return Number.isFinite(parsed) ? { seconds: Math.floor(parsed / 1000), minutePrecision: !hasSeconds } : undefined;
   }
   const iso = Date.parse(trimmed);
-  return Number.isFinite(iso) ? Math.floor(iso / 1000) : undefined;
+  if (!Number.isFinite(iso)) return undefined;
+  const hasSeconds = /:\d{2}:\d{2}/.test(trimmed);
+  return { seconds: Math.floor(iso / 1000), minutePrecision: !hasSeconds };
 }
+
+type CfStatusRowWithMeta = CfStatusRow & { _minutePrecision?: boolean };
 
 /**
  * Parse authenticated `/gym/<id>/my` HTML status table into CfStatusRow records
@@ -227,14 +239,14 @@ export function parseCfMySubmissionsHtml(
   markup: string,
   contest: number,
   opts?: { baseUrl?: string },
-): CfStatusRow[] {
+): CfStatusRowWithMeta[] {
   const { baseUrl, origin } = resolveBaseUrl(opts?.baseUrl ?? CODEFORCES_DEFAULT_ORIGIN, 'codeforces');
   const basePath = new URL(baseUrl).pathname.replace(/\/+$/, '');
   const escapedBase = basePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const pageUrl = `${baseUrl}/gym/${contest}/my`;
 
   const nodes = parseHtmlNodes(markup);
-  const rows: CfStatusRow[] = [];
+  const rows: CfStatusRowWithMeta[] = [];
   for (const tr of nodes) {
     if (tr.tagName !== 'tr') continue;
     const rawSubId = htmlAttr(tr, 'data-submission-id');
@@ -247,7 +259,7 @@ export function parseCfMySubmissionsHtml(
     let problemIndex: string | undefined;
     const authorHandles: string[] = [];
     let participantType: string | undefined;
-    let creationTimeSeconds: number | undefined;
+    let parsedTs: ParsedCfTimestamp | undefined;
     let verdictText = '';
     let timeMs: number | undefined;
     let memBytes: number | undefined;
@@ -259,11 +271,11 @@ export function parseCfMySubmissionsHtml(
       const tdNodes = walkHtml(td);
 
       // Parse explicit timestamp from time cell (column 1 or status-small / format-time)
-      if (creationTimeSeconds === undefined && (colIdx === 1 || cls.includes('status-small'))) {
+      if (parsedTs === undefined && (colIdx === 1 || cls.includes('status-small'))) {
         const formatTimeNode = tdNodes.find(n => (htmlAttr(n, 'class') ?? '').includes('format-time'));
         const tsText = formatTimeNode ? htmlText(formatTimeNode) : txt;
-        const parsedTs = parseCfTimestampSeconds(tsText);
-        if (parsedTs !== undefined) creationTimeSeconds = parsedTs;
+        const candidate = parseCfTimestampSeconds(tsText);
+        if (candidate !== undefined) parsedTs = candidate;
       }
 
       // Parse explicit author & participantType from party cell (column 2 or status-party-cell)
@@ -311,7 +323,7 @@ export function parseCfMySubmissionsHtml(
     }
 
     // Fail closed: require explicit problemIndex, single explicit author handle, explicit participantType, and timestamp!
-    if (!problemIndex || authorHandles.length !== 1 || !participantType || creationTimeSeconds === undefined) {
+    if (!problemIndex || authorHandles.length !== 1 || !participantType || parsedTs === undefined) {
       continue;
     }
 
@@ -323,7 +335,8 @@ export function parseCfMySubmissionsHtml(
         participantType,
         members: [{ handle: authorHandles[0]! }],
       },
-      creationTimeSeconds,
+      creationTimeSeconds: parsedTs.seconds,
+      _minutePrecision: parsedTs.minutePrecision,
       ...(verdictText ? { verdict: verdictText } : {}),
       ...(timeMs !== undefined ? { timeConsumedMillis: timeMs } : {}),
       ...(memBytes !== undefined ? { memoryConsumedBytes: memBytes } : {}),
@@ -423,11 +436,22 @@ async function previewGymPageHtml(
       platform: 'codeforces',
     });
   }
+
+  // Explicitly verify finished status from Gym page content (never blindly assume finished!).
+  const visibleText = nodes
+    .filter(n => n.value !== undefined)
+    .map(n => n.value!)
+    .join(' ')
+    .replace(/\s+/g, ' ');
+  const hasActiveMarker = /\b(contest is running|before the contest|pending system test|system testing)\b/i.test(visibleText);
+  const hasFinishedMarker = /\b(final standings|contest is over|practice|finished)\b/i.test(visibleText);
+  const status: ContestPreview['status'] = hasActiveMarker ? 'active' : hasFinishedMarker ? 'finished' : 'unknown';
+
   return {
     platform: 'codeforces',
     contest_ref: `gym:${numericId}`,
     title: title || `Codeforces Gym ${numericId}`,
-    status: 'finished',
+    status,
     problems,
     suggested_languages: CODEFORCES_LANGUAGE_PRESETS,
   };
@@ -555,7 +579,7 @@ export function createCodeforcesJudge(
     });
   }
 
-  async function fetchGymMyHtml(cookie: string, signal: AbortSignal): Promise<CfStatusRow[]> {
+  async function fetchGymMyHtml(cookie: string, signal: AbortSignal): Promise<CfStatusRowWithMeta[]> {
     const session = parseCookieHeader(cookie, 'codeforces');
     const url = `${baseUrl}/gym/${config.contest_id}/my`;
     const resp = await fetchImpl(url, {
@@ -582,7 +606,7 @@ export function createCodeforcesJudge(
     count: number,
     signal: AbortSignal,
     cookie?: string,
-  ): Promise<CfStatusRow[]> {
+  ): Promise<CfStatusRowWithMeta[]> {
     if (gym) {
       // CF user.status does NOT return Gym submissions; use contest.status for Gym.
       try {
@@ -679,9 +703,10 @@ export function createCodeforcesJudge(
         redirect: 'manual',
         signal: requestSignal,
       });
-    } catch (err) {
-      if (signal.aborted) throw err;
-      throw new JudgeInfrastructureError('submission_unconfirmed', 'Codeforces submit POST failed; will not retry', {
+    } catch {
+      // Once POST has entered transport, ANY error (network, timeout, or AbortSignal) leaves
+      // submission state uncertain; ALWAYS surface sanitized submission_unconfirmed!
+      throw new JudgeInfrastructureError('submission_unconfirmed', 'Codeforces submit POST did not complete; will not retry', {
         platform: 'codeforces',
       });
     }
@@ -731,24 +756,28 @@ export function createCodeforcesJudge(
 
     if (listRedirect || confirmed) {
       for (let attempt = 0; attempt < 4; attempt++) {
-        await delayImpl(2500, requestSignal);
-        let rows: CfStatusRow[];
+        let rows: CfStatusRowWithMeta[];
         try {
+          await delayImpl(2500, requestSignal);
           rows = await fetchSubmissions(handle, 30, requestSignal, serializeCookieHeader(session));
-        } catch (err) {
-          if (signal.aborted) throw err;
+        } catch {
+          // Post-POST correlation interruption (including abort/timeout) MUST return submission_unconfirmed.
           throw new JudgeInfrastructureError(
             'submission_unconfirmed',
             'Failed to correlate Codeforces submission after POST; will not retry',
             { platform: 'codeforces' },
           );
         }
+        // Relax timestamp lower bound by 60s ONLY for minute-precision HTML timestamps (/gym/<id>/my),
+        // while still requiring strict row.id > baseline and unique single new submission.
+        const hasMinutePrecision = rows.some(r => r._minutePrecision === true);
+        const effectiveSince = hasMinutePrecision ? since - 60 : since;
         const candidates = exactPracticeCandidates(rows, {
           baseline,
           contest: config.contest_id,
           problem: target,
           handle,
-          since,
+          since: effectiveSince,
         });
         const newerCount = rows.filter(row => row.id > baseline).length;
         if (candidates.length === 1 && newerCount === 1) return String(candidates[0]!);

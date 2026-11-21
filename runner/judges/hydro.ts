@@ -358,9 +358,10 @@ export function createHydroJudge(config: HydroJudgeConfig, deps: HydroJudgeDeps 
         redirect: 'manual',
         signal: requestSignal,
       });
-    } catch (err) {
-      if (signal.aborted) throw err;
-      throw new JudgeInfrastructureError('submission_unconfirmed', 'Hydro submit POST failed; will not retry', {
+    } catch {
+      // Once POST has entered transport, ANY error (network, timeout, or AbortSignal) leaves
+      // submission state uncertain; ALWAYS surface sanitized submission_unconfirmed!
+      throw new JudgeInfrastructureError('submission_unconfirmed', 'Hydro submit POST did not complete; will not retry', {
         platform: 'hydro',
       });
     }

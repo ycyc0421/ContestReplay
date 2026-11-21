@@ -910,12 +910,30 @@ test('Hydro uses real /p/<pid>/submit route, handles >100 partial scores, status
 });
 
 test('Final review regression suite: QOJ maintenance page & bare score, CF Gym auth precheck & strict /my parsing, strict problems/contestId/docId checks, and post-POST stream drops', async t => {
-  // 1. QOJ HTTP 200 maintenance page MUST NOT be treated as empty submission list; bare score keeps max_score undefined; login page -> auth_expired
+  // 1. QOJ HTTP 200 maintenance page AND table with unparseable data rows MUST NOT be recognized;
+  //    explicit empty table or "No data" placeholder IS recognized;
+  //    source code with "verify you are human" MUST NOT trigger captcha_required;
+  //    "Unknown Error 100/100" and bare "100" without verdict MUST fail closed (never accepted!).
   assert.equal(parseQojSubmissionListPage('<html><body>Site under maintenance</body></html>').recognized, false);
   assert.equal(
-    parseQojSubmissionListPage('<table><thead><tr><th>ID</th><th>Problem</th><th>Submitter</th><th>Result</th></tr></thead><tbody></tbody></table>').recognized,
+    parseQojSubmissionListPage(
+      '<table><thead><tr><th>ID</th><th>Problem</th><th>Submitter</th><th>Result</th></tr></thead><tbody><tr><td>unparseable</td><td>foo</td><td>bar</td><td>baz</td></tr></tbody></table>',
+    ).recognized,
+    false,
+  );
+  assert.equal(
+    parseQojSubmissionListPage(
+      '<table><thead><tr><th>ID</th><th>Problem</th><th>Submitter</th><th>Result</th></tr></thead><tbody></tbody></table>',
+    ).recognized,
     true,
   );
+  assert.equal(
+    parseQojSubmissionListPage(
+      '<table><thead><tr><th>ID</th><th>Problem</th><th>Submitter</th><th>Result</th></tr></thead><tbody><tr><td>No data</td></tr></tbody></table>',
+    ).recognized,
+    true,
+  );
+
   const bareScoreHtml = `
     <table><tr>
       <td><a href="/submission/6001">#6001</a></td>
@@ -927,6 +945,25 @@ test('Final review regression suite: QOJ maintenance page & bare score, CF Gym a
   const bareRow = parseQojSubmissionPage('6001', bareScoreHtml);
   assert.equal(bareRow?.score, 65);
   assert.equal(bareRow?.max_score, undefined);
+  assert.equal(normalizeVerdict(bareRow.raw_verdict, bareRow.score, bareRow.max_score), 'judge_error');
+
+  const sourceWithCaptchaHtml = `
+    <table><tr>
+      <td><a href="/submission/6002">#6002</a></td>
+      <td><a href="/problem/7801">Task</a></td>
+      <td><a href="/user/profile/qoj_tester">qoj_tester</a></td>
+      <td><a class="uoj-score">100/100</a></td>
+    </tr></table>
+    <pre><code>// verify you are human cf-turnstile &lt;form action="/login"&gt;</code></pre>
+  `;
+  const unknownErrorWith100Html = `
+    <table><tr>
+      <td><a href="/submission/6003">#6003</a></td>
+      <td><a href="/problem/7801">Task</a></td>
+      <td><a href="/user/profile/qoj_tester">qoj_tester</a></td>
+      <td>Unknown Error 100/100</td>
+    </tr></table>
+  `;
 
   const qojMaintJudge = createQojJudge(
     { handle: 'qoj_tester', languages: { cpp20: 'C++20' }, problem_map: { A: '7801' } },
@@ -946,6 +983,15 @@ test('Final review regression suite: QOJ maintenance page & bare score, CF Gym a
         if (url.pathname === '/submission/9001') {
           return htmlResponse('<form action="/login"><input name="username"></form>', 200);
         }
+        if (url.pathname === '/submission/6002') {
+          return htmlResponse(sourceWithCaptchaHtml, 200);
+        }
+        if (url.pathname === '/submission/6003') {
+          return htmlResponse(unknownErrorWith100Html, 200);
+        }
+        if (url.pathname === '/submission/6001') {
+          return htmlResponse(bareScoreHtml, 200);
+        }
         throw new Error(url.href);
       },
     },
@@ -960,15 +1006,27 @@ test('Final review regression suite: QOJ maintenance page & bare score, CF Gym a
     qojMaintJudge.verdicts(['9001'], new Map([['9001', 'A']]), AbortSignal.timeout(5000)),
     err => err instanceof JudgeInfrastructureError && err.code === 'auth_expired',
   );
+  // Source code mentioning "verify you are human" MUST NOT trigger captcha_required
+  const v6002 = await qojMaintJudge.verdicts(['6002'], new Map([['6002', 'A']]), AbortSignal.timeout(5000));
+  assert.equal(v6002.get('6002')?.verdict, 'accepted');
+  // "Unknown Error 100/100" and bare "65" without verdict MUST fail closed as JudgeInfrastructureError (never accepted!)
+  await assert.rejects(
+    qojMaintJudge.verdicts(['6003'], new Map([['6003', 'A']]), AbortSignal.timeout(5000)),
+    err => err instanceof JudgeInfrastructureError && err.code === 'upstream_unavailable',
+  );
+  await assert.rejects(
+    qojMaintJudge.verdicts(['6001'], new Map([['6001', 'A']]), AbortSignal.timeout(5000)),
+    err => err instanceof JudgeInfrastructureError && err.code === 'upstream_unavailable',
+  );
   // Missing problem mapping in verdicts() MUST fail closed with identity_mismatch
   await assert.rejects(
     qojMaintJudge.verdicts(['9001'], new Map(), AbortSignal.timeout(5000)),
     err => err instanceof JudgeInfrastructureError && err.code === 'identity_mismatch',
   );
 
-  // 2. CF Gym authenticated /gym/<id> preview fallback + strict parseCfMySubmissionsHtml (no fabricated defaults) + subpath profile check
+  // 2. CF Gym authenticated /gym/<id> preview fallback + strict finished check + case-sensitive basePath /CF + minute-precision /my correlation
   const subpathFormHtml = `
-    <a href="/cf/profile/cf_sub">cf_sub</a>
+    <a href="/CF/profile/CF_Sub">cf_sub</a>
     <form action="?csrf_token=subtok">
       <input type="hidden" name="csrf_token" value="subtok">
       <select name="submittedProblemIndex"></select>
@@ -976,22 +1034,30 @@ test('Final review regression suite: QOJ maintenance page & bare score, CF Gym a
     </form>
   `;
   assert.equal(
-    cfFormForContest(subpathFormHtml, 42, 'cf_sub', { origin: 'https://mirror.example/cf' }).fields.get('csrf_token'),
+    cfFormForContest(subpathFormHtml, 42, 'cf_sub', { origin: 'https://mirror.example/CF' }).fields.get('csrf_token'),
     'subtok',
+  );
+  // Case mismatch on deployment basePath (/cf vs /CF) must fail closed
+  assert.throws(
+    () =>
+      cfFormForContest(subpathFormHtml.replace('/CF/profile/CF_Sub', '/cf/profile/CF_Sub'), 42, 'cf_sub', {
+        origin: 'https://mirror.example/CF',
+      }),
+    err => err instanceof JudgeInfrastructureError && err.code === 'auth_expired',
   );
   // Off-origin spoofed profile link must be rejected
   assert.throws(
     () =>
       cfFormForContest(
-        subpathFormHtml.replace('/cf/profile/cf_sub', 'https://evil.example/cf/profile/cf_sub'),
+        subpathFormHtml.replace('/CF/profile/CF_Sub', 'https://evil.example/CF/profile/CF_Sub'),
         42,
         'cf_sub',
-        { origin: 'https://mirror.example/cf' },
+        { origin: 'https://mirror.example/CF' },
       ),
     err => err instanceof JudgeInfrastructureError && err.code === 'auth_expired',
   );
 
-  const gymPreview = await previewCodeforcesContest(104567, {
+  const gymPreviewFinished = await previewCodeforcesContest(104567, {
     gym: true,
     cookie: 'JSESSIONID=gym-auth',
     fetchImpl: async input => {
@@ -1000,6 +1066,7 @@ test('Final review regression suite: QOJ maintenance page & bare score, CF Gym a
       if (url.pathname === '/gym/104567') {
         return htmlResponse(`
           <html><head><title>Private Gym - Codeforces</title></head><body>
+            <div>Final standings</div>
             <a href="/gym/104567/problem/A">Alpha</a>
             <a href="https://evil.example/gym/104567/problem/Z">Spoofed</a>
           </body></html>
@@ -1008,11 +1075,71 @@ test('Final review regression suite: QOJ maintenance page & bare score, CF Gym a
       throw new Error(url.href);
     },
   });
-  assert.equal(gymPreview.title, 'Private Gym');
+  assert.equal(gymPreviewFinished.title, 'Private Gym');
+  assert.equal(gymPreviewFinished.status, 'finished');
   assert.deepEqual(
-    gymPreview.problems.map(p => p.remote_id),
+    gymPreviewFinished.problems.map(p => p.remote_id),
     ['A'],
   );
+
+  // Gym HTML without finished evidence MUST report status: 'unknown' (not blindly 'finished')
+  const gymPreviewUnknown = await previewCodeforcesContest(104567, {
+    gym: true,
+    cookie: 'JSESSIONID=gym-auth',
+    fetchImpl: async input => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/contest.standings') return jsonResponse({ status: 'FAILED' }, 403);
+      return htmlResponse('<html><body><a href="/gym/104567/problem/A">Alpha</a></body></html>');
+    },
+  });
+  assert.equal(gymPreviewUnknown.status, 'unknown');
+
+  // Gym HTML with active contest marker MUST report status: 'active'
+  const gymPreviewActive = await previewCodeforcesContest(104567, {
+    gym: true,
+    cookie: 'JSESSIONID=gym-auth',
+    fetchImpl: async input => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/contest.standings') return jsonResponse({ status: 'FAILED' }, 403);
+      return htmlResponse('<html><body><div>Contest is running</div><a href="/gym/104567/problem/A">Alpha</a></body></html>');
+    },
+  });
+  assert.equal(gymPreviewActive.status, 'active');
+
+  // Minute-precision /gym/<id>/my correlation (HH:MM floored to start of current UTC minute)
+  const nowDate = new Date();
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const minuteStamp = `${months[nowDate.getUTCMonth()]}/${String(nowDate.getUTCDate()).padStart(2, '0')}/${nowDate.getUTCFullYear()} ${String(nowDate.getUTCHours()).padStart(2, '0')}:${String(nowDate.getUTCMinutes()).padStart(2, '0')}`;
+  let gymMySubmitted = false;
+  const gymMyJudge = createCodeforcesJudge(
+    { contest_id: 104567, gym: true, handle: 'cf_tester', languages: { cpp20: 89 } },
+    {
+      cookie: 'JSESSIONID=gym-my',
+      skipContestCheck: true,
+      delayImpl: async () => {},
+      fetchImpl: async (input, init) => {
+        const url = new URL(String(input));
+        if (url.pathname === '/api/contest.status') return jsonResponse({ status: 'FAILED' }, 403);
+        if (url.pathname === '/gym/104567/submit' && (!init?.method || init.method === 'GET')) {
+          return htmlResponse(
+            '<a href="/profile/cf_tester">cf_tester</a><form action="?csrf_token=t"><input type="hidden" name="csrf_token" value="t"><select name="submittedProblemIndex"></select><textarea name="source"></textarea></form>',
+          );
+        }
+        if (url.pathname === '/gym/104567/submit' && init?.method === 'POST') {
+          gymMySubmitted = true;
+          return redirectResponse('/gym/104567/my');
+        }
+        if (url.pathname === '/gym/104567/my') {
+          const rowHtml = gymMySubmitted
+            ? `<tr data-submission-id="777002"><td>777002</td><td class="status-small"><span class="format-time">${minuteStamp}</span></td><td class="status-party-cell">* <a href="/profile/cf_tester">cf_tester</a></td><td><a href="/gym/104567/problem/A">A</a></td><td>C++20</td><td class="status-verdict-cell"><span submissionverdict="OK">Accepted</span></td></tr>`
+            : '';
+          return htmlResponse(`<table>${rowHtml}</table>`);
+        }
+        throw new Error(url.href);
+      },
+    },
+  );
+  assert.equal(await gymMyJudge.submit('A', 'cpp20', 'int main(){}', AbortSignal.timeout(5000)), '777002');
 
   // parseCfMySubmissionsHtml MUST reject rows missing author, timestamp, or explicit PRACTICE marker
   const myHtml = `
@@ -1158,6 +1285,52 @@ test('Final review regression suite: QOJ maintenance page & bare score, CF Gym a
       return true;
     },
   );
+  // 6. Post-POST AbortSignal cancellation throws sanitized submission_unconfirmed (never raw AbortError)
+  const postAbortAc = new AbortController();
+  const vjAbortPost = createVjudgeJudge(
+    { handle: 'vj_abort', languages: { cpp20: 'C++20' }, problem_map: { A: 'QOJ-100' } },
+    {
+      cookie: 'JSESSIONID=vj',
+      fetchImpl: async () => {
+        postAbortAc.abort(new Error('RAW_ABORT_REASON_SECRET'));
+        throw postAbortAc.signal.reason;
+      },
+    },
+  );
+  await assert.rejects(
+    vjAbortPost.submit('A', 'cpp20', 'int main(){}', postAbortAc.signal),
+    err => {
+      assert.ok(err instanceof JudgeInfrastructureError);
+      assert.equal(err.code, 'submission_unconfirmed');
+      assert.ok(!err.message.includes('RAW_ABORT_REASON_SECRET'));
+      return true;
+    },
+  );
+
+  // 7. Cross-caller process-wide serializer: mixing deps.pool and no-pool calls for the same handle never overlaps POSTs!
+  let concurrentPosts = 0;
+  let maxConcurrentPosts = 0;
+  const slowPostFetch = async () => {
+    concurrentPosts++;
+    maxConcurrentPosts = Math.max(maxConcurrentPosts, concurrentPosts);
+    await new Promise(resolve => setTimeout(resolve, 35));
+    concurrentPosts--;
+    return jsonResponse({ runId: Math.floor(Math.random() * 100000) + 1 });
+  };
+  const sharedPool = new OjAccountPool([]);
+  const vjWithPool = createVjudgeJudge(
+    { handle: 'shared_bot', languages: { cpp20: 'C++20' }, problem_map: { A: 'QOJ-100' } },
+    { cookie: 'JSESSIONID=s1', pool: sharedPool, fetchImpl: slowPostFetch },
+  );
+  const vjWithoutPool = createVjudgeJudge(
+    { handle: 'SHARED_BOT', languages: { cpp20: 'C++20' }, problem_map: { A: 'QOJ-100' } },
+    { cookie: 'JSESSIONID=s1', fetchImpl: slowPostFetch },
+  );
+  await Promise.all([
+    vjWithPool.submit('A', 'cpp20', 'int main(){}', AbortSignal.timeout(5000)),
+    vjWithoutPool.submit('A', 'cpp20', 'int main(){}', AbortSignal.timeout(5000)),
+  ]);
+  assert.equal(maxConcurrentPosts, 1);
 });
 
 test('Unified judge registry exposes all four backends, presets, factory, and preview dispatcher', async () => {

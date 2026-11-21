@@ -687,19 +687,23 @@ function abortError(signal: AbortSignal): Error {
   return err;
 }
 
+// Process-wide submission serialization chains keyed by canonical (platform, origin, handle) or account ID.
+// Shared across all OjAccountPool instances and standalone adapter calls so the same remote account
+// never has >1 concurrent submission write in flight.
+const processSubmissionChains = new Map<string, Promise<void>>();
+
 /**
  * Resource pool and per-account submission serializer for OJ accounts.
  *
  * - `acquire` leases an exclusive account from a platform/pool (or explicit IDs),
  *   queuing callers in FIFO order until one becomes available or `signal` aborts.
  * - `enqueueSubmission` strictly serializes submission writes per serialization key
- *   (account ID or canonical `platform:origin:handle`) so concurrent operations
- *   never race on submission ID correlation.
+ *   (account ID or canonical `platform:origin:handle`) across the entire process so
+ *   concurrent operations never race on submission ID correlation.
  */
 export class OjAccountPool {
   private readonly busyIds = new Set<string>();
   private readonly waiters: PoolWaiter[] = [];
-  private readonly submissionChains = new Map<string, Promise<void>>();
   private readonly store?: OjAccounts;
   private readonly staticAccounts?: OjAccount[];
   private dispatching = false;
@@ -895,18 +899,18 @@ export class OjAccountPool {
   ): Promise<T> {
     if (signal?.aborted) return Promise.reject(abortError(signal));
 
-    const prev = this.submissionChains.get(key) ?? Promise.resolve();
+    const prev = processSubmissionChains.get(key) ?? Promise.resolve();
     let releaseTurn!: () => void;
     const currentTurn = new Promise<void>(resolveTurn => {
       releaseTurn = resolveTurn;
     });
     const nextChain = prev.then(() => currentTurn);
-    this.submissionChains.set(key, nextChain);
+    processSubmissionChains.set(key, nextChain);
 
     const cleanupChain = () => {
       releaseTurn();
-      if (this.submissionChains.get(key) === nextChain) {
-        this.submissionChains.delete(key);
+      if (processSubmissionChains.get(key) === nextChain) {
+        processSubmissionChains.delete(key);
       }
     };
 

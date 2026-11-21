@@ -539,8 +539,8 @@ export async function resolveAdapterTransport(input: {
   });
 }
 
-// Process-wide fallback serializer so correlation-based submissions never run concurrently
-// on the same (platform, origin, handle) even when callers do not pass an OjAccountPool.
+// Process-wide submission serializer backed by OjAccountPool's shared processSubmissionChains map.
+// Always routes through the same process-wide per-key queue whether or not a caller supplies `pool`.
 const processSubmissionSerializer = new OjAccountPool([]);
 
 export function serializeAccountSubmission<T>(
