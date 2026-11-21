@@ -62,14 +62,21 @@ export function codeforces(backend: Backend): ProgramJudge {
       checkedContest ??= importCodeforces(backend.contest_id, signal);
       await checkedContest;
       const target = targetFor(problem);
+      const rawLanguage = Object.hasOwn(backend.languages, language) ? backend.languages[language] : undefined;
+      if (rawLanguage === undefined) throw new Error(`Unsupported Codeforces language key: ${language}`);
       if (!executable) {
+        const rawStr = String(rawLanguage).trim();
+        const languageId = Number(rawStr);
+        if (!/^\d+$/.test(rawStr) || !Number.isSafeInteger(languageId) || languageId <= 0) {
+          throw new Error(`Invalid numeric Codeforces language ID for ${language}`);
+        }
         const cookie = process.env.CR_CODEFORCES_COOKIE;
         if (!cookie) throw new Error('Missing Codeforces session');
         const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(30_000)]);
         let baseline = 0;
         let since = 0;
         return submitCodeforcesWeb({ contest: backend.contest_id, problem: target,
-          language: Number(backend.languages[language]!), source, handle, cookie, signal: requestSignal,
+          language: languageId, source, handle, cookie, signal: requestSignal,
           async beforePost() {
             const before = await userSubmissions(handle, 10, requestSignal);
             baseline = Math.max(0, ...before.map(row => row.id));

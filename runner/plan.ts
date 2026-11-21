@@ -1,16 +1,27 @@
-import { constants } from 'node:fs';
-import { access, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { z } from 'zod';
 import { createInference } from './model.js';
-import { agentRevision, file as readBoundedFile, loadAgent, loadContest, loadInputs, modelKey, type Inputs } from './config.js';
+import {
+  agentRevision,
+  file as readBoundedFile,
+  loadAgent,
+  loadContest,
+  loadInputs,
+  modelKey,
+  resolveOjAccountPolicy,
+  selectMatchingOjAccounts,
+  type Inputs,
+  type OjAccountPolicyResolution,
+  type RemoteJudgeConfig,
+} from './config.js';
 import { imageFor, inspectImage } from './docker.js';
-import { checkCodeforces } from './codeforces.js';
 import type { Connections } from './connections.js';
 import { speedTierSchema } from './harnesses.js';
-import { defaultOriginFor, effectiveOriginFor, OjAccountPool, OjAccounts, type OjPlatform } from './oj-accounts.js';
+import { OjAccountPool, OjAccounts } from './oj-accounts.js';
 import { protocolDigest, protocolDigestForPreset, protocolForPreset, protocolPresetNames, resolveProtocolPreset } from './protocol.js';
 import { runBench } from './run.js';
+
+export { resolveOjAccountPolicy, selectMatchingOjAccounts, type OjAccountPolicyResolution };
 
 const path = z.string().trim().min(1).max(4096);
 const absPath = path.refine(isAbsolute, 'expected an absolute path');
@@ -32,18 +43,83 @@ const cellsSpecSchema = z.strictObject({
   .refine(s => new Set(s.cells.map(cell => JSON.stringify([cell.agent, cell.contest]))).size === s.cells.length, 'duplicate matrix cell')
   .refine(s => s.cells.reduce((sum, cell) => sum + (cell.repeats ?? 1), 0) <= MAX_PLAN_JOBS, `maximum ${MAX_PLAN_JOBS} jobs`);
 export const specSchema = z.union([axisSpecSchema, cellsSpecSchema]);
-export const planSchema = z.strictObject({ schema_version: z.literal(2), protocol_sha256: digest,
-  jobs: z.array(z.strictObject({
-    image: imageRef, harness: z.enum(['builtin-responses', 'codex']), model_family_id: z.string().optional(),
-    agent_path: absPath, agent_id: z.string().min(1), agent_name: z.string().min(1).max(120).optional(),
-    speed_tier: speedTierSchema.optional(), credential_source: z.string().min(1).max(256).optional(),
-    agent_revision: digest,
-    agent_sha256: digest, profile_sha256: digest, native_sha256: digest.optional(), effective_sha256: digest.optional(),
-    contest_path: absPath, contest_id: z.string().min(1), data_version: z.number().int().positive(), contest_sha256: digest,
-    protocol_preset: z.enum(protocolPresetNames).optional(),
-    repeat_index: z.number().int().min(1).max(20).optional(),
-    repeat_total: z.number().int().min(1).max(20).optional(),
-  })).min(1).max(MAX_PLAN_JOBS),
+export const planJobSchema = z.strictObject({
+  image: imageRef, harness: z.enum(['builtin-responses', 'codex']), model_family_id: z.string().optional(),
+  agent_path: absPath, agent_id: z.string().min(1), agent_name: z.string().min(1).max(120).optional(),
+  speed_tier: speedTierSchema.optional(), credential_source: z.string().min(1).max(256).optional(),
+  agent_revision: digest,
+  agent_sha256: digest, profile_sha256: digest, native_sha256: digest.optional(), effective_sha256: digest.optional(),
+  contest_path: absPath, contest_id: z.string().min(1), data_version: z.number().int().positive(), contest_sha256: digest,
+  protocol_preset: z.enum(protocolPresetNames).optional(),
+  repeat_index: z.number().int().min(1).max(20).optional(),
+  repeat_total: z.number().int().min(1).max(20).optional(),
+}).superRefine((job, ctx) => {
+  const hasIndex = job.repeat_index !== undefined;
+  const hasTotal = job.repeat_total !== undefined;
+  if (hasIndex !== hasTotal) {
+    ctx.addIssue({
+      code: 'custom',
+      path: [hasIndex ? 'repeat_total' : 'repeat_index'],
+      message: 'repeat_index and repeat_total must be present together',
+    });
+  } else if (hasIndex && hasTotal && job.repeat_index! > job.repeat_total!) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['repeat_index'],
+      message: 'repeat_index cannot exceed repeat_total',
+    });
+  }
+});
+
+export function validatePlanRepeatGroups(jobs: ReadonlyArray<z.infer<typeof planJobSchema>>): string | undefined {
+  const groups = new Map<string, Array<z.infer<typeof planJobSchema>>>();
+  for (const job of jobs) {
+    const key = JSON.stringify([job.agent_path, job.contest_path]);
+    const list = groups.get(key) ?? [];
+    list.push(job);
+    groups.set(key, list);
+  }
+  for (const list of groups.values()) {
+    const withRepeats = list.filter(j => j.repeat_index !== undefined || j.repeat_total !== undefined);
+    if (withRepeats.length === 0) {
+      if (list.length > 1) return 'Duplicate non-repeated cell in plan';
+      continue;
+    }
+    if (withRepeats.length !== list.length) {
+      return 'Mixed repeated and non-repeated jobs for the same matrix cell';
+    }
+    const expectedTotal = list[0]!.repeat_total!;
+    if (list.some(j => j.repeat_total !== expectedTotal)) {
+      return 'Inconsistent repeat_total within a matrix cell repeat group';
+    }
+    if (list.length !== expectedTotal) {
+      return `Incomplete repeat group: expected ${expectedTotal} jobs, found ${list.length}`;
+    }
+    const seen = new Set<number>();
+    for (const j of list) {
+      const idx = j.repeat_index!;
+      if (idx < 1 || idx > expectedTotal || seen.has(idx)) {
+        return `Duplicate or out-of-range repeat_index ${idx} in repeat group`;
+      }
+      seen.add(idx);
+    }
+  }
+  return undefined;
+}
+
+export const planSchema = z.strictObject({
+  schema_version: z.literal(2),
+  protocol_sha256: digest,
+  jobs: z.array(planJobSchema).min(1).max(MAX_PLAN_JOBS),
+}).superRefine((plan, ctx) => {
+  const repeatError = validatePlanRepeatGroups(plan.jobs);
+  if (repeatError) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['jobs'],
+      message: repeatError,
+    });
+  }
 });
 export type Plan = z.infer<typeof planSchema>;
 export type PlanJob = Plan['jobs'][number];
@@ -143,80 +219,11 @@ function assertHarnessProtocolCompatible(profile: Inputs['profile']) {
   }
 }
 
-const ENV_PREFIX: Record<OjPlatform, string> = {
-  codeforces: 'CODEFORCES',
-  qoj: 'QOJ',
-  vjudge: 'VJUDGE',
-  hydro: 'HYDRO',
-};
-
 export async function checkOjReadiness(
-  judge: Exclude<Inputs['contest']['judge'], { kind: 'local' }>,
+  judge: RemoteJudgeConfig,
   ojAccounts?: OjAccounts,
 ): Promise<void> {
-  const accounts = ojAccounts ?? new OjAccounts();
-  const targetOrigin = judge.base_url ? new URL(judge.base_url).origin : defaultOriginFor(judge.kind);
-
-  if (judge.account_id) {
-    const acc = await accounts.get(judge.account_id);
-    if (acc.platform !== judge.kind) {
-      throw new Error(`OJ account ${judge.account_id} belongs to ${acc.platform}, expected ${judge.kind}`);
-    }
-    const bound = effectiveOriginFor(acc);
-    if (targetOrigin && bound !== targetOrigin) {
-      throw new Error(`OJ account ${judge.account_id} origin (${bound ?? 'none'}) does not match ${targetOrigin}`);
-    }
-    if (!acc.ready) {
-      throw new Error(`OJ account ${judge.account_id} is not ready (credential or submitter unavailable)`);
-    }
-    return;
-  }
-
-  if (judge.pool) {
-    const candidates = await accounts.listPool(judge.kind, judge.pool);
-    const ready = candidates.filter(acc => acc.ready && (!targetOrigin || effectiveOriginFor(acc) === targetOrigin));
-    if (!ready.length) {
-      throw new Error(`No ready ${judge.kind} OJ accounts in pool "${judge.pool}"`);
-    }
-    return;
-  }
-
-  // Handle-only or default-platform fallback: check env submitter/cookie or ready accounts in store.
-  const prefix = ENV_PREFIX[judge.kind];
-  const envExec = process.env[`CR_${prefix}_SUBMITTER`]?.trim();
-  if (envExec) {
-    if (!isAbsolute(envExec)) throw new Error(`CR_${prefix}_SUBMITTER must be an absolute executable path`);
-    const info = await stat(envExec);
-    if (!info.isFile()) throw new Error(`CR_${prefix}_SUBMITTER is not a regular file`);
-    await access(envExec, constants.X_OK);
-    return;
-  }
-  const envCookie = process.env[`CR_${prefix}_COOKIE`]?.trim();
-  if (envCookie) {
-    const approvedBase = process.env[`CR_${prefix}_BASE_URL`]?.trim();
-    const approvedOrigin = approvedBase ? new URL(approvedBase).origin : defaultOriginFor(judge.kind);
-    if (targetOrigin && approvedOrigin === targetOrigin) return;
-  }
-  if (judge.kind === 'codeforces') {
-    // Try ready stored account matching handle before throwing legacy CF error.
-    const candidates = await accounts.listPool('codeforces').catch(() => []);
-    const matched = candidates.find(acc =>
-      acc.ready &&
-      (!judge.handle || acc.handle.toLowerCase() === judge.handle.toLowerCase()) &&
-      (!targetOrigin || effectiveOriginFor(acc) === targetOrigin),
-    );
-    if (matched) return;
-    await checkCodeforces();
-    return;
-  }
-  const candidates = await accounts.listPool(judge.kind).catch(() => []);
-  const matched = candidates.find(acc =>
-    acc.ready &&
-    (!judge.handle || acc.handle.toLowerCase() === judge.handle.toLowerCase()) &&
-    (!targetOrigin || effectiveOriginFor(acc) === targetOrigin),
-  );
-  if (matched) return;
-  throw new Error(`No ready ${judge.kind} OJ account, cookie, or submitter configured`);
+  await resolveOjAccountPolicy(judge, ojAccounts);
 }
 
 function verifyAgent(job: PlanJob, input: AgentInput, contest: ContestInput['contest']) {

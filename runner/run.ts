@@ -12,7 +12,7 @@ import type { ResponseInput } from 'openai/resources/responses/responses.js';
 import { z } from 'zod';
 import { createContest, createMcp, finishArgs, statusArgs, submitArgs, type EventSink } from './contest.js';
 import { protocol, protocolDigestForPreset, protocolForPreset, resolveProtocolPreset, resolveScoringMode } from './protocol.js';
-import { agentRevision, type Inputs } from './config.js';
+import { agentRevision, resolveOjAccountPolicy, type Inputs } from './config.js';
 import { launch, renderPdf, resources, SandboxCleanupError } from './docker.js';
 import { match, type AnyProgramJudge } from './match.js';
 import { createProgramJudge, OjAccountPool, OjAccounts, type OjAccountLease, type ProgramJudge as UnifiedProgramJudge } from './judges/index.js';
@@ -257,6 +257,29 @@ export async function runBench(inputs: Inputs, opts: {
     const limits = inputs.contest.rules;
     if (inputs.profile.harness === 'codex') {
       if (!opts.key) throw new RunFailure('missing_model_key');
+      let judge: AnyProgramJudge | undefined = opts.programJudge;
+      if (!judge && inputs.contest.judge.kind !== 'local') {
+        const backend = inputs.contest.judge;
+        const accounts = opts.ojAccounts ?? new OjAccounts();
+        const policy = await resolveOjAccountPolicy(backend, accounts);
+        let pool = opts.ojPool;
+        if (policy.mode === 'account_pool') {
+          pool ??= new OjAccountPool(accounts);
+          ojLease = await pool.acquire(
+            backend.kind,
+            { accountIds: policy.matchedAccounts.map(acc => acc.id) },
+            opts.signal,
+          );
+        }
+        ownedJudge = createProgramJudge(backend, {
+          accounts,
+          pool,
+          ...(ojLease ? { account: ojLease.account } : {}),
+        });
+        judge = ownedJudge;
+      }
+      activeJudge = judge;
+      opts.signal.throwIfAborted();
       const input = join(stage, 'input');
       await mkdir(input, { mode: 0o755 });
       await writeFile(join(input, 'problems.pdf'), inputs.pdf, { mode: 0o444 });
@@ -268,28 +291,6 @@ export async function runBench(inputs: Inputs, opts: {
       for (const file of inputs.attachments) await writeFile(join(attachments, file.name), file.bytes, { mode: 0o444 });
       await codexConfig(input, inputs.profile, inputs.native);
       const channels = join(stage, 'channels');
-      let judge: AnyProgramJudge | undefined = opts.programJudge;
-      if (!judge && inputs.contest.judge.kind !== 'local') {
-        const backend = inputs.contest.judge;
-        const accounts = opts.ojAccounts ?? new OjAccounts();
-        const needsPoolLease = Boolean(backend.pool || backend.account_id || (!backend.handle && (opts.ojPool || opts.ojAccounts)));
-        const pool = opts.ojPool ?? (needsPoolLease ? new OjAccountPool(accounts) : undefined);
-        if (needsPoolLease && pool) {
-          const selector = backend.account_id
-            ? { accountIds: [backend.account_id] }
-            : backend.pool
-              ? { pool: backend.pool }
-              : {};
-          ojLease = await pool.acquire(backend.kind, selector, opts.signal);
-        }
-        ownedJudge = createProgramJudge(backend, {
-          accounts,
-          pool,
-          ...(ojLease ? { account: ojLease.account } : {}),
-        });
-        judge = ownedJudge;
-      }
-      activeJudge = judge;
       // Create the session lazily at t=0, after the container is launched.
       let live: ReturnType<typeof match> | undefined;
       const session = () => live ??= (contestMatch = match(inputs, event, judge));
@@ -475,10 +476,14 @@ export async function runBench(inputs: Inputs, opts: {
     catch { status = 'void'; if (reason !== 'sandbox_cleanup_failed') reason = 'staging_cleanup_failed'; }
     if (contestMatch) {
       if (status === 'completed') {
-        if (contestMatch.hasPending()) event({ type: 'settling' });
-        const judgeSettlementMs = activeJudge && 'settlementMs' in activeJudge && typeof activeJudge.settlementMs === 'number'
-          ? activeJudge.settlementMs : 0;
-        const settlementMs = Math.max(preset.settlementMs, judgeSettlementMs);
+        if (!contestMatch.failed() && contestMatch.hasPending()) event({ type: 'settling' });
+        const explicitSettlementMs =
+          inputs.contest.judge.kind !== 'local' ? inputs.contest.judge.settlement_ms : undefined;
+        const judgeSettlementMs =
+          activeJudge && 'settlementMs' in activeJudge && typeof activeJudge.settlementMs === 'number'
+            ? activeJudge.settlementMs
+            : 0;
+        const settlementMs = explicitSettlementMs ?? Math.max(preset.settlementMs, judgeSettlementMs);
         try { await contestMatch.settle(AbortSignal.any([opts.signal, AbortSignal.timeout(settlementMs)])); }
         catch { status = 'void'; reason = opts.signal.aborted ? 'interrupted' : contestMatch.failed() ? 'judge_error' : 'judge_unsettled'; }
       }

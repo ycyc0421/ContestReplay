@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { Inputs } from './config.js';
 import { createContest, type EventSink } from './contest.js';
 import type { ProgramJudge as LegacyProgramJudge } from './codeforces.js';
-import type { JudgeVerdict, ProgramJudge as UnifiedProgramJudge } from './judges/types.js';
+import { normalizeVerdict, type JudgeVerdict, type ProgramJudge as UnifiedProgramJudge } from './judges/types.js';
 
 export type AnyProgramJudge = LegacyProgramJudge | UnifiedProgramJudge;
 
@@ -13,18 +13,13 @@ export const submissionSchema = z.union([
 ]);
 export const statusSchema = z.strictObject({ submission_id: z.string().max(20).optional() });
 
-function isAcceptedLegacy(verdict: string): boolean {
-  return verdict === 'OK' || verdict === 'AC' || verdict === 'accepted';
-}
-
-function isPendingLegacy(verdict: string): boolean {
-  const upper = verdict.trim().toUpperCase();
-  return !upper || upper === 'TESTING' || upper === 'SUBMITTED' || upper === 'PENDING';
-}
-
-function clampScore(value: number, maxPoints: number): number {
-  if (!Number.isFinite(value) || value <= 0) return 0;
-  return Math.min(maxPoints, value);
+function scalePartialScore(value: number, maxPoints: number, remoteMaxScore?: number): number {
+  if (!Number.isFinite(value) || value <= 0 || maxPoints <= 0) return 0;
+  if (remoteMaxScore !== undefined && Number.isFinite(remoteMaxScore) && remoteMaxScore > 0 && remoteMaxScore !== maxPoints) {
+    const scaled = (value / remoteMaxScore) * maxPoints;
+    return Math.min(maxPoints, Math.max(0, Math.round(scaled * 1000) / 1000));
+  }
+  return Math.min(maxPoints, Math.max(0, value));
 }
 
 export function match(
@@ -86,20 +81,29 @@ export function match(
       const maxPts = problems.get(row.problem) ?? 0;
 
       if (typeof rawVerdict === 'string') {
-        if (isPendingLegacy(rawVerdict)) continue;
+        const normalized = normalizeVerdict(rawVerdict);
+        if (normalized === 'pending') continue;
+        if (normalized === 'judge_error') {
+          row.verdict = 'judge_error';
+          fault(new Error(`Judge infrastructure verdict: ${rawVerdict || 'judge_error'}`));
+          return;
+        }
         row.verdict = rawVerdict;
-        const subScore = isAcceptedLegacy(rawVerdict) ? maxPts : 0;
+        const isAc = normalized === 'accepted';
+        const subScore = isAc ? maxPts : 0;
         row.score = subScore;
-        if (isAcceptedLegacy(rawVerdict)) {
+        if (isAc) {
           accepted.add(row.problem);
         }
         bestScores.set(row.problem, Math.max(bestScores.get(row.problem) ?? 0, subScore));
         emit({
           type: 'submission_judged',
           submission_id,
+          problem_id: row.problem,
           verdict: rawVerdict,
           remote_submission_id: id,
           score: subScore,
+          max_points: maxPts,
           max_score: maxPts,
         });
       } else {
@@ -116,18 +120,21 @@ export function match(
           subScore = maxPts;
           accepted.add(row.problem);
         } else if (typeof jv.score === 'number' && Number.isFinite(jv.score) && (jv.verdict === 'partial' || jv.score > 0)) {
-          subScore = clampScore(jv.score, maxPts);
+          subScore = scalePartialScore(jv.score, maxPts, jv.max_score);
         }
         row.score = subScore;
         bestScores.set(row.problem, Math.max(bestScores.get(row.problem) ?? 0, subScore));
         emit({
           type: 'submission_judged',
           submission_id,
+          problem_id: row.problem,
           verdict: jv.verdict,
           raw_verdict: jv.raw_verdict,
           remote_submission_id: id,
           score: subScore,
-          max_score: jv.max_score ?? maxPts,
+          max_points: maxPts,
+          max_score: maxPts,
+          ...(jv.max_score !== undefined && jv.max_score !== maxPts ? { remote_max_score: jv.max_score } : {}),
           ...(jv.time_ms !== undefined ? { time_ms: jv.time_ms } : {}),
           ...(jv.memory_kb !== undefined ? { memory_kb: jv.memory_kb } : {}),
         });

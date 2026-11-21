@@ -1,4 +1,4 @@
-import { lstat, mkdir, readdir, realpath, rm } from 'node:fs/promises';
+import { lstat, mkdir, readdir, realpath, rm, rmdir } from 'node:fs/promises';
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { IncomingMessage } from 'node:http';
 import { z } from 'zod';
@@ -7,12 +7,24 @@ import { persistAgentManifest } from './author.js';
 import { agentCatalog, contestCatalog, evaluateMatrix } from './catalog.js';
 import { agentDigests, file, id as identifierSchema, loadAgent, loadContest, modelKey, resolveAgentManifest, revisionFor, sha256 } from './config.js';
 import { connectionId, ConnectionError, createConnectionSchema, endpoint, patchConnectionSchema, rotateConnectionSchema, type Connections } from './connections.js';
-import { createContestDocument, existingWorkspaceFile, outputPath, readWorkspaceFileNoFollow, updateContestDocument } from './contest-author.js';
+import {
+  assertAgentDocument,
+  assertContestDocument,
+  createContestDocument,
+  existingWorkspaceFile,
+  outputPath,
+  readWorkspaceFileNoFollow,
+  resolveRealPathOrAncestor,
+  updateContestDocument,
+  verifyManagedMaterialFile,
+  verifyManagedMaterialsRoot,
+} from './contest-author.js';
 import { imageFor, inspectImage } from './docker.js';
 import { efforts, harnessCapabilities, serviceTierSchema, speedTierSchema } from './harnesses.js';
 import {
   createOjAccountSchema,
   defaultOriginFor,
+  effectiveOriginFor,
   inferProblemMap,
   languagePresetsFor,
   listJudgeBackends,
@@ -25,11 +37,14 @@ import {
   patchOjAccountSchema,
   previewContest as defaultPreviewContest,
   rotateOjAccountSchema,
+  type OjAccount,
+  type OjPlatform,
 } from './judges/index.js';
-import { managedMaterial, uploadMaterial } from './materials.js';
+import { uploadMaterial } from './materials.js';
 import { checkPdfLimits, inspectPdf } from './pdf-synth.js';
 import { assertCompatible, checkOjReadiness } from './plan.js';
 import { protocolDigest, protocolPresetNames, protocolPresets, resolveProtocolPreset, resolveScoringMode } from './protocol.js';
+import { listBatches } from './queue.js';
 import { documentFormat, formatSchema, parseDocumentText, serializeDocument } from './serialization.js';
 import {
   capabilitiesSchema,
@@ -176,15 +191,29 @@ export function configError(error: unknown) {
 const ZodError = z.ZodError;
 const safeIssue = (code: string) => code === 'unrecognized_keys' ? 'Contains unsupported fields' : 'Invalid or missing value';
 
-async function scanWorkspaceConfigFiles(base: string, extensions: RegExp, limitError: () => Error) {
+const FORBIDDEN_WORKSPACE_DIRS = new Set(['node_modules', 'dist', 'coverage', 'runs']);
+const MANAGED_ASSET_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const MANAGED_ASSET_EXT = /^\.[A-Za-z0-9]{1,12}$/;
+
+function isWithinOrEqual(candidate: string, boundary: string): boolean {
+  const rel = relative(boundary, candidate);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+async function scanWorkspaceConfigFiles(base: string, root: string, extensions: RegExp, limitError: () => Error) {
+  const realBase = await realpath(base);
+  const realExcludedRoot = await resolveRealPathOrAncestor(root);
   const found: string[] = [];
-  const dirs = [base];
+  const dirs = [realBase];
   let scanned = 0;
   while (dirs.length) {
-    for (const entry of await readdir(dirs.pop()!, { withFileTypes: true })) {
+    const dir = dirs.pop()!;
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
       if (++scanned > 10000) throw limitError();
-      if (entry.name.startsWith('.') || ['node_modules', 'dist', 'coverage', 'runs'].includes(entry.name)) continue;
+      if (entry.name.startsWith('.') || FORBIDDEN_WORKSPACE_DIRS.has(entry.name)) continue;
+      if (entry.isSymbolicLink()) continue;
       const fullPath = join(entry.parentPath, entry.name);
+      if (isWithinOrEqual(fullPath, realExcludedRoot)) continue;
       if (entry.isDirectory()) { dirs.push(fullPath); continue; }
       if (!entry.isFile() || !extensions.test(entry.name)) continue;
       found.push(fullPath);
@@ -193,9 +222,10 @@ async function scanWorkspaceConfigFiles(base: string, extensions: RegExp, limitE
   return found;
 }
 
-async function workspaceReferences(base: string, id: string) {
+async function workspaceReferences(base: string, root: string, id: string) {
   const files = await scanWorkspaceConfigFiles(
     base,
+    root,
     /\.(toml|yaml|yml|json)$/i,
     () => new ConnectionError('Workspace too large to verify connection references', 409),
   );
@@ -214,139 +244,325 @@ async function workspaceReferences(base: string, id: string) {
   return false;
 }
 
-async function workspaceOjAccountReferences(base: string, id: string) {
+function judgeOriginFor(judge: Record<string, unknown>, platform: OjPlatform): string | undefined {
+  if (typeof judge.base_url === 'string' && judge.base_url.trim()) {
+    try {
+      return new URL(judge.base_url.trim()).origin;
+    } catch {
+      return undefined;
+    }
+  }
+  return defaultOriginFor(platform);
+}
+
+function contestJudgeReferencesAccount(
+  judgeRaw: unknown,
+  target: OjAccount,
+  allAccounts: readonly OjAccount[],
+  isActiveJob: boolean,
+): boolean {
+  if (!judgeRaw || typeof judgeRaw !== 'object' || Array.isArray(judgeRaw)) return false;
+  const judge = judgeRaw as Record<string, unknown>;
+  if (judge.account_id === target.id) return true;
+  if (judge.kind !== target.platform) return false;
+  const platform = target.platform;
+  const targetOrigin = effectiveOriginFor(target);
+  const contestOrigin = judgeOriginFor(judge, platform);
+  const originMatches = !contestOrigin || !targetOrigin || targetOrigin === contestOrigin;
+  if (!originMatches) return false;
+
+  if (typeof judge.pool === 'string' && !judge.account_id) {
+    if (target.pool !== judge.pool) return false;
+    if (typeof judge.handle === 'string' && target.handle.toLowerCase() !== judge.handle.trim().toLowerCase()) return false;
+    if (isActiveJob) return true;
+    // Block deleting the last ready account serving a referenced pool.
+    const hasReplacement = allAccounts.some(acc =>
+      acc.id !== target.id &&
+      acc.platform === platform &&
+      acc.pool === judge.pool &&
+      (typeof judge.handle !== 'string' || acc.handle.toLowerCase() === judge.handle.trim().toLowerCase()) &&
+      acc.ready &&
+      (!contestOrigin || effectiveOriginFor(acc) === contestOrigin),
+    );
+    return !hasReplacement;
+  }
+
+  if (typeof judge.handle === 'string' && !judge.account_id && !judge.pool) {
+    return target.handle.toLowerCase() === judge.handle.trim().toLowerCase();
+  }
+
+  // Active/queued jobs using platform-default selection (no account_id/pool/handle) may lease this account.
+  if (isActiveJob && !judge.account_id && !judge.pool && !judge.handle) {
+    return true;
+  }
+  return false;
+}
+
+async function workspaceOjAccountReferences(base: string, root: string, ojAccounts: OjAccounts, id: string) {
+  const target = await ojAccounts.get(id);
+  const allAccounts = await ojAccounts.list();
+
+  // 1. Check all workspace contest manifests
   const files = await scanWorkspaceConfigFiles(
     base,
+    root,
     /\.json$/i,
     () => new OjAccountError('Workspace too large to verify OJ account references', 409),
   );
   for (const path of files) {
-    const raw = await file(path, 1_000_000).then(bytes => JSON.parse(bytes.toString('utf8')) as unknown).catch(() => undefined);
-    if (
-      raw &&
-      typeof raw === 'object' &&
-      'contest_id' in raw &&
-      'judge' in raw &&
-      raw.judge &&
-      typeof raw.judge === 'object' &&
-      'account_id' in raw.judge &&
-      raw.judge.account_id === id
-    ) {
-      return true;
+    const raw = await readWorkspaceFileNoFollow(path, 1_000_000)
+      .then(bytes => JSON.parse(bytes.toString('utf8')) as unknown)
+      .catch(() => undefined);
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const obj = raw as Record<string, unknown>;
+    if (!('contest_id' in obj) || 'run_id' in obj || !('judge' in obj)) continue;
+    if (contestJudgeReferencesAccount(obj.judge, target, allAccounts, false)) return true;
+  }
+
+  // 2. Check all active (running) and queued batch jobs
+  const batches = await listBatches(root);
+  const checkedContestPaths = new Map<string, boolean>();
+  for (const batch of batches) {
+    for (let i = 0; i < batch.jobs.length; i++) {
+      const status = batch.jobs[i]?.status;
+      if (status !== 'running' && status !== 'queued') continue;
+      const contestPath = batch.plan.jobs[i]?.contest_path;
+      if (!contestPath) continue;
+      let referenced = checkedContestPaths.get(contestPath);
+      if (referenced === undefined) {
+        try {
+          const raw = JSON.parse((await file(contestPath, 1_000_000)).toString('utf8')) as unknown;
+          const judge = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>).judge : undefined;
+          referenced = contestJudgeReferencesAccount(judge, target, allAccounts, true);
+        } catch {
+          // Fail closed when an active/queued job's contest cannot be inspected.
+          referenced = true;
+        }
+        checkedContestPaths.set(contestPath, referenced);
+      }
+      if (referenced) return true;
     }
   }
   return false;
 }
 
-function parseManagedMaterialRef(root: string, ref: string): { contestId: string; kind: 'entrypoint' | 'attachment'; filename: string; fullPath: string } {
-  const parts = ref.split('/');
-  if (parts.length !== 4 || parts[0] !== 'managed') {
-    throw new FieldError(['path'], 'Material path must use managed/<contest_id>/<kind>/<filename>');
-  }
-  const contestId = identifierSchema.parse(parts[1]);
-  const kind = z.enum(['entrypoint', 'attachment']).parse(parts[2]);
-  const fullPath = managedMaterial(root, ref, contestId, kind);
-  if (!fullPath) throw new FieldError(['path'], 'Invalid managed material reference');
-  return { contestId, kind, filename: parts[3]!, fullPath };
-}
-
 async function pruneEmptyDirs(dir: string, stopAt: string) {
-  let current = dir;
+  let current = resolve(dir);
   const boundary = resolve(stopAt);
-  while (resolve(current) !== boundary && resolve(current).startsWith(boundary + sep)) {
-    const entries = await readdir(current).catch(() => []);
-    if (entries.length > 0) break;
-    await rm(current, { recursive: false, force: false }).catch(() => {});
+  while (current !== boundary && current.startsWith(boundary + sep)) {
+    try {
+      await rmdir(current);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (code === 'ENOENT' || code === 'ENOTEMPTY' || code === 'EEXIST') break;
+      throw error;
+    }
     current = dirname(current);
   }
 }
 
-async function deleteManagedMaterial(root: string, ref: string): Promise<string[]> {
-  const materialsRoot = join(root, '.materials');
-  const { fullPath } = parseManagedMaterialRef(root, ref);
-  let info;
-  try {
-    info = await lstat(fullPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
-      throw new FieldError(['path'], 'Material not found', 404);
-    }
-    throw error;
-  }
-  if (info.isSymbolicLink() || !info.isFile()) {
-    throw new FieldError(['path'], 'Material target is not a regular file');
-  }
-  const realRoot = await realpath(materialsRoot);
-  const realTarget = await realpath(fullPath);
-  const within = relative(realRoot, realTarget);
-  if (within === '..' || within.startsWith(`..${sep}`) || isAbsolute(within)) {
-    throw new FieldError(['path'], 'Material escapes managed materials directory');
-  }
-  await rm(fullPath);
-  await pruneEmptyDirs(dirname(fullPath), materialsRoot);
-  return [ref];
-}
-
-async function cleanupOrphanMaterials(root: string, base: string): Promise<string[]> {
-  const materialsRoot = join(root, '.materials');
-  let realMaterialsRoot: string;
-  try {
-    realMaterialsRoot = await realpath(materialsRoot);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return [];
-    throw error;
-  }
-
+async function collectReferencedManagedMaterials(
+  base: string,
+  root: string,
+  realMaterialsRoot: string,
+  fieldName: string,
+): Promise<Set<string>> {
   const referenced = new Set<string>();
   const files = await scanWorkspaceConfigFiles(
     base,
+    root,
     /\.json$/i,
-    () => new FieldError(['cleanup_orphans'], 'Workspace too large to scan material references', 409),
+    () => new FieldError([fieldName], 'Workspace too large to scan material references', 409),
   );
   for (const contestFile of files) {
-    const raw = await file(contestFile, 1_000_000).then(b => JSON.parse(b.toString('utf8')) as unknown).catch(() => undefined);
-    if (!raw || typeof raw !== 'object' || !('contest_id' in raw) || !('materials' in raw)) continue;
-    const materials = (raw as { materials?: unknown }).materials;
-    if (!materials || typeof materials !== 'object') continue;
-    const matRec = materials as { entrypoint?: { path?: unknown }; attachments?: Array<{ path?: unknown }> };
+    let bytes: Buffer;
+    try {
+      bytes = await readWorkspaceFileNoFollow(contestFile, 1_000_000, fieldName);
+    } catch {
+      throw new FieldError([fieldName], 'Could not read workspace JSON while scanning material references', 409);
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(bytes.toString('utf8')) as unknown;
+    } catch {
+      throw new FieldError([fieldName], 'Could not parse workspace JSON while scanning material references', 409);
+    }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const obj = raw as Record<string, unknown>;
+    if (!('contest_id' in obj) || 'run_id' in obj) continue;
+
     const candidates: string[] = [];
-    if (typeof matRec.entrypoint?.path === 'string') candidates.push(matRec.entrypoint.path);
-    if (Array.isArray(matRec.attachments)) {
-      for (const att of matRec.attachments) {
-        if (typeof att?.path === 'string') candidates.push(att.path);
+    // v1 contest manifest: statement.path
+    if (obj.statement && typeof obj.statement === 'object' && !Array.isArray(obj.statement)) {
+      const stPath = (obj.statement as { path?: unknown }).path;
+      if (typeof stPath === 'string') candidates.push(stPath);
+    }
+    // v2 contest manifest: materials.entrypoint.path & materials.attachments[].path
+    if (obj.materials && typeof obj.materials === 'object' && !Array.isArray(obj.materials)) {
+      const matRec = obj.materials as { entrypoint?: { path?: unknown }; attachments?: Array<{ path?: unknown }> };
+      if (typeof matRec.entrypoint?.path === 'string') candidates.push(matRec.entrypoint.path);
+      if (Array.isArray(matRec.attachments)) {
+        for (const att of matRec.attachments) {
+          if (typeof att?.path === 'string') candidates.push(att.path);
+        }
       }
     }
     for (const rel of candidates) {
+      if (rel.startsWith('managed/')) {
+        const parts = rel.split('/');
+        if (parts.length === 4) {
+          const direct = join(realMaterialsRoot, parts[1]!, parts[2]!, parts[3]!);
+          const real = await realpath(direct).catch(() => undefined);
+          if (real && isWithinOrEqual(real, realMaterialsRoot) && real !== realMaterialsRoot) {
+            referenced.add(real);
+          }
+        }
+        continue;
+      }
       const resolved = resolve(dirname(contestFile), rel);
       const real = await realpath(resolved).catch(() => undefined);
-      if (real && (real === realMaterialsRoot || real.startsWith(realMaterialsRoot + sep))) {
+      if (real && isWithinOrEqual(real, realMaterialsRoot) && real !== realMaterialsRoot) {
         referenced.add(real);
       }
     }
   }
+  return referenced;
+}
 
+async function deleteManagedMaterial(root: string, base: string, ref: string): Promise<string[]> {
+  const { fullPath, realMaterials } = await verifyManagedMaterialFile(root, ref, undefined, 'path');
+  const referenced = await collectReferencedManagedMaterials(base, root, realMaterials, 'path');
+  if (referenced.has(fullPath)) {
+    throw new FieldError(['path'], 'Material is referenced by a Contest manifest', 409);
+  }
+  await rm(fullPath);
+  await pruneEmptyDirs(dirname(fullPath), realMaterials);
+  return [ref];
+}
+
+async function cleanupOrphanMaterials(root: string, base: string): Promise<string[]> {
+  const realMaterialsRoot = await verifyManagedMaterialsRoot(root);
+  if (!realMaterialsRoot) return [];
+
+  // Scan ALL workspace manifests first; any scan/read/parse failure aborts cleanup with 0 deletions.
+  const referenced = await collectReferencedManagedMaterials(base, root, realMaterialsRoot, 'cleanup_orphans');
+
+  // Only inspect and delete recognized managed upload files in .materials/<contestId>/(entrypoint|attachment)/<assetName>.
   const deleted: string[] = [];
-  const walk = async (dir: string, relParts: string[]): Promise<void> => {
-    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      if (entry.name.startsWith('.')) continue;
-      const fullPath = join(dir, entry.name);
-      const info = await lstat(fullPath).catch(() => undefined);
-      if (!info || info.isSymbolicLink()) continue;
-      if (info.isDirectory()) {
-        await walk(fullPath, [...relParts, entry.name]);
-        await pruneEmptyDirs(fullPath, materialsRoot);
-      } else if (info.isFile()) {
+  const contestEntries = await readdir(realMaterialsRoot, { withFileTypes: true });
+  for (const contestEntry of contestEntries) {
+    if (contestEntry.name.startsWith('.') || !identifierSchema.safeParse(contestEntry.name).success) continue;
+    const contestDir = join(realMaterialsRoot, contestEntry.name);
+    const contestInfo = await lstat(contestDir).catch(() => undefined);
+    if (!contestInfo || contestInfo.isSymbolicLink() || !contestInfo.isDirectory()) continue;
+
+    const kindEntries = await readdir(contestDir, { withFileTypes: true }).catch(() => []);
+    for (const kindEntry of kindEntries) {
+      if (kindEntry.name !== 'entrypoint' && kindEntry.name !== 'attachment') continue;
+      const kindDir = join(contestDir, kindEntry.name);
+      const kindInfo = await lstat(kindDir).catch(() => undefined);
+      if (!kindInfo || kindInfo.isSymbolicLink() || !kindInfo.isDirectory()) continue;
+
+      const fileEntries = await readdir(kindDir, { withFileTypes: true }).catch(() => []);
+      for (const fileEntry of fileEntries) {
+        if (
+          fileEntry.name.startsWith('.') ||
+          !MANAGED_ASSET_NAME.test(fileEntry.name) ||
+          !MANAGED_ASSET_EXT.test(extname(fileEntry.name))
+        ) {
+          continue;
+        }
+        const fullPath = join(kindDir, fileEntry.name);
+        const fileInfo = await lstat(fullPath).catch(() => undefined);
+        if (!fileInfo || fileInfo.isSymbolicLink() || !fileInfo.isFile()) continue;
         const real = await realpath(fullPath).catch(() => undefined);
-        if (real && !referenced.has(real)) {
+        if (!real || !isWithinOrEqual(real, realMaterialsRoot) || real === realMaterialsRoot) continue;
+        if (!referenced.has(real)) {
           await rm(fullPath);
-          deleted.push(`managed/${[...relParts, entry.name].join('/')}`);
+          deleted.push(`managed/${contestEntry.name}/${kindEntry.name}/${fileEntry.name}`);
         }
       }
+      await pruneEmptyDirs(kindDir, realMaterialsRoot);
     }
-  };
-  await walk(materialsRoot, []);
+    await pruneEmptyDirs(contestDir, realMaterialsRoot);
+  }
   return deleted.sort();
+}
+
+function extractCookieSecrets(cookie: string | undefined): string[] {
+  if (!cookie) return [];
+  const secrets = new Set<string>();
+  const trimmed = cookie.trim();
+  if (trimmed) secrets.add(trimmed);
+  for (const part of trimmed.split(';')) {
+    const eq = part.indexOf('=');
+    const val = (eq >= 0 ? part.slice(eq + 1) : part).trim();
+    if (val.length >= 6) secrets.add(val);
+    if (part.trim().length >= 6) secrets.add(part.trim());
+  }
+  return [...secrets].sort((a, b) => b.length - a.length);
+}
+
+function redactSecretText(text: string, secrets: readonly string[]): string {
+  let out = text;
+  for (const secret of secrets) {
+    if (secret && out.includes(secret)) {
+      out = out.replaceAll(secret, '[REDACTED]');
+    }
+  }
+  return out;
+}
+
+function redactSecretsDeep<T>(value: T, secrets: readonly string[]): T {
+  if (!secrets.length) return value;
+  if (typeof value === 'string') return redactSecretText(value, secrets) as T;
+  if (Array.isArray(value)) return value.map(item => redactSecretsDeep(item, secrets)) as T;
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = redactSecretsDeep(v, secrets);
+    }
+    return out as T;
+  }
+  return value;
+}
+
+async function validateVariantDirectory(base: string, root: string, dirRel: string): Promise<string> {
+  if (!dirRel || dirRel.includes('\0') || isAbsolute(dirRel)) {
+    throw new FieldError(['directory'], 'Variant directory must be a relative path inside the Studio workspace');
+  }
+  const realBase = await realpath(base);
+  const realExcludedRoot = await resolveRealPathOrAncestor(root);
+  const candidate = resolve(realBase, dirRel);
+  const relDir = relative(realBase, candidate);
+  if (relDir === '..' || relDir.startsWith(`..${sep}`) || isAbsolute(relDir)) {
+    throw new FieldError(['directory'], 'Variant directory must be inside the Studio workspace');
+  }
+  const parts = relDir ? relDir.split(sep) : [];
+  if (
+    parts.some(p => !p || p === '.' || p === '..' || p.startsWith('.')) ||
+    (parts[0] !== undefined && FORBIDDEN_WORKSPACE_DIRS.has(parts[0]))
+  ) {
+    throw new FieldError(['directory'], 'Variant directory must be inside the Studio workspace');
+  }
+  if (isWithinOrEqual(candidate, realExcludedRoot)) {
+    throw new FieldError(['directory'], 'Variant directory cannot be inside the configured run root');
+  }
+  // Verify no existing prefix along the directory path is a symlink or non-directory BEFORE mkdir.
+  let cursor = realBase;
+  for (const part of parts) {
+    cursor = join(cursor, part);
+    try {
+      const info = await lstat(cursor);
+      if (info.isSymbolicLink() || !info.isDirectory()) {
+        throw new FieldError(['directory'], 'Variant directory traverses a symlink or non-directory');
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') break;
+      throw error;
+    }
+  }
+  return candidate;
 }
 
 function mergeCloneDocument(source: Record<string, unknown>, id: string, name?: string, overrides?: Record<string, unknown>) {
@@ -459,7 +675,7 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
       } else {
         if (method === 'PATCH') return { data: await describe(await store.patch(id, patchConnectionSchema.parse(await body()))) };
         if (method === 'DELETE') {
-          await store.remove(id, key => workspaceReferences(base, key));
+          await store.remove(id, key => workspaceReferences(base, root, key));
           return { data: { deleted: true } };
         }
       }
@@ -488,7 +704,7 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
           return { data: ojAccountResponseSchema.parse(updated) };
         }
         if (method === 'DELETE') {
-          await ojAccounts.remove(id, key => workspaceOjAccountReferences(base, key));
+          await ojAccounts.remove(id, key => workspaceOjAccountReferences(base, root, ojAccounts, key));
           return { data: { deleted: true } };
         }
       }
@@ -500,11 +716,12 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
     if (method === 'GET') {
       const relPath = url.searchParams.get('path');
       if (!relPath) throw new FieldError(['path'], 'Query parameter path is required');
-      const target = await existingWorkspaceFile(base, relPath, 'path');
+      const target = await existingWorkspaceFile(base, relPath, 'path', root);
       let format;
       try { format = documentFormat(target); } catch { throw new FieldError(['path'], 'Unsupported Agent manifest extension'); }
       const bytes = await readWorkspaceFileNoFollow(target);
       const parsed = parseDocumentText(bytes.toString('utf8'), format);
+      assertAgentDocument(target, parsed, 'path');
       const loaded = await loadAgent(target, store).then(value => ({ value }), error => ({ error }));
       const realBase = await realpath(base);
       return {
@@ -534,17 +751,21 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
     }
     if (method === 'PUT') {
       const input = agentUpdateRequest.parse(await body());
-      const target = await existingWorkspaceFile(base, input.path, 'path');
+      const target = await existingWorkspaceFile(base, input.path, 'path', root);
       let detected;
       try { detected = documentFormat(target); } catch { throw new FieldError(['path'], 'Unsupported manifest extension'); }
+      const existingBytes = await readWorkspaceFileNoFollow(target);
+      const existingParsed = parseDocumentText(existingBytes.toString('utf8'), detected);
+      assertAgentDocument(target, existingParsed, 'path');
       const format = input.format ?? detected;
       if (detected !== format) throw new FieldError(['format'], 'File extension does not match selected manifest format');
       const raw = z.record(z.string(), z.unknown()).parse(input.document);
       const resolved = await resolveAgentForWrite(raw, target, format, input.native_config, store, getImage, false, true);
       await persistAgentManifest(target, manifestProvider(resolved.manifest), resolved.serialized!, store, true);
+      const realBase = await realpath(base);
       return {
         data: {
-          path: target,
+          path: relative(realBase, target),
           format,
           manifest: resolved.manifest,
           revision: resolved.revision,
@@ -556,10 +777,15 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
     if (method === 'DELETE') {
       const relPath = url.searchParams.get('path');
       if (!relPath) throw new FieldError(['path'], 'Query parameter path is required');
-      const target = await existingWorkspaceFile(base, relPath, 'path');
-      try { documentFormat(target); } catch { throw new FieldError(['path'], 'Target is not a supported Agent manifest'); }
+      const target = await existingWorkspaceFile(base, relPath, 'path', root);
+      let format;
+      try { format = documentFormat(target); } catch { throw new FieldError(['path'], 'Target is not a supported Agent manifest'); }
+      const existingBytes = await readWorkspaceFileNoFollow(target);
+      const existingParsed = parseDocumentText(existingBytes.toString('utf8'), format);
+      assertAgentDocument(target, existingParsed, 'path');
       const realBase = await realpath(base);
       await rm(target);
+      await store.unregisterPath(target);
       return { data: { deleted: true, path: relative(realBase, target) } };
     }
   }
@@ -567,11 +793,12 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
   // Clone Agent
   if (method === 'POST' && path === '/api/agents/clone') {
     const input = agentCloneRequest.parse(await body());
-    const sourceTarget = await existingWorkspaceFile(base, input.source_path, 'source_path');
+    const sourceTarget = await existingWorkspaceFile(base, input.source_path, 'source_path', root);
     let sourceFormat;
     try { sourceFormat = documentFormat(sourceTarget); } catch { throw new FieldError(['source_path'], 'Unsupported Agent manifest extension'); }
     const bytes = await readWorkspaceFileNoFollow(sourceTarget);
     const parsed = parseDocumentText(bytes.toString('utf8'), sourceFormat);
+    assertAgentDocument(sourceTarget, parsed, 'source_path');
     const sourceDoc = z.record(z.string(), z.unknown()).parse(parsed);
     const clonedDoc = mergeCloneDocument(sourceDoc, input.id, input.name, input.overrides);
     const format = input.format ?? (input.file ? (() => {
@@ -579,7 +806,7 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
     })() : sourceFormat);
     const fileRel = input.file ?? `agents/${input.id}.${format}`;
     if (!input.file) await mkdir(join(base, 'agents'), { recursive: true });
-    const target = await outputPath(base, fileRel);
+    const target = await outputPath(base, fileRel, root);
     let detected;
     try { detected = documentFormat(target); } catch { throw new FieldError(['file'], 'Unsupported manifest extension'); }
     if (detected !== format) throw new FieldError(['file'], 'File extension does not match selected manifest format');
@@ -613,13 +840,22 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
     const totalCount = effortValues.length * speedValues.length * serviceValues.length;
     if (totalCount > 64) throw new FieldError(['base_document'], 'Variant matrix exceeds maximum of 64 variants');
 
+    // Validate variant directory confinement and symlinks BEFORE any mkdir!
+    const validatedDir = await validateVariantDirectory(base, root, dirRel);
     if (!input.dry_run) {
-      await mkdir(resolve(base, dirRel), { recursive: true });
+      await mkdir(validatedDir, { recursive: true });
     }
-    const baseDirResolved = input.dry_run ? resolve(base, dirRel) : await realpath(resolve(base, dirRel));
     const realBase = await realpath(base);
+    const realExcludedRoot = await resolveRealPathOrAncestor(root);
+    const baseDirResolved = input.dry_run ? validatedDir : await realpath(validatedDir);
     const relDir = relative(realBase, baseDirResolved);
-    if (relDir === '..' || relDir.startsWith(`..${sep}`) || isAbsolute(relDir) || relDir.split(sep).some(p => p.startsWith('.'))) {
+    if (
+      relDir === '..' ||
+      relDir.startsWith(`..${sep}`) ||
+      isAbsolute(relDir) ||
+      relDir.split(sep).some(p => p.startsWith('.')) ||
+      isWithinOrEqual(baseDirResolved, realExcludedRoot)
+    ) {
       throw new FieldError(['directory'], 'Variant directory must be inside the Studio workspace');
     }
 
@@ -670,7 +906,7 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
 
           const target = input.dry_run
             ? resolve(baseDirResolved, `${variantId}.${format}`)
-            : await outputPath(base, join(dirRel, `${variantId}.${format}`));
+            : await outputPath(base, join(dirRel, `${variantId}.${format}`), root);
           const resolved = await resolveAgentForWrite(doc, target, format, undefined, store, getImage, false, true);
           prepared.push({
             id: variantId,
@@ -702,7 +938,10 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
         writtenPaths.push(item.path);
       }
     } catch (error) {
-      for (const p of writtenPaths) await rm(p, { force: true }).catch(() => {});
+      for (const p of writtenPaths) {
+        await rm(p, { force: true }).catch(() => {});
+        await store.unregisterPath(p).catch(() => {});
+      }
       throw error;
     }
 
@@ -726,7 +965,7 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
     const fileRef = input.file ?? (managed ? `agents/${String(raw.id)}.toml` : undefined);
     const format = input.format ?? (managed ? 'toml' as const : undefined);
     if (saving && (!fileRef || !format)) throw new FieldError(['file'], 'File and manifest format are required');
-    const target = fileRef ? await outputPath(base, fileRef) : resolve(base, 'agent.toml');
+    const target = fileRef ? await outputPath(base, fileRef, root) : resolve(base, 'agent.toml');
     if (fileRef) {
       let detected;
       try { detected = documentFormat(target); } catch { throw new FieldError(['file'], 'Unsupported manifest extension'); }
@@ -778,12 +1017,13 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
     if (method === 'GET') {
       const relPath = url.searchParams.get('path');
       if (!relPath) throw new FieldError(['path'], 'Query parameter path is required');
-      const target = await existingWorkspaceFile(base, relPath, 'path');
+      const target = await existingWorkspaceFile(base, relPath, 'path', root);
       if (extname(target) !== '.json') throw new FieldError(['path'], 'Contest manifest must end in .json');
       const bytes = await readWorkspaceFileNoFollow(target);
       let parsed: unknown;
       try { parsed = JSON.parse(bytes.toString('utf8')); }
       catch { throw new FieldError(['path'], 'Invalid contest JSON'); }
+      assertContestDocument(target, parsed, 'path');
       const loaded = await loadContest(target).then(value => ({ value }), error => ({ error }));
       const realBase = await realpath(base);
       const includeLocalJudge =
@@ -813,8 +1053,13 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
     if (method === 'DELETE') {
       const relPath = url.searchParams.get('path');
       if (!relPath) throw new FieldError(['path'], 'Query parameter path is required');
-      const target = await existingWorkspaceFile(base, relPath, 'path');
+      const target = await existingWorkspaceFile(base, relPath, 'path', root);
       if (extname(target) !== '.json') throw new FieldError(['path'], 'Contest manifest must end in .json');
+      const bytes = await readWorkspaceFileNoFollow(target);
+      let parsed: unknown;
+      try { parsed = JSON.parse(bytes.toString('utf8')); }
+      catch { throw new FieldError(['path'], 'Target file is not a valid Contest manifest'); }
+      assertContestDocument(target, parsed, 'path');
       const realBase = await realpath(base);
       await rm(target);
       return { data: { deleted: true, path: relative(realBase, target) } };
@@ -838,7 +1083,7 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
       }
       const parsed = materialDeleteRequest.parse(rawInput);
       const deleted = parsed.path
-        ? await deleteManagedMaterial(root, parsed.path)
+        ? await deleteManagedMaterial(root, base, parsed.path)
         : await cleanupOrphanMaterials(root, base);
       return { data: { deleted, count: deleted.length } };
     }
@@ -856,37 +1101,37 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
         cookie = await ojAccounts.resolveSecret(input.account_id, { platform: input.platform, origin: targetOrigin });
       }
     }
-    const preview = await previewFn(input.platform, input.contest_id, {
-      gym: input.gym,
-      baseUrl: input.base_url,
-      domain: input.domain,
-      cookie,
-      signal,
-    });
+    const cookieSecrets = extractCookieSecrets(cookie);
+    let rawPreview: Awaited<ReturnType<typeof defaultPreviewContest>>;
+    try {
+      rawPreview = await previewFn(input.platform, input.contest_id, {
+        gym: input.gym,
+        baseUrl: input.base_url,
+        domain: input.domain,
+        cookie,
+        signal,
+      });
+    } catch (error) {
+      if (cookieSecrets.length && error instanceof Error) {
+        error.message = redactSecretText(error.message, cookieSecrets);
+      }
+      throw error;
+    }
+    const preview = redactSecretsDeep(rawPreview, cookieSecrets);
     let pdfInfo: Awaited<ReturnType<typeof inspectPdf>> | undefined;
     if (input.pdf_path) {
       let pdfFile: string;
       if (input.pdf_path.startsWith('managed/')) {
-        const ref = parseManagedMaterialRef(root, input.pdf_path);
-        const info = await lstat(ref.fullPath);
-        if (info.isSymbolicLink() || !info.isFile()) {
-          throw new FieldError(['pdf_path'], 'Material target is not a regular file');
-        }
-        const realMaterials = await realpath(join(root, '.materials'));
-        const realPdf = await realpath(ref.fullPath);
-        const within = relative(realMaterials, realPdf);
-        if (within === '..' || within.startsWith(`..${sep}`) || isAbsolute(within)) {
-          throw new FieldError(['pdf_path'], 'Material escapes managed directory');
-        }
-        pdfFile = ref.fullPath;
+        const managed = await verifyManagedMaterialFile(root, input.pdf_path, undefined, 'pdf_path');
+        pdfFile = managed.fullPath;
       } else {
-        pdfFile = await existingWorkspaceFile(base, input.pdf_path, 'pdf_path');
+        pdfFile = await existingWorkspaceFile(base, input.pdf_path, 'pdf_path', root);
       }
       pdfInfo = await inspectPdf(pdfFile);
     }
     const localProblems = input.local_problems ?? pdfInfo?.problem_ids ?? [];
     const problemMapSuggestion = localProblems.length > 0
-      ? inferProblemMap(localProblems, preview.problems)
+      ? redactSecretsDeep(inferProblemMap(localProblems, preview.problems), cookieSecrets)
       : undefined;
     return {
       data: {
@@ -905,6 +1150,9 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
   // Preflight Doctor
   if (method === 'POST' && path === '/api/preflight') {
     const input = preflightRequest.parse(await body());
+    if (!input.agents?.length && !input.contests?.length && !input.cells?.length) {
+      throw new FieldError(['agents'], 'Select at least one agent, contest, or cell to run preflight', 400);
+    }
     const agentPaths = new Set<string>(input.agents ?? []);
     const contestPaths = new Set<string>(input.contests ?? []);
     const cellPairs: Array<{ agent: string; contest: string }> = [];
@@ -931,7 +1179,7 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
       let harnessKindVal: string | undefined;
       let credentialOk = false;
       try {
-        const resolvedPath = await existingWorkspaceFile(base, relPath, 'agents');
+        const resolvedPath = await existingWorkspaceFile(base, relPath, 'agents', root);
         const loaded = await loadAgent(resolvedPath, store);
         loadedAgents.set(relPath, loaded);
         agentId = loaded.agent.agent_id;
@@ -983,7 +1231,7 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
       let ojReady = true;
       let pdfCheck: z.infer<typeof preflightReportSchema>['contests'][number]['pdf'];
       try {
-        const resolvedPath = await existingWorkspaceFile(base, relPath, 'contests');
+        const resolvedPath = await existingWorkspaceFile(base, relPath, 'contests', root);
         const loaded = await loadContest(resolvedPath);
         loadedContests.set(relPath, loaded);
         contestId = loaded.contest.contest_id;

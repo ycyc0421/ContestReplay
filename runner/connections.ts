@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { constants } from 'node:fs';
-import { link, mkdir, lstat, open, rename, rm, writeFile, readdir } from 'node:fs/promises';
+import { link, mkdir, lstat, open, realpath, rename, rm, writeFile, readdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { z } from 'zod';
 
 export const connectionId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
@@ -211,12 +211,63 @@ export class Connections {
     }
     else await channel('clear', old.credential_ref);
   }
+  private async canonicalRefPath(p: string) {
+    const abs = resolve(p);
+    try {
+      return await realpath(abs);
+    } catch {
+      const parentReal = await realpath(dirname(abs)).catch(() => dirname(abs));
+      return join(parentReal, basename(abs));
+    }
+  }
   register<T>(id: string, path: string, save: () => Promise<T>) {
     return this.locked(async () => {
       await this.stored(id); await privateDir(this.refs);
-      const file = join(this.refs, `${id}~${randomUUID()}.json`);
-      await writeFile(file, JSON.stringify({ path }), { mode: 0o600, flag: 'wx' });
-      try { return await save(); } catch (e) { await rm(file, { force: true }); throw e; }
+      const targetResolved = resolve(path);
+      const targetBefore = await this.canonicalRefPath(path);
+      const fileName = `${id}~${randomUUID()}.json`;
+      const file = join(this.refs, fileName);
+      await writeFile(file, JSON.stringify({ path: targetBefore }), { mode: 0o600, flag: 'wx' });
+      let result: T;
+      try { result = await save(); } catch (e) { await rm(file, { force: true }); throw e; }
+      const targetAfter = await this.canonicalRefPath(path);
+      const records = await readdir(this.refs).catch(e => { if (missing(e)) return []; throw e; });
+      for (const record of records) {
+        if (record === fileName || !record.endsWith('.json')) continue;
+        try {
+          const parsed = JSON.parse(await readPrivate(join(this.refs, record))) as { path?: unknown };
+          if (typeof parsed.path !== 'string') continue;
+          const recordCanonical = await this.canonicalRefPath(parsed.path);
+          if (recordCanonical === targetBefore || recordCanonical === targetAfter || resolve(parsed.path) === targetResolved) {
+            await rm(join(this.refs, record), { force: true });
+          }
+        } catch {
+          // Ignore malformed or concurrently removed ref files.
+        }
+      }
+      return result;
+    });
+  }
+  unregisterPath(path: string) {
+    return this.locked(async () => {
+      try { await assertPrivateDir(this.refs); }
+      catch (e) { if (missing(e)) return; throw e; }
+      const targetResolved = resolve(path);
+      const targetCanonical = await this.canonicalRefPath(path);
+      const records = await readdir(this.refs).catch(e => { if (missing(e)) return []; throw e; });
+      for (const record of records) {
+        if (!record.endsWith('.json')) continue;
+        try {
+          const parsed = JSON.parse(await readPrivate(join(this.refs, record))) as { path?: unknown };
+          if (typeof parsed.path !== 'string') continue;
+          const recordCanonical = await this.canonicalRefPath(parsed.path);
+          if (recordCanonical === targetCanonical || resolve(parsed.path) === targetResolved) {
+            await rm(join(this.refs, record), { force: true });
+          }
+        } catch {
+          // Ignore malformed or unreadable ref files.
+        }
+      }
     });
   }
   remove(id: string, referenced: (id: string) => Promise<boolean>) {

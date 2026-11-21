@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { appendFile, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -9,6 +10,15 @@ import { OjAccounts } from '../dist/judges/index.js';
 import { synthesizeTextContestPdf } from '../dist/pdf-synth.js';
 import { PushDispatcher, PushTargets } from '../dist/push.js';
 import { startStudio } from '../dist/studio.js';
+import {
+  agentItemResponseSchema,
+  contestItemResponseSchema,
+  contestPreviewResponseSchema,
+  coverageResponseSchema,
+  ojAccountsResponseSchema,
+  rankedResultsResponseSchema,
+  runStatusEventSchema,
+} from '../dist/studio-contract.js';
 
 const FAKE_IMAGE = 'sha256:' + 'b'.repeat(64);
 const getImage = async () => FAKE_IMAGE;
@@ -742,4 +752,701 @@ test('Studio v2 API: live progress, SSE stream, sliced logs, replay, ghost race,
   assert.equal(rankedByModel.value.groups[0].length, 1, 'Policy C groups both gpt-5.4 variants into 1 model row');
   assert.equal(rankedByModel.value.groups[0][0].result.agent_id, 'gpt-high', 'Primary row must be the highest-scoring variant');
   assert.equal(rankedByModel.value.groups[0][0].variants.length, 2, 'Variants array retains both reasoning_effort variants');
+  assert.deepEqual(rankedByModel.value.omitted_runs, []);
+  rankedResultsResponseSchema.parse(rankedByModel.value);
+});
+
+test('Studio v2 security & CRUD regressions: document identity, root exclusion, relative paths, provider ref cleanup, artifact confinement, immutable answers, materials safety, variant dir confinement, preview redaction, OJ guards, empty preflight', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-studio-v2-sec-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const base = join(dir, 'workspace');
+  // Deliberately nest custom run root INSIDE base to verify custom root exclusion!
+  const root = join(base, 'custom-runs');
+  await mkdir(join(base, 'agents'), { recursive: true });
+  await mkdir(join(base, 'contests'), { recursive: true });
+  await mkdir(join(root, 'agents'), { recursive: true });
+  await mkdir(join(root, 'contests'), { recursive: true });
+
+  const store = new Connections(join(dir, 'connections'));
+  const ojAccounts = new OjAccounts(join(dir, 'oj-accounts'));
+
+  await store.create({
+    id: 'prov-a',
+    label: 'Provider A',
+    protocol: 'responses',
+    base_url: 'https://api.example.com/v1',
+    secret: 'sk-provider-a-secret-1234',
+  });
+  await store.create({
+    id: 'prov-b',
+    label: 'Provider B',
+    protocol: 'responses',
+    base_url: 'https://api.example.com/v1',
+    secret: 'sk-provider-b-secret-5678',
+  });
+
+  // Preview mock that reflects cookie secrets in fields AND throws secret on contest_id === 999
+  let previewMode = 'reflect';
+  const mockPreviewContest = async (platform, contestId, opts) => {
+    const reflected = opts?.cookie ?? 'no-cookie';
+    if (previewMode === 'throw') {
+      throw new Error(`Upstream 403 rejecting cookie=${reflected}`);
+    }
+    return {
+      platform,
+      contest_ref: `${platform}:${contestId}`,
+      title: `Round ${contestId} (${reflected})`,
+      status: 'finished',
+      problems: [{ remote_id: 'A', title: `Secret ${reflected}`, max_points: 100 }],
+      suggested_languages: [],
+    };
+  };
+
+  const studio = await startStudio(root, 0, {
+    base,
+    store,
+    ojAccounts,
+    getImage,
+    previewContest: mockPreviewContest,
+  });
+  t.after(() => studio.close());
+  const req = makeRequester(studio.url);
+
+  // 1. Document identity & custom root exclusion on GET/PUT/DELETE /api/{agents,contests}/item
+  await writeFile(join(base, 'package.json'), JSON.stringify({ name: 'not-a-manifest', version: '1.0.0' }));
+  await writeFile(join(base, 'secret.judge.json'), JSON.stringify({ schema_version: 1, problems: [{ id: '1', max_points: 10, accepted_answers: ['42'] }] }));
+  await writeFile(join(base, 'run.json'), JSON.stringify({ run_id: randomUUID(), contest_id: 'x', agent_id: 'a' }));
+
+  const validAgentDoc = {
+    kind: 'contestreplay.dev/agent',
+    schema_version: 1,
+    id: 'agent-a',
+    name: 'Agent A',
+    model: 'gpt-5.4',
+    provider: 'prov-a',
+    harness: { kind: 'codex', version: '0.170.0', options: { reasoning_effort: 'medium' } },
+  };
+  await writeFile(join(root, 'agents', 'inside-root.json'), JSON.stringify(validAgentDoc));
+  const pdfInBase = join(base, 'paper.pdf');
+  await synthesizeTextContestPdf([{ id: '1', title: 'One', body: 'Solve 1.' }], pdfInBase);
+  await writeFile(
+    join(root, 'contests', 'inside-root.json'),
+    JSON.stringify({
+      schema_version: 2,
+      contest_id: 'inside-root',
+      data_version: 1,
+      title: 'Inside Root',
+      source: { name: 'Local' },
+      materials: { entrypoint: { kind: 'pdf', path: pdfInBase } },
+      problems: [{ id: '1', max_points: 1 }],
+      judge: { kind: 'local', answers: { path: join(base, 'secret.judge.json') } },
+    }),
+  );
+
+  for (const badPath of ['package.json', 'secret.judge.json', 'run.json', 'custom-runs/agents/inside-root.json']) {
+    assert.equal((await req(`/api/agents/item?path=${encodeURIComponent(badPath)}`)).status, 400, `GET agent must reject ${badPath}`);
+    assert.equal(
+      (await req('/api/agents/item', { method: 'PUT', body: { path: badPath, document: validAgentDoc } })).status,
+      400,
+      `PUT agent must reject ${badPath}`,
+    );
+    assert.equal((await req(`/api/agents/item?path=${encodeURIComponent(badPath)}`, { method: 'DELETE' })).status, 400, `DELETE agent must reject ${badPath}`);
+  }
+  for (const badPath of ['package.json', 'secret.judge.json', 'run.json', 'custom-runs/contests/inside-root.json']) {
+    assert.equal((await req(`/api/contests/item?path=${encodeURIComponent(badPath)}`)).status, 400, `GET contest must reject ${badPath}`);
+    assert.equal((await req(`/api/contests/item?path=${encodeURIComponent(badPath)}`, { method: 'DELETE' })).status, 400, `DELETE contest must reject ${badPath}`);
+  }
+
+  // 2. PUT /api/agents/item returns workspace-relative path & retires old provider refs; DELETE unregisters refs
+  const createdA = await req('/api/agents', { body: { document: validAgentDoc } });
+  assert.equal(createdA.status, 201, createdA.text);
+
+  // Provider A is referenced -> cannot delete
+  assert.equal((await req('/api/providers/prov-a', { method: 'DELETE' })).status, 409);
+
+  // Switch agent from prov-a -> prov-b via PUT /api/agents/item
+  const putA = await req('/api/agents/item', {
+    method: 'PUT',
+    body: { path: 'agents/agent-a.toml', document: { ...validAgentDoc, provider: 'prov-b' } },
+  });
+  assert.equal(putA.status, 200, putA.text);
+  assert.equal(putA.value.path, 'agents/agent-a.toml', 'PUT /api/agents/item must return workspace-relative path');
+  assert.ok(!putA.value.path.startsWith('/'), 'PUT /api/agents/item path must not be absolute');
+
+  // Now prov-a can be deleted while prov-b is protected
+  assert.equal((await req('/api/providers/prov-a', { method: 'DELETE' })).status, 200);
+  assert.equal((await req('/api/providers/prov-b', { method: 'DELETE' })).status, 409);
+
+  // Verify GET item validates against studio-contract schema
+  const getA = await req('/api/agents/item?path=agents/agent-a.toml');
+  assert.equal(getA.status, 200);
+  agentItemResponseSchema.parse(getA.value);
+
+  // Delete agent -> prov-b ref is unregistered -> prov-b can now be deleted
+  assert.equal((await req('/api/agents/item?path=agents/agent-a.toml', { method: 'DELETE' })).status, 200);
+  assert.equal((await req('/api/providers/prov-b', { method: 'DELETE' })).status, 200);
+
+  // 3. Variant directory confinement BEFORE mkdir (never creates out-of-workspace/hidden/root/symlink dirs)
+  await store.create({
+    id: 'prov-v',
+    label: 'Provider V',
+    protocol: 'responses',
+    base_url: 'https://api.example.com/v1',
+    secret: 'sk-provider-v-secret-9999',
+  });
+  const variantBaseDoc = { ...validAgentDoc, id: 'varbase', provider: 'prov-v' };
+  const outsideDir = join(dir, 'escaped-variants');
+  const hiddenDir = join(base, '.hidden-variants');
+  const insideRootDir = join(root, 'sub-variants');
+  await symlink(dir, join(base, 'sym-variants'));
+
+  for (const [badDir, checkPath] of [
+    ['../escaped-variants', outsideDir],
+    ['.hidden-variants', hiddenDir],
+    ['custom-runs/sub-variants', insideRootDir],
+    ['sym-variants/nested', join(dir, 'nested')],
+  ]) {
+    const res = await req('/api/agents/variants', {
+      body: { base_document: variantBaseDoc, reasoning_efforts: ['low'], directory: badDir, dry_run: false },
+    });
+    assert.equal(res.status, 400, `Variant directory ${badDir} must be rejected`);
+    await assert.rejects(stat(checkPath), /ENOENT/, `Directory ${badDir} must NOT be created before validation`);
+  }
+
+  // 4. Contest artifact confinement (external symlinked attachment & *.judge.json attachment rejected) + atomic immutable local PUT
+  const outsideSecret = join(dir, 'host-secret.txt');
+  await writeFile(outsideSecret, 'TOP_SECRET_HOST_FILE');
+  await symlink(outsideSecret, join(base, 'link-att.txt'));
+
+  const badSymContest = await req('/api/contests', {
+    body: {
+      document: {
+        schema_version: 2,
+        contest_id: 'bad-att-sym',
+        data_version: 1,
+        title: 'Bad Sym',
+        source: { name: 'Local' },
+        materials: {
+          entrypoint: { kind: 'pdf', path: pdfInBase },
+          attachments: [{ name: 'leak.txt', path: join(base, 'link-att.txt') }],
+        },
+        judge: { kind: 'local', problems: [{ id: '1', max_points: 10, accepted_answers: ['42'] }] },
+      },
+    },
+  });
+  assert.equal(badSymContest.status, 400, 'External symlink attachment must be rejected');
+
+  const badJudgeAttContest = await req('/api/contests', {
+    body: {
+      document: {
+        schema_version: 2,
+        contest_id: 'bad-att-judge',
+        data_version: 1,
+        title: 'Bad Judge Att',
+        source: { name: 'Local' },
+        materials: {
+          entrypoint: { kind: 'pdf', path: pdfInBase },
+          attachments: [{ name: 'answers.json', path: join(base, 'secret.judge.json') }],
+        },
+        judge: { kind: 'local', problems: [{ id: '1', max_points: 10, accepted_answers: ['42'] }] },
+      },
+    },
+  });
+  assert.equal(badJudgeAttContest.status, 400, '*.judge.json attachment must be rejected');
+
+  // Create valid local contest -> failed PUT preserves old manifest & answers -> valid PUT publishes new immutable answer file
+  const goodLocal = await req('/api/contests', {
+    body: {
+      document: {
+        schema_version: 2,
+        contest_id: 'atomic-local',
+        data_version: 1,
+        title: 'Atomic Local v1',
+        source: { name: 'Local' },
+        materials: { entrypoint: { kind: 'pdf', path: pdfInBase } },
+        judge: { kind: 'local', problems: [{ id: '1', max_points: 10, accepted_answers: ['42'] }] },
+      },
+    },
+  });
+  assert.equal(goodLocal.status, 201, goodLocal.text);
+  const v1ContestGet = await req('/api/contests/item?path=contests/atomic-local.json&include_judge=1');
+  assert.equal(v1ContestGet.status, 200);
+  contestItemResponseSchema.parse(v1ContestGet.value);
+  const v1JudgeRel = v1ContestGet.value.document.judge.answers.path;
+  const v1JudgeFull = join(base, 'contests', v1JudgeRel);
+
+  // Failing PUT (invalid PDF path) must leave old manifest and answers untouched
+  const failedPut = await req('/api/contests/item', {
+    method: 'PUT',
+    body: {
+      path: 'contests/atomic-local.json',
+      document: {
+        schema_version: 2,
+        contest_id: 'atomic-local',
+        data_version: 2,
+        title: 'Broken v2',
+        source: { name: 'Local' },
+        materials: { entrypoint: { kind: 'pdf', path: join(base, 'missing.pdf') } },
+        judge: { kind: 'local', problems: [{ id: '1', max_points: 10, accepted_answers: ['99'] }] },
+      },
+    },
+  });
+  assert.equal(failedPut.status, 404);
+  const stillV1 = await req('/api/contests/item?path=contests/atomic-local.json&include_judge=1');
+  assert.equal(stillV1.value.document.title, 'Atomic Local v1');
+  assert.equal(stillV1.value.judge.problems[0].accepted_answers[0], '42');
+
+  // Valid PUT creates a NEW immutable judge file and preserves the old v1 judge file on disk
+  const goodPut = await req('/api/contests/item', {
+    method: 'PUT',
+    body: {
+      path: 'contests/atomic-local.json',
+      document: {
+        schema_version: 2,
+        contest_id: 'atomic-local',
+        data_version: 2,
+        title: 'Atomic Local v2',
+        source: { name: 'Local' },
+        materials: { entrypoint: { kind: 'pdf', path: pdfInBase } },
+        judge: { kind: 'local', problems: [{ id: '1', max_points: 10, accepted_answers: ['99'] }] },
+      },
+    },
+  });
+  assert.equal(goodPut.status, 200, goodPut.text);
+  assert.equal(goodPut.value.path, 'contests/atomic-local.json', 'PUT /api/contests/item must return relative path');
+  assert.ok(!goodPut.value.path.startsWith('/'));
+  const v2ContestGet = await req('/api/contests/item?path=contests/atomic-local.json&include_judge=1');
+  assert.notEqual(v2ContestGet.value.document.judge.answers.path, v1JudgeRel, 'Updated answers must use a new immutable filename');
+  const oldJudgeDisk = JSON.parse(await readFile(v1JudgeFull, 'utf8'));
+  assert.equal(oldJudgeDisk.problems[0].accepted_answers[0], '42', 'Old immutable answer file must remain intact');
+
+  // 5. Materials direct delete & orphan cleanup safety (v1 + v2 refs, scan failure aborts with 0 deletions, symlinked .materials rejected)
+  const pdfBytes = await readFile(pdfInBase);
+  const uploadMat = async (contestId, filename, bytes, kind) => {
+    const form = new FormData();
+    form.append('contest_id', contestId);
+    form.append('kind', kind);
+    form.append('file', new Blob([bytes]), filename);
+    const res = await fetch(`${studio.url}/api/contests/materials`, {
+      method: 'POST',
+      headers: { Origin: studio.url, 'X-CR-Studio': '1' },
+      body: form,
+    });
+    return { status: res.status, value: await res.json() };
+  };
+  const matV1 = await uploadMat('mat-v1', 'v1.pdf', pdfBytes, 'entrypoint');
+  const matV2Ep = await uploadMat('mat-v2', 'v2.pdf', pdfBytes, 'entrypoint');
+  const matV2Att = await uploadMat('mat-v2', 'notes.txt', Buffer.from('attachment data'), 'attachment');
+  const matOrphan = await uploadMat('mat-orphan', 'orphan.pdf', pdfBytes, 'entrypoint');
+  assert.equal(matV1.status, 201);
+  assert.equal(matV2Ep.status, 201);
+  assert.equal(matV2Att.status, 201);
+  assert.equal(matOrphan.status, 201);
+
+  // Create v1 manifest referencing matV1 via statement.path
+  await writeFile(
+    join(base, 'contests', 'legacy-v1.json'),
+    JSON.stringify({
+      schema_version: 1,
+      contest_id: 'mat-v1',
+      data_version: 1,
+      title: 'Legacy v1',
+      statement: { path: matV1.value.path },
+      problems: [{ id: '1', max_points: 1 }],
+      judge: { kind: 'local', answers: { path: '../secret.judge.json' } },
+    }),
+  );
+  // Create v2 manifest referencing matV2Ep + matV2Att
+  const savedV2Mat = await req('/api/contests', {
+    body: {
+      document: {
+        schema_version: 2,
+        contest_id: 'mat-v2',
+        data_version: 1,
+        title: 'Managed v2',
+        source: { name: 'Local' },
+        materials: {
+          entrypoint: matV2Ep.value,
+          attachments: [{ name: 'notes.txt', path: matV2Att.value.path }],
+        },
+        judge: { kind: 'local', problems: [{ id: '1', max_points: 10, accepted_answers: ['42'] }] },
+      },
+    },
+  });
+  assert.equal(savedV2Mat.status, 201, savedV2Mat.text);
+
+  // Direct delete must refuse ALL referenced materials (v1 entrypoint, v2 entrypoint, v2 attachment) with 409
+  for (const ref of [matV1.value.path, matV2Ep.value.path, matV2Att.value.path]) {
+    const blocked = await req('/api/contests/materials', { method: 'DELETE', body: { path: ref } });
+    assert.equal(blocked.status, 409, `Direct delete must refuse referenced material ${ref}`);
+  }
+
+  // Corrupt JSON in workspace -> orphan cleanup MUST abort (409) with 0 deletions!
+  const corruptJsonPath = join(base, 'contests', 'corrupt.json');
+  await writeFile(corruptJsonPath, '{broken json');
+  const abortedCleanup = await req('/api/contests/materials', { method: 'DELETE', body: { cleanup_orphans: true } });
+  assert.equal(abortedCleanup.status, 409, 'Orphan cleanup must abort on JSON scan failure');
+  await stat(join(root, '.materials', 'mat-orphan', 'entrypoint', matOrphan.value.path.split('/').at(-1)));
+  await rm(corruptJsonPath);
+
+  // Now orphan cleanup succeeds, deletes ONLY matOrphan, keeps v1/v2 materials intact
+  const okCleanup = await req('/api/contests/materials', { method: 'DELETE', body: { cleanup_orphans: true } });
+  assert.equal(okCleanup.status, 200, okCleanup.text);
+  assert.deepEqual(okCleanup.value.deleted, [matOrphan.value.path]);
+
+  // 6. OJ Account delete guard across pool, handle, and active/queued batch jobs + preview secret redaction
+  const secretCookie = 'SID=super-secret-token-xyz-77777; csrf=another-secret-88888';
+  await req('/api/oj-accounts', {
+    body: { id: 'qoj-p1', label: 'QOJ Pool 1', platform: 'qoj', handle: 'qoj_h1', pool: 'shared', transport: 'cookie', secret: secretCookie },
+  });
+  await req('/api/oj-accounts', {
+    body: { id: 'qoj-p2', label: 'QOJ Pool 2', platform: 'qoj', handle: 'qoj_h2', pool: 'shared', transport: 'cookie', secret: 'SID=pool2-secret-value-11111' },
+  });
+  await req('/api/oj-accounts', {
+    body: { id: 'cf-h1', label: 'CF Handle', platform: 'codeforces', handle: 'cf_special_handle', pool: 'default', transport: 'cookie', secret: 'JSESSIONID=cf-handle-secret-22222' },
+  });
+  ojAccountsResponseSchema.parse((await req('/api/oj-accounts')).value);
+
+  // Preview secret reflection redaction (both response fields AND thrown error messages!)
+  previewMode = 'reflect';
+  const prevOk = await req('/api/contests/preview', {
+    body: { platform: 'qoj', contest_id: 42, account_id: 'qoj-p1' },
+  });
+  assert.equal(prevOk.status, 200, prevOk.text);
+  assert.ok(!prevOk.text.includes('super-secret-token-xyz-77777'), 'Preview response must redact cookie secret');
+  assert.ok(!prevOk.text.includes('another-secret-88888'), 'Preview response must redact cookie components');
+  assert.ok(prevOk.value.preview.title.includes('[REDACTED]'));
+  contestPreviewResponseSchema.parse(prevOk.value);
+
+  previewMode = 'throw';
+  const prevErr = await req('/api/contests/preview', {
+    body: { platform: 'qoj', contest_id: 999, account_id: 'qoj-p1' },
+  });
+  assert.equal(prevErr.status, 400);
+  assert.ok(!prevErr.text.includes('super-secret-token-xyz-77777'), 'Preview error must redact cookie secret');
+  assert.ok(prevErr.text.includes('[REDACTED]'));
+
+  // Contest referencing pool: 'shared' -> deleting 1st succeeds (2nd remains), deleting 2nd (last) returns 409!
+  const poolContest = await req('/api/contests', {
+    body: {
+      document: {
+        schema_version: 2,
+        contest_id: 'qoj-pool-ref',
+        data_version: 1,
+        title: 'QOJ Pool Ref',
+        source: { name: 'QOJ' },
+        materials: { entrypoint: { kind: 'pdf', path: pdfInBase } },
+        problems: [{ id: 'A', max_points: 100 }],
+        judge: { kind: 'qoj', contest_id: 42, pool: 'shared', languages: { cpp20: 'C++20' } },
+      },
+    },
+  });
+  assert.equal(poolContest.status, 201, poolContest.text);
+  assert.equal((await req('/api/oj-accounts/qoj-p1', { method: 'DELETE' })).status, 200, 'Deleting 1 of 2 ready pool accounts is allowed');
+  assert.equal((await req('/api/oj-accounts/qoj-p2', { method: 'DELETE' })).status, 409, 'Deleting last ready account in referenced pool must be blocked');
+
+  // Contest referencing handle without account_id -> blocks deleting matching handle account!
+  const handleContest = await req('/api/contests', {
+    body: {
+      document: {
+        schema_version: 2,
+        contest_id: 'cf-handle-ref',
+        data_version: 1,
+        title: 'CF Handle Ref',
+        source: { name: 'CF' },
+        materials: { entrypoint: { kind: 'pdf', path: pdfInBase } },
+        problems: [{ id: 'A', max_points: 500 }],
+        judge: { kind: 'codeforces', contest_id: 1900, gym: false, handle: 'cf_special_handle', languages: { cpp20: '89' } },
+      },
+    },
+  });
+  assert.equal(handleContest.status, 201, handleContest.text);
+  assert.equal((await req('/api/oj-accounts/cf-h1', { method: 'DELETE' })).status, 409, 'Contest referencing handle must block account delete');
+
+  // Remove handle contest, then add a queued batch job referencing a contest using platform-default CF -> still blocks delete!
+  assert.equal((await req('/api/contests/item?path=contests/cf-handle-ref.json', { method: 'DELETE' })).status, 200);
+  const activeCfContestPath = join(dir, 'external-cf-contest.json');
+  await writeFile(
+    activeCfContestPath,
+    JSON.stringify({
+      schema_version: 2,
+      contest_id: 'active-cf',
+      data_version: 1,
+      title: 'Active CF',
+      source: { name: 'CF' },
+      materials: { entrypoint: { kind: 'pdf', path: pdfInBase } },
+      problems: [{ id: 'A', max_points: 500 }],
+      judge: { kind: 'codeforces', contest_id: 1900, gym: false, languages: { cpp20: '89' } },
+    }),
+  );
+  const activeBatchId = randomUUID();
+  const fakeDigest = 'a'.repeat(64);
+  await mkdir(join(root, '.batches'), { recursive: true, mode: 0o700 });
+  await writeFile(
+    join(root, '.batches', `${activeBatchId}.json`),
+    JSON.stringify({
+      schema_version: 1,
+      id: activeBatchId,
+      created_at: new Date().toISOString(),
+      plan: {
+        schema_version: 2,
+        protocol_sha256: fakeDigest,
+        jobs: [{
+          image: FAKE_IMAGE,
+          harness: 'codex',
+          agent_path: join(base, 'agents', 'a.toml'),
+          agent_id: 'a',
+          agent_revision: fakeDigest,
+          agent_sha256: fakeDigest,
+          profile_sha256: fakeDigest,
+          contest_path: activeCfContestPath,
+          contest_id: 'active-cf',
+          data_version: 1,
+          contest_sha256: fakeDigest,
+        }],
+      },
+      jobs: [{ status: 'queued' }],
+    }),
+  );
+  assert.equal((await req('/api/oj-accounts/cf-h1', { method: 'DELETE' })).status, 409, 'Queued batch job must block OJ account delete');
+  await rm(join(root, '.batches', `${activeBatchId}.json`));
+  assert.equal((await req('/api/oj-accounts/cf-h1', { method: 'DELETE' })).status, 200);
+
+  // 7. Empty preflight rejected with 400
+  const emptyPre1 = await req('/api/preflight', { body: {} });
+  assert.equal(emptyPre1.status, 400);
+  assert.match(emptyPre1.value.error, /Select at least one/i);
+  const emptyPre2 = await req('/api/preflight', { body: { agents: [], contests: [], cells: [] } });
+  assert.equal(emptyPre2.status, 400);
+
+  // 8. Symlinked .materials root rejected on preview & material deletion
+  await rm(join(root, '.materials'), { recursive: true, force: true });
+  const fakeMatDir = join(dir, 'outside-materials');
+  await mkdir(join(fakeMatDir, 'x', 'entrypoint'), { recursive: true });
+  await writeFile(join(fakeMatDir, 'x', 'entrypoint', 'p.pdf'), pdfBytes);
+  await symlink(fakeMatDir, join(root, '.materials'));
+  assert.equal((await req('/api/contests/materials', { method: 'DELETE', body: { cleanup_orphans: true } })).status, 400);
+  assert.equal((await req('/api/contests/materials', { method: 'DELETE', body: { path: 'managed/x/entrypoint/p.pdf' } })).status, 400);
+  previewMode = 'reflect';
+  assert.equal(
+    (await req('/api/contests/preview', { body: { platform: 'qoj', contest_id: 42, pdf_path: 'managed/x/entrypoint/p.pdf' } })).status,
+    400,
+  );
+});
+
+test('Studio v2 runtime regressions: SSE closes on terminal queue jobs, /api/coverage execution recency ordering, UUID validation (404 without path leak), and ranked omitted_runs', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-studio-v2-rt-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const base = join(dir, 'workspace');
+  const root = join(dir, 'runs');
+  await mkdir(base, { recursive: true });
+  await mkdir(join(root, '.batches'), { recursive: true, mode: 0o700 });
+
+  const studio = await startStudio(root, 0, { base, getImage, ssePollMs: 40 });
+  t.after(() => studio.close());
+  const req = makeRequester(studio.url);
+
+  const dA = '1'.repeat(64);
+  const dC = '2'.repeat(64);
+  const dP = '3'.repeat(64);
+  const makePlanJob = (agentId, extra = {}) => ({
+    image: FAKE_IMAGE,
+    harness: 'codex',
+    agent_path: join(base, `${agentId}.toml`),
+    agent_id: agentId,
+    agent_revision: dA,
+    agent_sha256: dA,
+    profile_sha256: dA,
+    contest_path: join(base, 'c.json'),
+    contest_id: 'cov-contest',
+    data_version: 1,
+    contest_sha256: dC,
+    ...extra,
+  });
+
+  const writeRunFiles = async (runId, agentId, { startedAt, status = 'completed', score = 10, maxScore = 10, corrupt = false }) => {
+    const runDir = join(root, runId);
+    await mkdir(runDir, { recursive: true, mode: 0o700 });
+    if (corrupt) {
+      await writeFile(join(runDir, 'run.json'), '{not-valid-json');
+      return;
+    }
+    await writeFile(
+      join(runDir, 'run.json'),
+      JSON.stringify({
+        schema_version: 1,
+        run_id: runId,
+        contest_id: 'cov-contest',
+        data_version: 1,
+        contest_revision: dC,
+        protocol_id: 'contestreplay-mcp',
+        protocol_version: 1,
+        protocol_sha256: dP,
+        agent_id: agentId,
+        agent_revision: dA,
+        harness: { kind: 'codex', version: '0.170.0' },
+        model: { model: 'gpt-5.4', vendor: 'openai' },
+        input_sha256: { contest: dC },
+        problems: [{ id: '1', max_points: maxScore }],
+        rules: { time_limit_ms: 600_000, max_submissions: 10 },
+      }),
+    );
+    const events = [
+      JSON.stringify({ schema_version: 1, seq: 1, elapsed_ms: 0, type: 'run_started', started_at: startedAt }),
+    ];
+    if (status === 'completed') {
+      events.push(
+        JSON.stringify({ schema_version: 1, seq: 2, elapsed_ms: 1000, type: 'submission_received', submission_id: 's1', problem_id: '1' }),
+        JSON.stringify({ schema_version: 1, seq: 3, elapsed_ms: 1000, type: 'submission_judged', submission_id: 's1', problem_id: '1', verdict: 'accepted', score, max_points: maxScore }),
+        JSON.stringify({ schema_version: 1, seq: 4, elapsed_ms: 2000, type: 'run_ended', status: 'completed', reason: 'finish', score, max_score: maxScore }),
+      );
+    }
+    await writeFile(join(runDir, 'events.jsonl'), events.join('\n') + '\n');
+  };
+
+  // 1. Batch with:
+  //   - repeat 1 completed (r1) + repeat 2 queued (no run_id) -> /api/coverage MUST keep latest_status='completed' & latest_run_id=r1!
+  //   - cancelled job without run.json (rCancelledNoFile) -> SSE MUST emit event: status & close immediately!
+  //   - interrupted job whose run.json is stuck at running (rInterruptedStuck) -> SSE MUST emit event: status & close immediately!
+  //   - completed job with corrupted run.json (rCorrupt) -> /api/results/ranked MUST return it in omitted_runs without host paths!
+  const r1 = randomUUID();
+  const rCancelledNoFile = randomUUID();
+  const rInterruptedStuck = randomUUID();
+  const rCorrupt = randomUUID();
+  const b1 = randomUUID();
+
+  await writeRunFiles(r1, 'agent-repeat', { startedAt: '2026-01-01T00:01:00.000Z', status: 'completed', score: 8, maxScore: 10 });
+  await writeRunFiles(rInterruptedStuck, 'agent-int', { startedAt: '2026-01-01T00:02:00.000Z', status: 'running' });
+  await writeRunFiles(rCorrupt, 'agent-corrupt', { startedAt: '2026-01-01T00:03:00.000Z', corrupt: true });
+
+  await writeFile(
+    join(root, '.batches', `${b1}.json`),
+    JSON.stringify({
+      schema_version: 1,
+      id: b1,
+      created_at: '2026-01-01T00:00:00.000Z',
+      plan: {
+        schema_version: 2,
+        protocol_sha256: dP,
+        jobs: [
+          makePlanJob('agent-repeat', { repeat_index: 1, repeat_total: 2 }),
+          makePlanJob('agent-repeat', { repeat_index: 2, repeat_total: 2 }),
+          makePlanJob('agent-cancel'),
+          makePlanJob('agent-int'),
+          makePlanJob('agent-corrupt'),
+        ],
+      },
+      jobs: [
+        { status: 'completed', run_id: r1, reason: 'finish' },
+        { status: 'queued' },
+        { status: 'cancelled', run_id: rCancelledNoFile, reason: 'cancelled' },
+        { status: 'interrupted', run_id: rInterruptedStuck, reason: 'executor_stopped' },
+        { status: 'completed', run_id: rCorrupt, reason: 'finish' },
+      ],
+    }),
+  );
+
+  // 2. Resumed older batch vs newer batch for /api/coverage execution recency ordering:
+  //    bOlder (created 01:00) ran at 05:00 (resumed!) vs bNewer (created 02:00) ran at 03:00 -> bOlder's run MUST win!
+  const rOldResumed = randomUUID();
+  const rNewerCreated = randomUUID();
+  const bOlder = randomUUID();
+  const bNewer = randomUUID();
+  await writeRunFiles(rOldResumed, 'agent-recency', { startedAt: '2026-01-01T05:00:00.000Z', status: 'completed', score: 10, maxScore: 10 });
+  await writeRunFiles(rNewerCreated, 'agent-recency', { startedAt: '2026-01-01T03:00:00.000Z', status: 'completed', score: 5, maxScore: 10 });
+
+  await writeFile(
+    join(root, '.batches', `${bOlder}.json`),
+    JSON.stringify({
+      schema_version: 1,
+      id: bOlder,
+      created_at: '2026-01-01T01:00:00.000Z',
+      plan: { schema_version: 2, protocol_sha256: dP, jobs: [makePlanJob('agent-recency')] },
+      jobs: [{ status: 'completed', run_id: rOldResumed, reason: 'finish' }],
+    }),
+  );
+  await writeFile(
+    join(root, '.batches', `${bNewer}.json`),
+    JSON.stringify({
+      schema_version: 1,
+      id: bNewer,
+      created_at: '2026-01-01T02:00:00.000Z',
+      plan: { schema_version: 2, protocol_sha256: dP, jobs: [makePlanJob('agent-recency')] },
+      jobs: [{ status: 'completed', run_id: rNewerCreated, reason: 'finish' }],
+    }),
+  );
+
+  // Check /api/coverage
+  const covRes = await req('/api/coverage');
+  assert.equal(covRes.status, 200, covRes.text);
+  coverageResponseSchema.parse(covRes.value);
+  const repeatCell = covRes.value.cells.find(c => c.agent_id === 'agent-repeat');
+  assert.ok(repeatCell);
+  assert.equal(repeatCell.latest_status, 'completed', 'Unrun queued repeat must NOT overwrite completed latest_status');
+  assert.equal(repeatCell.latest_run_id, r1, 'Unrun queued repeat must NOT clear latest_run_id');
+  assert.equal(repeatCell.completed_count, 1);
+
+  const recencyCell = covRes.value.cells.find(c => c.agent_id === 'agent-recency');
+  assert.ok(recencyCell);
+  assert.equal(recencyCell.latest_run_id, rOldResumed, 'Resumed older batch that ran more recently must win latest_run_id');
+  assert.equal(recencyCell.completed_count, 2);
+  assert.equal(recencyCell.best_score, 10);
+
+  // Check SSE closes promptly on both cancelled-before-run.json AND interrupted-with-running-run.json!
+  const readSseToClose = async runId => {
+    const res = await fetch(`${studio.url}/api/runs/${runId}/events`, { signal: AbortSignal.timeout(2000) });
+    assert.equal(res.status, 200);
+    const bodyText = await res.text();
+    const frames = bodyText.split('\n\n').filter(Boolean);
+    return frames.map(f => {
+      const eventLine = f.split('\n').find(l => l.startsWith('event: '));
+      const dataLine = f.split('\n').find(l => l.startsWith('data: '));
+      return {
+        event: eventLine ? eventLine.slice(7) : null,
+        data: dataLine ? JSON.parse(dataLine.slice(6)) : null,
+      };
+    }).filter(f => f.event);
+  };
+
+  const sseCancelFrames = await readSseToClose(rCancelledNoFile);
+  const cancelStatus = sseCancelFrames.find(f => f.event === 'status');
+  assert.ok(cancelStatus, 'Cancelled job without run.json must emit terminal status event and close');
+  runStatusEventSchema.parse(cancelStatus.data);
+  assert.equal(cancelStatus.data.status, 'cancelled');
+
+  const sseIntFrames = await readSseToClose(rInterruptedStuck);
+  const intStatus = sseIntFrames.find(f => f.event === 'status');
+  assert.ok(intStatus, 'Interrupted job with stuck running run.json must emit terminal status event and close');
+  runStatusEventSchema.parse(intStatus.data);
+  assert.equal(intStatus.data.status, 'interrupted');
+
+  // Check strict UUID validation (400) & missing batch (404 without host path leak) on /api/batches/:id/* and /api/results/ranked
+  const missingBatchId = randomUUID();
+  assert.equal((await req('/api/batches/not-a-uuid/results')).status, 400);
+  assert.equal((await req('/api/batches/not-a-uuid/stop', { method: 'POST', body: {} })).status, 400);
+  assert.equal((await req('/api/batches/not-a-uuid/resume', { method: 'POST', body: {} })).status, 400);
+  assert.equal((await req('/api/results/ranked?batch_id=not-a-uuid')).status, 400);
+
+  for (const [p, opts] of [
+    [`/api/batches/${missingBatchId}/results`, {}],
+    [`/api/batches/${missingBatchId}/stop`, { method: 'POST', body: {} }],
+    [`/api/batches/${missingBatchId}/resume`, { method: 'POST', body: {} }],
+    [`/api/results/ranked?batch_id=${missingBatchId}`, {}],
+  ]) {
+    const res = await req(p, opts);
+    assert.equal(res.status, 404, `Missing batch on ${p} must return 404`);
+    assert.equal(res.value.error, 'Batch not found');
+    assert.ok(!res.text.includes(root), `404 on ${p} must never leak host filesystem path`);
+  }
+
+  // Check /api/results/ranked reports omitted_runs without leaking host paths
+  const rankedRes = await req(`/api/results/ranked?batch_id=${b1}`);
+  assert.equal(rankedRes.status, 200, rankedRes.text);
+  rankedResultsResponseSchema.parse(rankedRes.value);
+  assert.equal(rankedRes.value.groups.length, 1);
+  assert.equal(rankedRes.value.groups[0].length, 1);
+  assert.equal(rankedRes.value.groups[0][0].result.run_id, r1);
+  assert.equal(rankedRes.value.omitted_runs.length, 1);
+  assert.equal(rankedRes.value.omitted_runs[0].run_id, rCorrupt);
+  assert.ok(!rankedRes.value.omitted_runs[0].reason.includes(root), 'omitted_runs reason must not leak host path');
 });

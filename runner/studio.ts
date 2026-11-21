@@ -73,6 +73,29 @@ function reply(res: ServerResponse, status: number, content: string, type = 'app
   res.end(content);
 }
 
+const MAX_SSE_CONNECTIONS = 64;
+const TERMINAL_JOB_STATUSES = new Set(['completed', 'void', 'cancelled', 'interrupted']);
+
+function isMissingError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException)?.code === 'ENOENT';
+}
+
+function parseUuidParam(raw: string, label: string): string {
+  const parsed = z.uuid().safeParse(raw);
+  if (!parsed.success) throw new HttpError(400, `Invalid ${label}`);
+  return parsed.data;
+}
+
+function sanitizeOmittedReason(root: string, error: unknown): string {
+  if (isMissingError(error)) return 'Run artifacts missing';
+  if (error instanceof z.ZodError) return 'Invalid run metadata';
+  const raw = error instanceof Error ? error.message : 'Could not export run';
+  if (raw.includes(root) || /(?:^|[\s'"])(?:\/|[A-Za-z]:\\)\S+/.test(raw)) {
+    return 'Run artifacts could not be exported';
+  }
+  return raw.slice(0, 200);
+}
+
 const raceRequestSchema = z.strictObject({
   run_ids: z.array(z.uuid()).min(1).max(8),
   scoring_mode: scoringModeSchema.optional(),
@@ -219,22 +242,22 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
         }
       }
 
-      // Batches with live_summary on running jobs
+      // Batches with live_summary on running jobs (bounded concurrency)
       if (req.method === 'GET' && path === '/api/batches') {
         const summaries = (await listBatches(root)).map(summarize);
-        await Promise.all(
-          summaries.flatMap(b =>
-            b.jobs.map(async job => {
-              if (job.status === 'running' && job.run_id) {
-                const progress = await readRunProgress(root, job.run_id).catch(() => undefined);
-                if (progress) {
-                  (job as typeof job & { live_summary?: ReturnType<typeof summarizeLiveRun> }).live_summary =
-                    summarizeLiveRun(progress);
-                }
+        const runningJobs = summaries.flatMap(b => b.jobs.filter(job => job.status === 'running' && job.run_id));
+        for (let i = 0; i < runningJobs.length; i += 8) {
+          const chunk = runningJobs.slice(i, i + 8);
+          await Promise.all(
+            chunk.map(async job => {
+              const progress = await readRunProgress(root, job.run_id!).catch(() => undefined);
+              if (progress) {
+                (job as typeof job & { live_summary?: ReturnType<typeof summarizeLiveRun> }).live_summary =
+                  summarizeLiveRun(progress);
               }
             }),
-          ),
-        );
+          );
+        }
         return json(res, { batches: summaries, error: lastError, busy: !!worker });
       }
 
@@ -250,10 +273,18 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
         return json(res, { path: saved }, 201);
       }
 
-      const exported = path.match(/^\/api\/batches\/([0-9a-f-]+)\/results$/);
+      const exported = path.match(/^\/api\/batches\/([^/]+)\/results$/);
       if (req.method === 'GET' && exported) {
+        const batchId = parseUuidParam(exported[1]!, 'batch ID');
+        let bundle;
+        try {
+          bundle = await exportBatch(root, batchId);
+        } catch (error) {
+          if (isMissingError(error)) throw new HttpError(404, 'Batch not found');
+          throw error;
+        }
         res.setHeader('Content-Disposition', 'attachment; filename="results.json"');
-        return json(res, await exportBatch(root, exported[1]!));
+        return json(res, bundle);
       }
 
       if (req.method === 'POST' && path === '/api/plan') {
@@ -287,27 +318,88 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
         return json(res, { id }, 202);
       }
 
-      const batch = path.match(/^\/api\/batches\/([0-9a-f-]+)\/(stop|resume)$/);
+      const batch = path.match(/^\/api\/batches\/([^/]+)\/(stop|resume)$/);
       if (req.method === 'POST' && batch) {
         await body(req);
-        const id = batch[1]!;
-        if (batch[2] === 'resume') await launch(async () => id);
-        else await requestBatchStop(root, id);
+        const id = parseUuidParam(batch[1]!, 'batch ID');
+        if (batch[2] === 'resume') {
+          try {
+            await getBatch(root, id);
+          } catch (error) {
+            if (isMissingError(error)) throw new HttpError(404, 'Batch not found');
+            throw error;
+          }
+          await launch(async () => id);
+        } else {
+          try {
+            await requestBatchStop(root, id);
+          } catch (error) {
+            if (isMissingError(error)) throw new HttpError(404, 'Batch not found');
+            throw error;
+          }
+        }
         return json(res, { id }, 202);
       }
 
       // Coverage-driven matrix endpoint
       if (req.method === 'GET' && path === '/api/coverage') {
         const batches = await listBatches(root); // newest first
-        const map = new Map<string, CoverageCell>();
+        // Read run progress with bounded concurrency (chunks of 8) so we can score and order by actual execution recency.
+        const uniqueRunIds = [...new Set(
+          batches.flatMap(b => b.jobs.map(j => j.run_id).filter((id): id is string => Boolean(id))),
+        )];
+        const progressByRunId = new Map<string, Awaited<ReturnType<typeof readRunProgress>>>();
+        for (let i = 0; i < uniqueRunIds.length; i += 8) {
+          const chunk = uniqueRunIds.slice(i, i + 8);
+          const loaded = await Promise.all(
+            chunk.map(async runId => [runId, await readRunProgress(root, runId).catch(() => undefined)] as const),
+          );
+          for (const [runId, progress] of loaded) {
+            if (progress) progressByRunId.set(runId, progress);
+          }
+        }
+
+        type RecencyRank = {
+          executed: number;
+          activityTs: number;
+          isActive: number;
+          batchCreatedMs: number;
+          jobIndex: number;
+        };
+        const isMoreRecent = (a: RecencyRank, b: RecencyRank): boolean =>
+          a.executed !== b.executed ? a.executed > b.executed
+            : a.activityTs !== b.activityTs ? a.activityTs > b.activityTs
+              : a.isActive !== b.isActive ? a.isActive > b.isActive
+                : a.batchCreatedMs !== b.batchCreatedMs ? a.batchCreatedMs > b.batchCreatedMs
+                  : a.jobIndex > b.jobIndex;
+
+        const nowMs = Date.now();
+        const map = new Map<string, { cell: CoverageCell; latestRank: RecencyRank }>();
         for (const b of batches) {
-          for (let i = b.jobs.length - 1; i >= 0; i--) {
+          const batchCreatedMs = Date.parse(b.created_at) || 0;
+          for (let i = 0; i < b.jobs.length; i++) {
             const job = b.jobs[i]!;
             const planJob = b.plan.jobs[i]!;
             const key = JSON.stringify([planJob.agent_id, planJob.agent_revision, planJob.contest_id, planJob.data_version]);
-            let cell = map.get(key);
-            if (!cell) {
-              cell = {
+            const progress = job.run_id ? progressByRunId.get(job.run_id) : undefined;
+            const startedAtMs = progress?.started_at ? Date.parse(progress.started_at) : NaN;
+            const executed = job.run_id !== undefined || job.status === 'running' ? 1 : 0;
+            const activityTs = Number.isFinite(startedAtMs)
+              ? startedAtMs + (progress?.elapsed_ms ?? 0)
+              : job.status === 'running'
+                ? nowMs
+                : batchCreatedMs;
+            const rank: RecencyRank = {
+              executed,
+              activityTs,
+              isActive: job.status === 'running' ? 1 : 0,
+              batchCreatedMs,
+              jobIndex: i,
+            };
+
+            let entry = map.get(key);
+            if (!entry) {
+              const cell: CoverageCell = {
                 agent_id: planJob.agent_id,
                 agent_revision: planJob.agent_revision,
                 contest_id: planJob.contest_id,
@@ -317,23 +409,27 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
                 latest_status: job.status,
                 ...(job.run_id ? { latest_run_id: job.run_id } : {}),
               };
-              map.set(key, cell);
+              entry = { cell, latestRank: rank };
+              map.set(key, entry);
+            } else if (isMoreRecent(rank, entry.latestRank)) {
+              entry.latestRank = rank;
+              entry.cell.latest_status = job.status;
+              if (job.run_id) entry.cell.latest_run_id = job.run_id;
+              else delete entry.cell.latest_run_id;
             }
+
             if (job.status === 'completed') {
-              cell.completed_count++;
-              if (job.run_id) {
-                const progress = await readRunProgress(root, job.run_id).catch(() => undefined);
-                if (progress) {
-                  cell.best_score = cell.best_score === undefined ? progress.score : Math.max(cell.best_score, progress.score);
-                  cell.max_score = cell.max_score === undefined ? progress.max_score : Math.max(cell.max_score, progress.max_score);
-                }
+              entry.cell.completed_count++;
+              if (progress) {
+                entry.cell.best_score = entry.cell.best_score === undefined ? progress.score : Math.max(entry.cell.best_score, progress.score);
+                entry.cell.max_score = entry.cell.max_score === undefined ? progress.max_score : Math.max(entry.cell.max_score, progress.max_score);
               }
             } else if (job.status === 'void') {
-              cell.void_count++;
+              entry.cell.void_count++;
             }
           }
         }
-        return json(res, coverageResponseSchema.parse({ cells: [...map.values()] }));
+        return json(res, coverageResponseSchema.parse({ cells: [...map.values()].map(v => v.cell) }));
       }
 
       // Ranked results (supports Policy C model grouping & multi-scoring)
@@ -346,15 +442,33 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
         const family = url.searchParams.get('family') || undefined;
         const batchIdParam = url.searchParams.get('batch_id') || undefined;
 
-        const targetBatches = batchIdParam ? [await getBatch(root, z.uuid().parse(batchIdParam))] : await listBatches(root);
+        let targetBatches;
+        if (batchIdParam) {
+          const validBatchId = parseUuidParam(batchIdParam, 'batch_id');
+          try {
+            targetBatches = [await getBatch(root, validBatchId)];
+          } catch (error) {
+            if (isMissingError(error)) throw new HttpError(404, 'Batch not found');
+            throw error;
+          }
+        } else {
+          targetBatches = await listBatches(root);
+        }
         const seenRunIds = new Set<string>();
         const results: Result[] = [];
+        const omitted_runs: Array<{ run_id: string; reason: string }> = [];
         for (const b of targetBatches) {
           for (const job of b.jobs) {
             if (job.status !== 'completed' || !job.run_id || seenRunIds.has(job.run_id)) continue;
             seenRunIds.add(job.run_id);
-            const exportedRun = await exportRun(root, job.run_id).catch(() => undefined);
-            if (exportedRun) results.push(exportedRun);
+            try {
+              results.push(await exportRun(root, job.run_id));
+            } catch (error) {
+              omitted_runs.push({
+                run_id: job.run_id,
+                reason: sanitizeOmittedReason(root, error),
+              });
+            }
           }
         }
         const groups = rankResults(resultBundle(results), { scoring, groupBy, vendor, family });
@@ -362,6 +476,7 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
           scoring_mode: scoring ?? null,
           group_by: groupBy,
           groups,
+          omitted_runs,
         });
       }
 
@@ -379,9 +494,9 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
       }
 
       // Run-specific routes: progress, events (SSE), logs (full or sliced), replay, cancel
-      const run = path.match(/^\/api\/runs\/([0-9a-f-]+)\/(logs|cancel|progress|events|replay)$/);
+      const run = path.match(/^\/api\/runs\/([^/]+)\/(logs|cancel|progress|events|replay)$/);
       if (run) {
-        const runId = run[1]!;
+        const runId = parseUuidParam(run[1]!, 'run ID');
         const action = run[2]!;
 
         if (req.method === 'GET' && action === 'progress') {
@@ -390,7 +505,14 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
         }
 
         if (req.method === 'GET' && action === 'events') {
+          if (sseResponses.size >= MAX_SSE_CONNECTIONS) {
+            throw new HttpError(503, 'Too many concurrent SSE streams');
+          }
           if (!await lookupRun(root, runId)) throw new HttpError(404, 'Unknown batch run');
+          if (res.destroyed || res.writableEnded || control.signal.aborted) return;
+          if (sseResponses.size >= MAX_SSE_CONNECTIONS) {
+            throw new HttpError(503, 'Too many concurrent SSE streams');
+          }
           req.setTimeout(0);
           res.setTimeout(0);
           res.writeHead(200, {
@@ -413,32 +535,78 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
             closed = true;
             if (timer) clearInterval(timer);
             sseResponses.delete(res);
+            req.off('close', cleanup);
+            res.off('close', cleanup);
+            req.off('error', cleanup);
+            res.off('error', cleanup);
             control.signal.removeEventListener('abort', cleanup);
             if (!res.writableEnded && !res.destroyed) res.end();
           };
 
+          const safeWrite = (chunk: string) => {
+            if (closed || res.destroyed || res.writableEnded) return false;
+            try {
+              res.write(chunk);
+              return true;
+            } catch {
+              cleanup();
+              return false;
+            }
+          };
+
           req.once('close', cleanup);
           res.once('close', cleanup);
+          req.on('error', cleanup);
+          res.on('error', cleanup);
           control.signal.addEventListener('abort', cleanup, { once: true });
 
+          const emitTerminalStatus = (status: string, reason?: string) => {
+            const payload = JSON.stringify({
+              run_id: runId,
+              status,
+              ...(reason ? { reason } : {}),
+            });
+            safeWrite(`event: status\ndata: ${payload}\n\n`);
+            cleanup();
+          };
+
           const tick = async () => {
-            if (closed || polling) return;
+            if (closed || polling || res.destroyed || res.writableEnded) return;
             polling = true;
             try {
               const snapshot = await readRunProgress(root, runId);
-              if (closed) return;
+              if (closed || res.destroyed || res.writableEnded) return;
               const serialized = JSON.stringify(snapshot);
-              if (serialized !== lastSent) {
+              const changed = serialized !== lastSent;
+              if (changed) {
                 lastSent = serialized;
-                res.write(`event: progress\ndata: ${serialized}\n\n`);
-              } else {
-                res.write(': ping\n\n');
+                if (!safeWrite(`event: progress\ndata: ${serialized}\n\n`)) return;
               }
               if (snapshot.status === 'completed' || snapshot.status === 'void') {
                 cleanup();
+                return;
+              }
+              // Non-terminal progress snapshot: verify the queue job has not already terminated
+              // (e.g. cancelled or interrupted externally).
+              const current = await lookupRun(root, runId).catch(() => undefined);
+              if (closed || res.destroyed || res.writableEnded) return;
+              if (current && TERMINAL_JOB_STATUSES.has(current.job.status)) {
+                emitTerminalStatus(current.job.status, current.job.reason);
+                return;
+              }
+              if (!changed) {
+                safeWrite(': ping\n\n');
               }
             } catch {
-              if (!closed) res.write(': ping\n\n');
+              if (closed || res.destroyed || res.writableEnded) return;
+              // Run progress unavailable (e.g. ENOENT before run.json is written): check queue job status.
+              const current = await lookupRun(root, runId).catch(() => undefined);
+              if (closed || res.destroyed || res.writableEnded) return;
+              if (!current || TERMINAL_JOB_STATUSES.has(current.job.status)) {
+                emitTerminalStatus(current?.job.status ?? 'void', current?.job.reason);
+                return;
+              }
+              safeWrite(': ping\n\n');
             } finally {
               polling = false;
             }
@@ -483,10 +651,18 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
       throw new HttpError(404, 'Not found');
     })().catch(error => {
       if (!res.destroyed && !res.headersSent) {
-        const status = error instanceof HttpError ? error.status : error instanceof z.ZodError ? 400 : 400;
+        const status = error instanceof HttpError
+          ? error.status
+          : isMissingError(error)
+            ? 404
+            : error instanceof z.ZodError
+              ? 400
+              : 400;
         const message = error instanceof z.ZodError
           ? error.issues.map(i => `${i.path.join('.') || '(root)'}: ${i.message}`).join('; ')
-          : error instanceof Error ? error.message : 'Request failed';
+          : isMissingError(error)
+            ? 'Resource not found'
+            : error instanceof Error ? error.message : 'Request failed';
         json(res, { error: message }, status);
       } else if (!res.destroyed && !res.writableEnded) {
         res.end();

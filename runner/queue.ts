@@ -4,10 +4,9 @@ import { spawnSync } from 'node:child_process';
 import { access, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { z } from 'zod';
-import { loadContest } from './config.js';
 import type { Connections } from './connections.js';
 import { removeContainer } from './docker.js';
-import { OjAccountPool, type OjAccounts } from './oj-accounts.js';
+import { OjAccountPool, OjAccounts } from './oj-accounts.js';
 import { checkRuntime, executeJob, planSchema, readJson, verifyPlan, type Plan, type PlanJob } from './plan.js';
 import { readRunProgress } from './progress.js';
 import type { PushDispatcher } from './push.js';
@@ -35,6 +34,7 @@ export type QueueOptions = {
   ojAccounts?: OjAccounts;
   ojPool?: OjAccountPool;
   pushDispatcher?: PushDispatcher;
+  pushDrainTimeoutMs?: number;
   execute?: Execute;
   preflight?: (plan: Plan) => Promise<unknown>;
   recover?: (id: string) => Promise<void>;
@@ -154,6 +154,7 @@ export async function dispatch(root: string, batchId: string, signal: AbortSigna
   id(batchId);
   const dispatchStartMs = Date.now();
   const release = await lock(root);
+  let persistQueue = Promise.resolve();
   try {
     // A running job left by a previous lock owner was interrupted, not queued.
     // Stop its sandbox before allowing any new job to launch in this workspace.
@@ -176,58 +177,58 @@ export async function dispatch(root: string, batchId: string, signal: AbortSigna
       batch.concurrency = concurrency;
     }
 
-    // Serialize all batch.json writes so concurrent workers never overwrite each other.
-    let persistQueue = Promise.resolve();
-    const persistLocked = () => {
-      const next = persistQueue.then(() => persist(root, batch));
+    // Serialize all in-memory batch mutations and batch.json writes so concurrent
+    // workers never observe transient mutations or overwrite each other on disk.
+    const persistLocked = (mutate?: () => boolean | void) => {
+      const next = persistQueue.then(() => {
+        const shouldWrite = mutate ? mutate() !== false : true;
+        if (!shouldWrite) return;
+        return persist(root, batch);
+      });
       persistQueue = next.then(() => {}, () => {});
       return next;
     };
 
+    const ojAccounts = options.ojAccounts ?? new OjAccounts();
+    const ojPool = options.ojPool ?? new OjAccountPool(ojAccounts);
+
     const preflight = options.preflight ?? (async (plan: Plan) => {
       await checkRuntime(plan);
-      await verifyPlan(plan, true, options.store, options.ojAccounts);
+      await verifyPlan(plan, true, options.store, ojAccounts);
     });
     const cancelPending = async () => {
       if (!await exists(batchStop(root, batchId))) return false;
-      let changed = false;
-      for (const job of batch.jobs) {
-        if (job.status === 'queued') {
-          job.status = 'cancelled';
-          job.reason = 'batch_stopped';
-          changed = true;
+      await persistLocked(() => {
+        let changed = false;
+        for (const job of batch.jobs) {
+          if (job.status === 'queued') {
+            job.status = 'cancelled';
+            job.reason = 'batch_stopped';
+            changed = true;
+          }
         }
-      }
-      if (changed) await persistLocked();
+        return changed;
+      });
       return true;
     };
     if (await cancelPending() || signal.aborted || !batch.jobs.some(j => j.status === 'queued')) return batch;
     await preflight({ ...batch.plan, jobs: batch.plan.jobs.filter((_job, i) => batch.jobs[i]?.status === 'queued') });
 
-    const ojPool = options.ojPool ?? (options.ojAccounts ? new OjAccountPool(options.ojAccounts) : undefined);
-    const contestProblemIdsCache = new Map<string, string[] | undefined>();
-    const loadValidProblemIds = async (contestPath: string): Promise<string[] | undefined> => {
-      if (contestProblemIdsCache.has(contestPath)) return contestProblemIdsCache.get(contestPath);
-      try {
-        const loaded = await loadContest(contestPath);
-        const ids = loaded.contest.problems.map(p => p.id);
-        contestProblemIdsCache.set(contestPath, ids);
-        return ids;
-      } catch {
-        contestProblemIdsCache.set(contestPath, undefined);
-        return undefined;
-      }
-    };
-
+    const pushDrain = new AbortController();
+    const pushSignal = AbortSignal.any([signal, pushDrain.signal]);
     const pendingPushes: Promise<unknown>[] = [];
-    const fireRunPush = (planJob: PlanJob, jobState: Batch['jobs'][number], runId: string) => {
+    const fireRunPush = (
+      planJob: PlanJob,
+      status: Batch['jobs'][number]['status'],
+      reason: string | undefined,
+      runId: string,
+    ) => {
       const dispatcher = options.pushDispatcher;
-      if (!dispatcher) return;
-      const status = jobState.status;
+      if (!dispatcher || pushSignal.aborted) return;
       if (status !== 'completed' && status !== 'void' && status !== 'cancelled' && status !== 'interrupted') return;
       const task = (async () => {
-        const validProblemIds = await loadValidProblemIds(planJob.contest_path);
         const progress = await readRunProgress(root, runId).catch(() => undefined);
+        if (pushSignal.aborted) return;
         await dispatcher.deliver(
           'run.completed',
           {
@@ -239,7 +240,7 @@ export async function dispatch(root: string, batchId: string, signal: AbortSigna
             ...(planJob.agent_name ? { agent_name: planJob.agent_name } : {}),
             agent_revision: planJob.agent_revision,
             status,
-            ...(jobState.reason ? { reason: jobState.reason } : {}),
+            ...(reason ? { reason } : {}),
             ...(progress ? {
               score: status === 'completed' ? progress.score : null,
               max_score: progress.max_score,
@@ -250,7 +251,7 @@ export async function dispatch(root: string, batchId: string, signal: AbortSigna
             } : {}),
             timestamp: new Date().toISOString(),
           },
-          { ...(validProblemIds ? { validProblemIds } : {}) },
+          { signal: pushSignal },
         );
       })().catch(() => {
         // Push delivery failures must never fail or block runs.
@@ -262,142 +263,215 @@ export async function dispatch(root: string, batchId: string, signal: AbortSigna
     let cursor = 0;
     let fatalCleanupError: Error | undefined;
     let fatalMonitorError: Error | undefined;
+    let fatalWorkerError: Error | undefined;
     let stopDispatching = false;
+    const workerAbort = new AbortController();
 
     const worker = async () => {
-      while (true) {
-        if (stopDispatching || fatalCleanupError || fatalMonitorError || signal.aborted) break;
-        if (await exists(batchStop(root, batchId))) {
-          stopDispatching = true;
-          break;
-        }
-        const i = queuedIndices[cursor++];
-        if (i === undefined) break;
-        const job = batch.jobs[i]!;
-        if (job.status !== 'queued') continue;
-        const planJob = batch.plan.jobs[i]!;
+      try {
+        while (true) {
+          if (stopDispatching || fatalCleanupError || fatalMonitorError || fatalWorkerError || signal.aborted) break;
+          if (await exists(batchStop(root, batchId))) {
+            stopDispatching = true;
+            break;
+          }
+          // Recheck admission gate after awaiting filesystem check.
+          if (stopDispatching || fatalCleanupError || fatalMonitorError || fatalWorkerError || signal.aborted) break;
+          const i = queuedIndices[cursor++];
+          if (i === undefined) break;
+          const job = batch.jobs[i]!;
+          if (job.status !== 'queued') continue;
+          const planJob = batch.plan.jobs[i]!;
 
-        const runId = randomUUID();
-        job.run_id = runId;
-        job.status = 'running';
-        await persistLocked();
-        options.onJobStart?.(runId, join(root, runId));
-
-        const abort = new AbortController();
-        const subscribed = AbortSignal.any([signal, abort.signal]);
-        const stopped = async () => await exists(runStop(root, runId)) || await exists(batchStop(root, batchId));
-        let done = false;
-        let monitorError: unknown;
-        const monitor = (async () => {
-          try {
-            while (!done && !subscribed.aborted) {
-              if (await stopped()) { abort.abort(); break; }
-              await sleep(150);
-            }
-          } catch (error) { monitorError = error; abort.abort(); }
-        })();
-
-        let cleanupFailed = false;
-        try {
-          const result = await (options.execute ?? executeJob)(batch.plan, planJob, {
-            out: root,
-            runId,
-            signal: subscribed,
-            store: options.store,
-            ojAccounts: options.ojAccounts,
-            ojPool,
+          const runId = randomUUID();
+          await persistLocked(() => {
+            job.run_id = runId;
+            job.status = 'running';
           });
-          cleanupFailed = result.reason === 'sandbox_cleanup_failed';
-          job.status = result.status;
-          job.reason = result.reason;
-        } catch {
-          job.status = 'void';
-          job.reason = 'runner_error';
-        } finally {
-          done = true;
-          await monitor;
-        }
+          options.onJobStart?.(runId, join(root, runId));
 
-        if (monitorError) {
-          job.status = 'void';
-          job.reason = 'queue_monitor_error';
-        }
-        if (job.status !== 'completed' && !monitorError && !cleanupFailed) {
-          if (await stopped()) { job.status = 'cancelled'; job.reason = 'cancelled'; }
-          else if (signal.aborted) { job.status = 'interrupted'; job.reason = 'executor_stopped'; }
-        }
-        if (cleanupFailed) {
-          // Keep the job marked running until recovery can confirm removal;
-          // prevent workers from launching additional jobs on top of a possibly live sandbox.
-          job.status = 'running';
-          stopDispatching = true;
-          fatalCleanupError ??= new Error(`Could not confirm cleanup for ${runId}; resume the batch after Docker is healthy`);
-          await persistLocked();
-          break;
-        }
+          const abort = new AbortController();
+          const subscribed = AbortSignal.any([signal, workerAbort.signal, abort.signal]);
+          const stopped = async () => await exists(runStop(root, runId)) || await exists(batchStop(root, batchId));
+          let done = false;
+          let monitorError: unknown;
+          const monitor = (async () => {
+            try {
+              while (!done && !subscribed.aborted) {
+                if (await stopped()) { abort.abort(); break; }
+                await sleep(150);
+              }
+            } catch (error) { monitorError = error; abort.abort(); }
+          })();
 
-        await persistLocked();
-        if (monitorError) {
-          stopDispatching = true;
-          fatalMonitorError ??= new Error('Could not monitor cancellation requests');
-          break;
+          let cleanupFailed = false;
+          let nextStatus: Batch['jobs'][number]['status'] = 'void';
+          let nextReason: string | undefined = 'runner_error';
+          try {
+            const result = await (options.execute ?? executeJob)(batch.plan, planJob, {
+              out: root,
+              runId,
+              signal: subscribed,
+              store: options.store,
+              ojAccounts,
+              ojPool,
+            });
+            cleanupFailed = result.reason === 'sandbox_cleanup_failed';
+            if (cleanupFailed) {
+              // Immediately close admissions BEFORE awaiting monitor so no sibling can launch another job.
+              stopDispatching = true;
+              fatalCleanupError ??= new Error(`Could not confirm cleanup for ${runId}; resume the batch after Docker is healthy`);
+              nextStatus = 'running';
+              nextReason = result.reason;
+            } else {
+              nextStatus = result.status;
+              nextReason = result.reason;
+            }
+          } catch {
+            nextStatus = 'void';
+            nextReason = 'runner_error';
+          } finally {
+            done = true;
+            await monitor;
+          }
+
+          if (cleanupFailed) {
+            // Keep the job marked running in memory and on disk at all times so recovery cleans up the sandbox.
+            await persistLocked(() => {
+              job.status = 'running';
+              job.reason = nextReason;
+            });
+            break;
+          }
+
+          if (monitorError) {
+            nextStatus = 'void';
+            nextReason = 'queue_monitor_error';
+            stopDispatching = true;
+            fatalMonitorError ??= new Error('Could not monitor cancellation requests');
+          } else if (nextStatus !== 'completed') {
+            if (await stopped()) {
+              nextStatus = 'cancelled';
+              nextReason = 'cancelled';
+            } else if (signal.aborted) {
+              nextStatus = 'interrupted';
+              nextReason = 'executor_stopped';
+            }
+          }
+
+          await persistLocked(() => {
+            job.status = nextStatus;
+            job.reason = nextReason;
+          });
+
+          if (monitorError) break;
+          fireRunPush(planJob, nextStatus, nextReason, runId);
         }
-        fireRunPush(planJob, job, runId);
+      } catch (error) {
+        stopDispatching = true;
+        fatalWorkerError ??= error instanceof Error ? error : new Error(String(error));
+        workerAbort.abort(fatalWorkerError);
       }
     };
 
     const workerCount = Math.min(concurrency, queuedIndices.length);
-    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    const settled = await Promise.allSettled(Array.from({ length: workerCount }, () => worker()));
+    for (const outcome of settled) {
+      if (outcome.status === 'rejected') {
+        fatalWorkerError ??= outcome.reason instanceof Error ? outcome.reason : new Error(String(outcome.reason));
+      }
+    }
 
-    await cancelPending();
+    if (!fatalWorkerError) {
+      await cancelPending().catch(error => {
+        fatalWorkerError ??= error instanceof Error ? error : new Error(String(error));
+      });
+    }
 
-    if (options.pushDispatcher && !fatalCleanupError && !fatalMonitorError) {
+    await persistQueue;
+
+    if (options.pushDispatcher && !fatalCleanupError && !fatalMonitorError && !fatalWorkerError && !pushSignal.aborted) {
       const counts = { completed: 0, void: 0, cancelled: 0, interrupted: 0, queued: 0, running: 0 };
       for (const j of batch.jobs) counts[j.status]++;
-      const batchStatus = counts.cancelled > 0 || counts.interrupted > 0
-        ? 'stopped'
-        : counts.void === batch.jobs.length
-          ? 'failed'
-          : counts.completed === batch.jobs.length
-            ? 'completed'
-            : 'partial';
-      pendingPushes.push(
-        options.pushDispatcher.deliver('batch.completed', {
-          batch_id: batch.id,
-          status: batchStatus,
-          total: batch.jobs.length,
-          completed: counts.completed,
-          void: counts.void,
-          cancelled: counts.cancelled,
-          interrupted: counts.interrupted,
-          duration_ms: Math.max(0, Date.now() - dispatchStartMs),
-          jobs: batch.jobs.map((j, idx) => {
-            const p = batch.plan.jobs[idx]!;
-            return {
-              ...(j.run_id ? { run_id: j.run_id } : {}),
-              agent_id: p.agent_id,
-              ...(p.agent_name ? { agent_name: p.agent_name } : {}),
-              contest_id: p.contest_id,
-              data_version: p.data_version,
-              status: j.status,
-              ...(j.reason ? { reason: j.reason } : {}),
-            };
+      // Emit batch.completed ONLY when the batch is actually terminal (no queued or running jobs left).
+      if (counts.queued === 0 && counts.running === 0) {
+        const batchStatus = counts.cancelled > 0 || counts.interrupted > 0
+          ? 'stopped'
+          : counts.void === batch.jobs.length
+            ? 'failed'
+            : counts.completed === batch.jobs.length
+              ? 'completed'
+              : 'partial';
+        pendingPushes.push(
+          options.pushDispatcher.deliver(
+            'batch.completed',
+            {
+              batch_id: batch.id,
+              status: batchStatus,
+              total: batch.jobs.length,
+              completed: counts.completed,
+              void: counts.void,
+              cancelled: counts.cancelled,
+              interrupted: counts.interrupted,
+              duration_ms: Math.max(0, Date.now() - dispatchStartMs),
+              ...(batch.jobs.length <= 1000 ? {
+                jobs: batch.jobs.map((j, idx) => {
+                  const p = batch.plan.jobs[idx]!;
+                  return {
+                    ...(j.run_id ? { run_id: j.run_id } : {}),
+                    agent_id: p.agent_id,
+                    ...(p.agent_name ? { agent_name: p.agent_name } : {}),
+                    contest_id: p.contest_id,
+                    data_version: p.data_version,
+                    status: j.status,
+                    ...(j.reason ? { reason: j.reason } : {}),
+                  };
+                }),
+              } : {}),
+              timestamp: new Date().toISOString(),
+            },
+            { signal: pushSignal },
+          ).catch(() => {
+            // Never fail dispatch on webhook delivery error.
           }),
-          timestamp: new Date().toISOString(),
-        }).catch(() => {
-          // Never fail dispatch on webhook delivery error.
-        }),
-      );
+        );
+      }
     }
 
     if (pendingPushes.length) {
-      await Promise.allSettled(pendingPushes);
+      const drainTimeoutMs = Math.max(50, Math.min(15_000, Math.floor(options.pushDrainTimeoutMs ?? 5_000)));
+      let drainTimer: ReturnType<typeof setTimeout> | undefined;
+      let onSignalAbort: (() => void) | undefined;
+      const drainLimit = new Promise<void>(resolveDrain => {
+        const finish = () => {
+          pushDrain.abort();
+          resolveDrain();
+        };
+        onSignalAbort = finish;
+        if (signal.aborted) {
+          finish();
+          return;
+        }
+        drainTimer = setTimeout(finish, drainTimeoutMs);
+        drainTimer.unref();
+        signal.addEventListener('abort', finish, { once: true });
+      });
+      try {
+        await Promise.race([Promise.allSettled(pendingPushes), drainLimit]);
+      } finally {
+        if (drainTimer) clearTimeout(drainTimer);
+        if (onSignalAbort) signal.removeEventListener('abort', onSignalAbort);
+      }
     }
 
     if (fatalCleanupError) throw fatalCleanupError;
     if (fatalMonitorError) throw fatalMonitorError;
+    if (fatalWorkerError) throw fatalWorkerError;
     return batch;
-  } finally { release(); }
+  } finally {
+    await persistQueue.catch(() => {});
+    release();
+  }
 }
 
 export async function readRunLog(root: string, runId: string, stream: 'stdout' | 'stderr') {
