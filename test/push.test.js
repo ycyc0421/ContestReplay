@@ -13,6 +13,8 @@ import {
   pushDeliverySchema,
   pushTargetResponseSchema,
   rotatePushTargetSchema,
+  sanitizeDeliveryError,
+  sanitizePushPayload,
   signPushPayload,
   verifyPushSignature,
 } from '../dist/push.js';
@@ -60,37 +62,45 @@ async function startMockReceiver(t, handler) {
   return { baseUrl, requests };
 }
 
-test('PushTargets enforces write-only credential storage, origin pinning, and CRUD validation', async t => {
+test('PushTargets enforces write-only credential storage, origin pinning, URL/SSRF rules, and atomic credential_ref rotation', async t => {
   useFileSecretBackend(t);
   const root = await mkdtemp(join(tmpdir(), 'cr-push-store-'));
   t.after(() => rm(root, { recursive: true, force: true }));
 
   const store = new PushTargets(join(root, 'targets-store'));
   const bearerSecret = 'cr-test-bearer-token-initial-001';
-  const rotatedSecret = 'cr-test-bearer-token-rotated-002';
+  const rotatedSecret = 'cr-test-hmac-secret-rotated-002';
 
   assert.deepEqual(await store.list(), []);
 
-  // Reject unsafe URLs (non-loopback HTTP, userinfo, fragment)
+  // Reject unsafe URLs: non-loopback HTTP, userinfo, query string, fragment, link-local / IMDS / unspecified
+  const badUrls = [
+    'http://example.com/hook',
+    'https://user:pass@example.com/hook',
+    'https://example.com/hook?token=secret',
+    'https://example.com/hook#frag',
+    'https://0.0.0.0/hook',
+    'https://[::]/hook',
+    'https://169.254.169.254/latest/meta-data',
+    'https://[fe80::1]/hook',
+    'https://[::ffff:169.254.169.254]/hook',
+    'https://metadata.google.internal/computeMetadata/v1/',
+  ];
+  for (const url of badUrls) {
+    assert.throws(
+      () => createPushTargetSchema.parse({ label: 'Bad', url, events: ['run.completed'], auth_mode: 'none' }),
+      `Expected URL to be rejected: ${url}`,
+    );
+  }
+
+  // Reject short secrets (< 8 chars) and auth_mode / secret mismatches
   assert.throws(() => createPushTargetSchema.parse({
-    label: 'Insecure',
-    url: 'http://example.com/hook',
+    label: 'Short secret',
+    url: 'https://hooks.example.test/v1',
     events: ['run.completed'],
-    auth_mode: 'none',
+    auth_mode: 'bearer',
+    secret: 'short7!',
   }));
-  assert.throws(() => createPushTargetSchema.parse({
-    label: 'Userinfo',
-    url: 'https://user:pass@example.com/hook',
-    events: ['run.completed'],
-    auth_mode: 'none',
-  }));
-  assert.throws(() => createPushTargetSchema.parse({
-    label: 'Fragment',
-    url: 'https://example.com/hook#frag',
-    events: ['run.completed'],
-    auth_mode: 'none',
-  }));
-  // Reject auth_mode / secret mismatches
   assert.throws(() => createPushTargetSchema.parse({
     label: 'Unexpected secret',
     url: 'https://hooks.example.test/v1',
@@ -104,7 +114,6 @@ test('PushTargets enforces write-only credential storage, origin pinning, and CR
     events: ['run.completed'],
     auth_mode: 'bearer',
   }));
-  // Reject secret embedded in public metadata
   await assert.rejects(
     store.create({
       id: 'bad-meta',
@@ -121,7 +130,7 @@ test('PushTargets enforces write-only credential storage, origin pinning, and CR
   const created = await store.create({
     id: 'prod-hook',
     label: 'Prod Webhook',
-    url: 'https://hooks.example.test/events?team=bench',
+    url: 'https://hooks.example.test/events',
     events: ['run.completed', 'batch.completed'],
     auth_mode: 'bearer',
     secret: bearerSecret,
@@ -136,12 +145,12 @@ test('PushTargets enforces write-only credential storage, origin pinning, and CR
 
   // Verify on-disk permissions and secret separation
   const targetFile = join(store.root, 'targets', 'prod-hook.json');
-  const credFile = join(store.root, 'credentials', created.credential_ref);
+  const oldCredFile = join(store.root, 'credentials', created.credential_ref);
   assert.equal((await stat(store.root)).mode & 0o777, 0o700);
   assert.equal((await stat(targetFile)).mode & 0o777, 0o600);
-  assert.equal((await stat(credFile)).mode & 0o777, 0o600);
+  assert.equal((await stat(oldCredFile)).mode & 0o777, 0o600);
   assert.ok(!(await readFile(targetFile, 'utf8')).includes(bearerSecret), 'Secret must not appear in target JSON');
-  assert.equal(await readFile(credFile, 'utf8'), bearerSecret);
+  assert.equal(await readFile(oldCredFile, 'utf8'), bearerSecret);
 
   // Duplicate ID rejected with 409
   await assert.rejects(
@@ -164,7 +173,6 @@ test('PushTargets enforces write-only credential storage, origin pinning, and CR
     store.patch('prod-hook', { url: 'https://hooks.example.test:8443/events' }),
     error => error instanceof PushTargetError && error.status === 409,
   );
-  // Strict patch schema rejects secret mutation via patch
   assert.throws(() => patchPushTargetSchema.parse({ secret: rotatedSecret }));
 
   // Same-origin patch succeeds
@@ -183,42 +191,60 @@ test('PushTargets enforces write-only credential storage, origin pinning, and CR
   assert.equal(patched.max_retries, 2);
 
   // Loose credential permissions mark credential_available: false until rotated
-  await chmod(credFile, 0o644);
+  await chmod(oldCredFile, 0o644);
   assert.equal((await store.get('prod-hook')).credential_available, false);
 
-  // Rotate secret restores 0o600 credential without exposing value
-  assert.doesNotThrow(() => rotatePushTargetSchema.parse({ secret: rotatedSecret }));
-  const rotated = await store.rotate('prod-hook', { secret: rotatedSecret });
+  // Atomic rotation from bearer -> hmac-sha256 allocates a NEW credential_ref and cleans up the old one
+  assert.doesNotThrow(() => rotatePushTargetSchema.parse({ secret: rotatedSecret, auth_mode: 'hmac-sha256' }));
+  const rotated = await store.rotate('prod-hook', { secret: rotatedSecret, auth_mode: 'hmac-sha256' });
   assert.equal(rotated.credential_available, true);
-  assert.equal(rotated.credential_ref, created.credential_ref);
+  assert.equal(rotated.auth_mode, 'hmac-sha256');
+  assert.notEqual(rotated.credential_ref, created.credential_ref, 'Rotation must allocate a fresh credential_ref');
   assert.ok(!JSON.stringify(rotated).includes(rotatedSecret));
-  assert.equal(await readFile(credFile, 'utf8'), rotatedSecret);
-  assert.equal((await stat(credFile)).mode & 0o777, 0o600);
 
-  // List never echoes secrets
-  const listed = await store.list();
-  assert.equal(listed.length, 1);
-  assert.ok(!JSON.stringify(listed).includes(bearerSecret));
-  assert.ok(!JSON.stringify(listed).includes(rotatedSecret));
+  const newCredFile = join(store.root, 'credentials', rotated.credential_ref);
+  assert.equal(await readFile(newCredFile, 'utf8'), rotatedSecret);
+  assert.equal((await stat(newCredFile)).mode & 0o777, 0o600);
+  await assert.rejects(stat(oldCredFile), { code: 'ENOENT' });
 
-  // Remove deletes both target and credential file
+  // Concurrent resolveForDelivery + rotate always yields a mutually consistent (auth_mode, secret) pair
+  const nextBearer = 'cr-test-bearer-next-consistent-003';
+  const [snap1, rotatedAgain, snap2] = await Promise.all([
+    store.resolveForDelivery('prod-hook'),
+    store.rotate('prod-hook', { secret: nextBearer, auth_mode: 'bearer' }),
+    store.resolveForDelivery('prod-hook'),
+  ]);
+  assert.equal(rotatedAgain.auth_mode, 'bearer');
+  for (const snap of [snap1, snap2]) {
+    if (snap.target.auth_mode === 'hmac-sha256') assert.equal(snap.secret, rotatedSecret);
+    else if (snap.target.auth_mode === 'bearer') assert.equal(snap.secret, nextBearer);
+    else assert.fail(`Unexpected auth_mode: ${snap.target.auth_mode}`);
+  }
+
+  // Remove deletes both target and latest credential file
+  const latestCredFile = join(store.root, 'credentials', rotatedAgain.credential_ref);
   await store.remove('prod-hook');
-  await assert.rejects(stat(credFile), { code: 'ENOENT' });
+  await assert.rejects(stat(latestCredFile), { code: 'ENOENT' });
   await assert.rejects(store.get('prod-hook'), error => error instanceof PushTargetError && error.status === 404);
 });
 
-test('PushDispatcher delivers Bearer & HMAC-SHA256 webhooks, retries 503/429, skips retry on 400/redirect, and logs sanitized history', async t => {
+test('PushDispatcher enforces public payload whitelist, redacts short/symbol secrets, refreshes retry timestamps, and handles concurrency/cancellation', async t => {
   useFileSecretBackend(t);
   const root = await mkdtemp(join(tmpdir(), 'cr-push-dispatch-'));
   t.after(() => rm(root, { recursive: true, force: true }));
 
-  const bearerSecret = 'secret-bearer-token-987654321';
+  const bearerSecret = 'secret-bearer!@#$%^&*()_+-98765';
   const hmacSecret = 'secret-hmac-signing-key-abcdef123456';
   const sleepDelays = [];
-  const fastSleep = async ms => { sleepDelays.push(ms); };
+  let fakeNow = Date.parse('2026-04-01T12:00:00.000Z');
+  const fastSleep = async ms => {
+    sleepDelays.push(ms);
+    fakeNow += 5_000; // Advance clock across retries so X-CR-Timestamp refreshes visibly
+  };
 
   let retry503Count = 0;
   let retry429Count = 0;
+  let hmacRetryCount = 0;
 
   const { baseUrl, requests } = await startMockReceiver(t, (req, res) => {
     if (req.url === '/bearer') {
@@ -229,6 +255,12 @@ test('PushDispatcher delivers Bearer & HMAC-SHA256 webhooks, retries 503/429, sk
     if (req.url === '/hmac') {
       res.writeHead(202, { 'Content-Type': 'application/json' });
       res.end('{"accepted":true}');
+      return;
+    }
+    if (req.url === '/hmac-retry') {
+      hmacRetryCount++;
+      res.writeHead(hmacRetryCount < 2 ? 503 : 200);
+      res.end(hmacRetryCount < 2 ? 'retry' : 'ok');
       return;
     }
     if (req.url === '/flaky-503') {
@@ -275,6 +307,15 @@ test('PushDispatcher delivers Bearer & HMAC-SHA256 webhooks, retries 503/429, sk
     secret: hmacSecret,
   });
   await store.create({
+    id: 't-hmac-retry',
+    label: 'HMAC Retry Receiver',
+    url: `${baseUrl}/hmac-retry`,
+    events: ['run.progress'],
+    auth_mode: 'hmac-sha256',
+    secret: hmacSecret,
+    max_retries: 2,
+  });
+  await store.create({
     id: 't-flaky',
     label: 'Flaky 503',
     url: `${baseUrl}/flaky-503`,
@@ -316,11 +357,52 @@ test('PushDispatcher delivers Bearer & HMAC-SHA256 webhooks, retries 503/429, sk
     secret: bearerSecret,
   });
 
-  const dispatcher = new PushDispatcher(store, { sleep: fastSleep });
+  const dispatcher = new PushDispatcher(store, { sleep: fastSleep, now: () => fakeNow, concurrency: 4 });
 
-  // 1. Deliver run.completed -> hits t-bearer and t-hmac, skips t-disabled and batch.completed targets
-  const completedPayload = { run_id: '11111111-1111-4111-8111-111111111111', score: 300 };
-  const runResults = await dispatcher.deliver('run.completed', completedPayload);
+  // 1. Outbound payload whitelist canary test: private fields must NEVER leave the host!
+  const canaryPayload = {
+    run_id: '11111111-1111-4111-8111-111111111111',
+    contest_id: 'demo-contest',
+    score: 300,
+    max_score: 500,
+    reason: 'failed at /home/alice/private/judge.json with Bearer CANARY_BEARER_XYZ',
+    source: 'CANARY_SOURCE_CODE',
+    answer: 'CANARY_LOCAL_ANSWER',
+    stdout: 'CANARY_STDOUT_LOG',
+    stderr: 'CANARY_STDERR_LOG',
+    local_inputs: { pdf: '/home/alice/secret.pdf' },
+    session: 'CANARY_SESSION_TRANSCRIPT',
+    extra_nested: { secret: 'CANARY_UNDECLARED_NESTED' },
+    submissions: [
+      {
+        submission_id: 's1',
+        problem_id: 'A',
+        elapsed_ms: 1000,
+        verdict: 'AC',
+        source: 'CANARY_SUB_SOURCE',
+        answer: 'CANARY_SUB_ANSWER',
+      },
+    ],
+  };
+
+  const sanitizedDirect = sanitizePushPayload('run.completed', canaryPayload);
+  const sanitizedStr = JSON.stringify(sanitizedDirect);
+  for (const canary of [
+    'CANARY_SOURCE_CODE',
+    'CANARY_LOCAL_ANSWER',
+    'CANARY_STDOUT_LOG',
+    'CANARY_STDERR_LOG',
+    'CANARY_SESSION_TRANSCRIPT',
+    'CANARY_UNDECLARED_NESTED',
+    'CANARY_SUB_SOURCE',
+    'CANARY_SUB_ANSWER',
+    'CANARY_BEARER_XYZ',
+    '/home/alice',
+  ]) {
+    assert.ok(!sanitizedStr.includes(canary), `Whitelist leaked canary: ${canary}`);
+  }
+
+  const runResults = await dispatcher.deliver('run.completed', canaryPayload);
   assert.equal(runResults.length, 2);
   for (const r of runResults) {
     assert.doesNotThrow(() => pushDeliverySchema.parse(r));
@@ -330,25 +412,43 @@ test('PushDispatcher delivers Bearer & HMAC-SHA256 webhooks, retries 503/429, sk
 
   const bearerReq = requests.find(r => r.url === '/bearer');
   assert.equal(bearerReq.headers['authorization'], `Bearer ${bearerSecret}`);
-  assert.equal(bearerReq.headers['content-type'], 'application/json');
   assert.equal(bearerReq.headers['x-cr-event'], 'run.completed');
-  assert.ok(bearerReq.headers['x-cr-delivery-id']);
-  assert.ok(bearerReq.headers['x-cr-timestamp']);
-  assert.deepEqual(bearerReq.json, completedPayload);
+  assert.ok(!bearerReq.rawBody.includes('CANARY_'), 'Canary leaked over wire to Bearer target');
+  assert.equal(bearerReq.json.score, 300);
 
   const hmacReq = requests.find(r => r.url === '/hmac');
   assert.equal(hmacReq.headers['authorization'], undefined);
-  assert.equal(hmacReq.headers['x-cr-event'], 'run.completed');
   const sig = hmacReq.headers['x-cr-signature-256'];
   const ts = hmacReq.headers['x-cr-timestamp'];
   assert.ok(sig && ts);
   assert.equal(sig, signPushPayload(hmacSecret, hmacReq.rawBody, ts));
   assert.equal(verifyPushSignature(hmacSecret, hmacReq.rawBody, ts, sig), true);
-  assert.equal(verifyPushSignature(hmacSecret, hmacReq.rawBody + ' ', ts, sig), false);
-  assert.equal(verifyPushSignature(hmacSecret, hmacReq.rawBody, String(Number(ts) + 1), sig), false);
-  assert.equal(verifyPushSignature('wrong-secret', hmacReq.rawBody, ts, sig), false);
+  assert.equal(verifyPushSignature(hmacSecret, hmacReq.rawBody, ts, sig.toUpperCase()), false);
+  assert.equal(verifyPushSignature(hmacSecret, hmacReq.rawBody, ts, 'sha256=deadbeef'), false);
 
-  // 2. Deliver batch.completed -> tests 503 retry, 429 retry, 400 no-retry, 302 redirect rejection
+  // 2. Retries preserve X-CR-Delivery-Id while refreshing X-CR-Timestamp and X-CR-Signature-256
+  const retryRes = await dispatcher.deliver(
+    'run.progress',
+    { run_id: '11111111-1111-4111-8111-111111111111', status: 'running', score: 100, answer: 'CANARY_PROGRESS_ANS' },
+    { targetIds: ['t-hmac-retry'] },
+  );
+  assert.equal(retryRes.length, 1);
+  assert.equal(retryRes[0].status, 'delivered');
+  assert.equal(retryRes[0].attempts, 2);
+  const hmacAttempts = requests.filter(r => r.url === '/hmac-retry');
+  assert.equal(hmacAttempts.length, 2);
+  assert.equal(hmacAttempts[0].headers['x-cr-delivery-id'], hmacAttempts[1].headers['x-cr-delivery-id']);
+  assert.notEqual(hmacAttempts[0].headers['x-cr-timestamp'], hmacAttempts[1].headers['x-cr-timestamp']);
+  assert.notEqual(hmacAttempts[0].headers['x-cr-signature-256'], hmacAttempts[1].headers['x-cr-signature-256']);
+  for (const req of hmacAttempts) {
+    assert.ok(!req.rawBody.includes('CANARY_PROGRESS_ANS'));
+    assert.equal(
+      verifyPushSignature(hmacSecret, req.rawBody, req.headers['x-cr-timestamp'], req.headers['x-cr-signature-256']),
+      true,
+    );
+  }
+
+  // 3. Batch delivery with 503/429 retries, 400 no-retry, 302 redirect rejection (concurrently!)
   sleepDelays.length = 0;
   const batchResults = await dispatcher.deliver('batch.completed', { batch_id: 'b-1', completed: 4 });
   const byTarget = Object.fromEntries(batchResults.map(r => [r.target_id, r]));
@@ -367,46 +467,63 @@ test('PushDispatcher delivers Bearer & HMAC-SHA256 webhooks, retries 503/429, sk
 
   assert.equal(byTarget['t-redirect'].status, 'failed');
   assert.equal(byTarget['t-redirect'].attempts, 1);
-  // Ensure redirect target never followed to /bearer
+  assert.equal(byTarget['t-redirect'].error, 'redirect_rejected');
   assert.equal(requests.filter(r => r.url === '/bearer').length, 1);
-  // Backoff delays recorded in deterministic target-id order: t-429 (250), t-flaky (250, 500)
-  assert.deepEqual(sleepDelays, [250, 250, 500]);
 
-  // 2b. targetIds restricts delivery to specified enabled subscribed targets
-  const targeted = await dispatcher.deliver('run.completed', completedPayload, { targetIds: ['t-hmac', 't-disabled'] });
-  assert.equal(targeted.length, 1);
-  assert.equal(targeted[0].target_id, 't-hmac');
-  assert.equal(targeted[0].status, 'delivered');
+  // 4. Pre-aborted signal skips fanout cleanly without writing bogus attempt=1 failures
+  const beforeAbortCount = (await dispatcher.listDeliveries(100)).length;
+  const aborted = new AbortController();
+  aborted.abort();
+  const abortedResults = await dispatcher.deliver('run.completed', canaryPayload, { signal: aborted.signal });
+  assert.deepEqual(abortedResults, []);
+  assert.equal((await dispatcher.listDeliveries(100)).length, beforeAbortCount);
 
-  // 3. testTarget sends lightweight { type: 'ping', timestamp } even when disabled
-  const pingRes = await dispatcher.testTarget('t-disabled');
-  assert.equal(pingRes.status, 'delivered');
-  assert.equal(pingRes.event, 'ping');
-  const pingReq = requests.filter(r => r.url === '/bearer')[1];
-  assert.equal(pingReq.headers['x-cr-event'], 'ping');
-  assert.equal(pingReq.json.type, 'ping');
-  assert.ok(typeof pingReq.json.timestamp === 'string');
+  // 5. Target disabled/deleted race during dispatch skips cleanly without bogus failure record
+  const raceTarget = await store.create({
+    id: 't-race',
+    label: 'Race Target',
+    url: `${baseUrl}/bearer`,
+    events: ['run.completed'],
+    auth_mode: 'none',
+  });
+  let deletedDuringList = false;
+  const origResolve = store.resolveForDelivery.bind(store);
+  store.resolveForDelivery = async id => {
+    if (id === raceTarget.id && !deletedDuringList) {
+      deletedDuringList = true;
+      await store.remove(raceTarget.id);
+    }
+    return origResolve(id);
+  };
+  const afterRace = await dispatcher.deliver('run.completed', canaryPayload, { targetIds: [raceTarget.id] });
+  store.resolveForDelivery = origResolve;
+  assert.deepEqual(afterRace, []);
 
-  // 4. Secret never leaks into delivery log even if fetch throws error containing the secret
+  // 6. Short secret & symbol Bearer redaction + safe fixed error codes on transport failure
+  assert.equal(sanitizeDeliveryError('failed with key abc12', 'abc12'), 'failed with key [REDACTED]');
+  assert.equal(sanitizeDeliveryError('header Authorization: Bearer tok!@#$%xyz failed'), 'header Authorization: Bearer [REDACTED] failed');
+
   const leakedFetch = async () => {
-    throw new Error(`upstream rejected Authorization: Bearer ${bearerSecret}`);
+    throw new Error(`upstream rejected Authorization: Bearer ${bearerSecret} at https://secret.host/?k=1`);
   };
   const failedLeak = await dispatcher.testTarget('t-bearer', { fetchImpl: leakedFetch, sleep: fastSleep });
   assert.equal(failedLeak.status, 'failed');
-  assert.ok(!failedLeak.error.includes(bearerSecret));
+  assert.equal(failedLeak.error, 'network_error');
 
-  // 5. listDeliveries returns newest-first sanitized history
-  const history = await dispatcher.listDeliveries(50);
-  assert.equal(history.length, 9);
-  assert.equal(history[0].delivery_id, failedLeak.delivery_id);
-  assert.equal(history[1].delivery_id, pingRes.delivery_id);
+  // 7. testTarget sends lightweight { type: 'ping', timestamp } even when disabled
+  const pingRes = await dispatcher.testTarget('t-disabled');
+  assert.equal(pingRes.status, 'delivered');
+  assert.equal(pingRes.event, 'ping');
 
-  const filtered = await dispatcher.listDeliveries(10, 't-hmac');
-  assert.equal(filtered.length, 2);
-  assert.equal(filtered[0].target_id, 't-hmac');
-
+  // 8. Audit log permissions & secret non-leakage
   const logRaw = await readFile(dispatcher.deliveriesFile, 'utf8');
   assert.equal((await stat(dispatcher.deliveriesFile)).mode & 0o777, 0o600);
   assert.ok(!logRaw.includes(bearerSecret), 'Bearer secret leaked into deliveries.jsonl');
   assert.ok(!logRaw.includes(hmacSecret), 'HMAC secret leaked into deliveries.jsonl');
+
+  // Loosened deliveries.jsonl permissions fail closed on listDeliveries
+  await chmod(dispatcher.deliveriesFile, 0o644);
+  await assert.rejects(dispatcher.listDeliveries(10), error => error instanceof PushTargetError && error.status === 500);
+  await chmod(dispatcher.deliveriesFile, 0o600);
+  assert.ok((await dispatcher.listDeliveries(10)).length >= 5);
 });

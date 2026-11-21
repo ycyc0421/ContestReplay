@@ -1,8 +1,8 @@
 import { constants } from 'node:fs';
-import { open, readdir } from 'node:fs/promises';
+import { lstat, open, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
-import { file as readBoundedFile } from './config.js';
+import { sha256 } from './config.js';
 
 export const scoringModeSchema = z.enum(['icpc', 'cf', 'ioi', 'last_ac']);
 export type ScoringMode = z.infer<typeof scoringModeSchema>;
@@ -12,6 +12,7 @@ export type ProblemStatus = z.infer<typeof problemStatusSchema>;
 
 const count = z.number().int().nonnegative();
 const points = z.number().nonnegative();
+const digest = z.string().regex(/^[a-f0-9]{64}$/);
 
 export const runProgressProblemSchema = z.strictObject({
   id: z.string().min(1),
@@ -176,6 +177,10 @@ export const runReplaySchema = z.strictObject({
   contest_id: z.string().min(1),
   contest_title: z.string().optional(),
   data_version: count,
+  contest_revision: digest.optional(),
+  protocol_id: z.string().min(1).optional(),
+  protocol_version: count.optional(),
+  protocol_sha256: digest.optional(),
   scoring_mode: scoringModeSchema,
   started_at: z.string().optional(),
   time_limit_ms: count,
@@ -245,7 +250,10 @@ export const ghostRaceMilestoneSchema = z.strictObject({
 export type GhostRaceMilestone = z.infer<typeof ghostRaceMilestoneSchema>;
 
 export const ghostRaceStandingSchema = z.strictObject({
-  rank: z.number().int().positive(),
+  rank: z.number().int().positive().nullable(),
+  status: z.enum(['running', 'completed', 'void', 'unknown']),
+  provisional: z.boolean(),
+  unranked: z.boolean(),
   run_id: z.uuid(),
   agent_id: z.string().min(1),
   agent_name: z.string().optional(),
@@ -271,7 +279,13 @@ export type GhostRaceSnapshot = z.infer<typeof ghostRaceSnapshotSchema>;
 export const ghostRaceSchema = z.strictObject({
   contest_id: z.string().min(1),
   contest_title: z.string().optional(),
+  data_version: count,
+  contest_revision: digest.optional(),
+  protocol_id: z.string().min(1).optional(),
+  protocol_version: count.optional(),
+  protocol_sha256: digest.optional(),
   time_limit_ms: count,
+  timeline_end_ms: count,
   scoring_mode: scoringModeSchema,
   problems: z.array(problemMetaSchema),
   participants: z.array(ghostRaceParticipantSchema).min(1).max(8),
@@ -289,6 +303,15 @@ const runMetaSchema = z.object({
   contest_id: z.string().min(1),
   contest_title: z.string().optional(),
   data_version: count.default(1),
+  contest_revision: digest.optional(),
+  protocol_id: z.string().min(1).optional(),
+  protocol_version: count.optional(),
+  protocol_sha256: digest.optional(),
+  input_sha256: z.object({
+    contest: digest.optional(),
+    pdf: digest.optional(),
+    judge: digest.optional(),
+  }).optional(),
   agent_id: z.string().min(1),
   agent_name: z.string().optional(),
   scoring_mode: scoringModeSchema.optional(),
@@ -325,17 +348,18 @@ function roundScore(value: number): number {
 }
 
 const SECRET_PATTERNS: Array<[RegExp, string]> = [
-  [/\bBearer\s+[A-Za-z0-9._~+/=-]{4,}/gi, 'Bearer [REDACTED]'],
+  [/\bBearer\s+[\x21-\x7e]+/gi, 'Bearer [REDACTED]'],
   [/\b(?:sk|pk|rk)[-_][A-Za-z0-9_-]{8,}\b/g, '[REDACTED]'],
   [/\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{10,}\b/g, '[REDACTED]'],
   [/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, '[REDACTED]'],
   [/\bAKIA[0-9A-Z]{16}\b/g, '[REDACTED]'],
+  [/("(?:api[_-]?key|token|secret|password|cookie|authorization)"\s*:\s*")[^"]+(")/gi, '$1[REDACTED]$2'],
   [/\b(api[_-]?key|token|secret|password|cookie|authorization)\s*([:=])\s*[^\s,;'"`]+/gi, '$1$2[REDACTED]'],
 ];
 
 const HOST_PATH_PATTERNS: RegExp[] = [
-  /(?:^|[\s([{'"])((?:\/(?:home|Users|tmp|var|etc|root|opt|srv|private|mnt|media|run))(?:\/[^\s)\]}'"`]+)+)/g,
-  /(?:^|[\s([{'"])([A-Za-z]:\\(?:[^\s)\]}'"`\\]+\\?)+)/g,
+  /(?:^|[\s([{'",=:]|file:\/\/)((?:\/(?:home|Users|tmp|var|etc|root|opt|srv|private|mnt|media|run))(?:\/[^\s)\]}'"`,;]+)+)/g,
+  /(?:^|[\s([{'",=:]|file:\/\/\/?)([A-Za-z]:\\[^\s)\]}'"`,;]+)/g,
 ];
 
 function sanitizeString(input: string, redactPaths = true): string {
@@ -365,14 +389,13 @@ function isAlreadyAcceptedVerdict(verdict: string): boolean {
   return verdict.trim().toLowerCase() === 'already_accepted';
 }
 
+function isInvalidSubmissionVerdict(verdict: string): boolean {
+  return verdict.trim().toLowerCase() === 'invalid_submission';
+}
+
 function isPendingVerdict(verdict: string): boolean {
   const v = verdict.trim().toLowerCase();
   return v === 'pending' || v === 'testing' || v === 'queued' || v === 'running' || v === 'judging';
-}
-
-function isPartialVerdict(verdict: string): boolean {
-  const v = verdict.trim().toLowerCase();
-  return v === 'partial' || v === 'pc' || v === 'partially_accepted';
 }
 
 function isNoPenaltyVerdict(verdict: string): boolean {
@@ -395,11 +418,18 @@ function formatShortVerdict(verdict: string): string {
   return v.length > 48 ? v.slice(0, 48) : v;
 }
 
-async function readNoFollowJson(filePath: string, limit: number): Promise<unknown> {
+async function assertRealDirectory(dir: string): Promise<void> {
+  const info = await lstat(dir);
+  if (!info.isDirectory()) {
+    throw new Error('Expected a real directory (symlinks are not allowed)');
+  }
+}
+
+async function readRegularFileNoFollow(filePath: string, limit: number): Promise<Buffer> {
   const handle = await open(filePath, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
   try {
     const info = await handle.stat();
-    if (!info.isFile() || info.size > limit) throw new Error('Run metadata file is invalid or too large');
+    if (!info.isFile() || info.size > limit) throw new Error('File is invalid or exceeds size limit');
     const bytes = Buffer.alloc(info.size + 1);
     let read = 0;
     while (read < bytes.length) {
@@ -407,14 +437,22 @@ async function readNoFollowJson(filePath: string, limit: number): Promise<unknow
       if (!res.bytesRead) break;
       read += res.bytesRead;
     }
-    if (read !== info.size) throw new Error('Run metadata changed while reading');
-    return JSON.parse(bytes.subarray(0, read).toString('utf8')) as unknown;
+    if (read !== info.size) throw new Error('File changed while reading');
+    return bytes.subarray(0, read);
   } finally {
     await handle.close();
   }
 }
 
-async function discoverProblemsFromLocalInputs(localInputs?: { contest?: string; judge?: string }): Promise<ProblemMeta[]> {
+async function readNoFollowJson(filePath: string, limit: number): Promise<unknown> {
+  const bytes = await readRegularFileNoFollow(filePath, limit);
+  return JSON.parse(bytes.toString('utf8')) as unknown;
+}
+
+async function discoverProblemsFromLocalInputs(
+  localInputs?: { contest?: string; judge?: string },
+  inputSha256?: { contest?: string; judge?: string },
+): Promise<ProblemMeta[]> {
   if (!localInputs) return [];
   const parseList = (raw: unknown): ProblemMeta[] => {
     if (!raw || typeof raw !== 'object' || !('problems' in raw) || !Array.isArray(raw.problems)) return [];
@@ -429,20 +467,30 @@ async function discoverProblemsFromLocalInputs(localInputs?: { contest?: string;
     }
     return list;
   };
-  if (localInputs.contest) {
+
+  if (localInputs.contest && inputSha256?.contest) {
     try {
-      const bytes = await readBoundedFile(localInputs.contest, 1_000_000);
-      const parsed = parseList(JSON.parse(bytes.toString('utf8')));
-      if (parsed.length) return parsed;
-    } catch { /* ignore unavailable local contest file */ }
+      const bytes = await readRegularFileNoFollow(localInputs.contest, 1_000_000);
+      const parsed = JSON.parse(bytes.toString('utf8')) as unknown;
+      const matchesDigest =
+        sha256(bytes) === inputSha256.contest ||
+        sha256(JSON.stringify(parsed)) === inputSha256.contest;
+      if (matchesDigest) {
+        const list = parseList(parsed);
+        if (list.length) return list;
+      }
+    } catch { /* ignore missing or tampered local contest file */ }
   }
-  if (localInputs.judge) {
+
+  if (localInputs.judge && inputSha256?.judge) {
     try {
-      const bytes = await readBoundedFile(localInputs.judge, 4_000_000);
-      // Read ONLY id and max_points; never access or retain accepted_answers.
-      const parsed = parseList(JSON.parse(bytes.toString('utf8')));
-      if (parsed.length) return parsed;
-    } catch { /* ignore unavailable local judge file */ }
+      const bytes = await readRegularFileNoFollow(localInputs.judge, 4_000_000);
+      if (sha256(bytes) === inputSha256.judge) {
+        // Read ONLY id and max_points; never access or retain accepted_answers.
+        const list = parseList(JSON.parse(bytes.toString('utf8')));
+        if (list.length) return list;
+      }
+    } catch { /* ignore missing or tampered local judge file */ }
   }
   return [];
 }
@@ -455,8 +503,9 @@ interface RawEvent {
 }
 
 const MAX_EVENT_LINE_BYTES = 4 * 1024 * 1024;
+const MAX_REPLAY_SOURCE_DIFF_BYTES = 2 * 1024 * 1024;
 
-async function streamRunEvents(eventsPath: string): Promise<RawEvent[]> {
+async function streamRunEvents(eventsPath: string, includeSources: boolean): Promise<RawEvent[]> {
   let handle;
   try {
     handle = await open(eventsPath, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
@@ -467,25 +516,44 @@ async function streamRunEvents(eventsPath: string): Promise<RawEvent[]> {
 
   const events: RawEvent[] = [];
   let buffer = '';
-  let fallbackSeq = 0;
+  let skipUntilNewline = false;
+  let lastSeq = 0;
 
-  const consumeLine = (line: string) => {
+  const consumeLine = (line: string, isTrailingUnfinished: boolean) => {
     const trimmed = line.trim();
     if (!trimmed) return;
     let parsed: unknown;
     try {
       parsed = JSON.parse(trimmed);
     } catch {
-      return;
+      if (isTrailingUnfinished) return;
+      throw new Error('Corrupted run event log: malformed JSON record');
     }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      if (isTrailingUnfinished) return;
+      throw new Error('Corrupted run event log: expected JSON object');
+    }
     const rec = parsed as Record<string, unknown>;
-    if (typeof rec.type !== 'string' || !rec.type.trim()) return;
-    const seq = typeof rec.seq === 'number' && Number.isInteger(rec.seq) && rec.seq >= 0 ? rec.seq : ++fallbackSeq;
-    fallbackSeq = Math.max(fallbackSeq, seq);
+    if (typeof rec.type !== 'string' || !rec.type.trim()) {
+      if (isTrailingUnfinished) return;
+      throw new Error('Corrupted run event log: missing event type');
+    }
+    let seq: number;
+    if (rec.seq !== undefined) {
+      if (typeof rec.seq !== 'number' || !Number.isInteger(rec.seq) || rec.seq !== lastSeq + 1) {
+        throw new Error(`Corrupted run event log: invalid sequence number (expected ${lastSeq + 1})`);
+      }
+      seq = rec.seq;
+    } else {
+      seq = lastSeq + 1;
+    }
+    lastSeq = seq;
     const elapsed_ms = toNonNegInt(rec.elapsed_ms, 0);
-    // Drop local answers and raw model outputs immediately; never retain them in progress/replay state.
-    const { answer: _droppedAnswer, output: _droppedOutput, ...rest } = rec;
+    // Drop local answers and raw model outputs immediately; drop source unless explicitly requested.
+    const { answer: _droppedAnswer, output: _droppedOutput, source: rawSource, ...rest } = rec;
+    if (includeSources && typeof rawSource === 'string') {
+      rest.source = rawSource;
+    }
     events.push({ seq, elapsed_ms, type: rec.type, raw: rest });
   };
 
@@ -499,21 +567,31 @@ async function streamRunEvents(eventsPath: string): Promise<RawEvent[]> {
       const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
       if (!bytesRead) break;
       position += bytesRead;
-      buffer += decoder.decode(chunk.subarray(0, bytesRead), { stream: true });
+      const decoded = decoder.decode(chunk.subarray(0, bytesRead), { stream: true });
+
+      if (skipUntilNewline) {
+        const nl = decoded.indexOf('\n');
+        if (nl === -1) continue;
+        skipUntilNewline = false;
+        throw new Error('Corrupted run event log: event line exceeded maximum length');
+      }
+
+      buffer += decoded;
       let newlineIdx: number;
       while ((newlineIdx = buffer.indexOf('\n')) !== -1) {
         const line = buffer.slice(0, newlineIdx);
         buffer = buffer.slice(newlineIdx + 1);
-        consumeLine(line);
+        consumeLine(line, false);
       }
       if (buffer.length > MAX_EVENT_LINE_BYTES) {
         buffer = '';
+        skipUntilNewline = true;
       }
     }
     buffer += decoder.decode();
-    if (buffer.trim()) {
+    if (!skipUntilNewline && buffer.trim()) {
       // Tolerates partially written trailing JSON line while a run is live.
-      consumeLine(buffer);
+      consumeLine(buffer, true);
     }
   } finally {
     await handle.close();
@@ -530,49 +608,6 @@ function extractUsage(usage: unknown): { input?: number; output?: number } {
     input: input !== undefined ? Math.floor(input) : undefined,
     output: output !== undefined ? Math.floor(output) : undefined,
   };
-}
-
-interface ParsedRunState {
-  runId: string;
-  meta: z.infer<typeof runMetaSchema>;
-  scoringMode: ScoringMode;
-  explicitScoringMode?: ScoringMode;
-  status: 'running' | 'completed' | 'void' | 'unknown';
-  reason?: string;
-  startedAt?: string;
-  timeLimitMs: number;
-  maxSubmissions: number;
-  lastEventElapsedMs: number;
-  lastActivityType?: string;
-  terminalScore?: number;
-  terminalMaxScore?: number;
-  seededProblems: boolean;
-  problemsOrder: string[];
-  problemMap: Map<string, {
-    id: string;
-    max_points: number;
-    attempts: number;
-    pending_count: number;
-    accepted: boolean;
-    best_score: number;
-    first_ac_ms?: number;
-    last_verdict?: string;
-    last_elapsed_ms?: number;
-  }>;
-  submissions: Map<string, {
-    submission_id: string;
-    problem_id: string;
-    received_ms: number;
-    judged_ms?: number;
-    verdict: string;
-    score?: number;
-    max_points?: number;
-    language?: string;
-    source?: string;
-  }>;
-  activities: RunProgressActivity[];
-  frames: ReplayFrame[];
-  telemetry: RunProgressTelemetry;
 }
 
 function buildSafeActivitySummary(
@@ -635,8 +670,8 @@ export function unifiedLineDiff(prev: string, next: string, labelA = 'previous',
   const b = next.replace(/\r\n/g, '\n').split('\n');
   if (a.length === b.length && a.every((line, idx) => line === b[idx])) return '';
 
-  // For very large files, fall back to a compact bounded hunk diff so diffing stays O(N).
-  if (a.length * b.length > 400_000) {
+  // For large files, fall back to a compact bounded hunk diff so diffing stays O(N).
+  if (a.length > 2000 || b.length > 2000 || a.length * b.length > 400_000) {
     let prefix = 0;
     while (prefix < a.length && prefix < b.length && a[prefix] === b[prefix]) prefix++;
     let suffix = 0;
@@ -659,16 +694,17 @@ export function unifiedLineDiff(prev: string, next: string, labelA = 'previous',
     return lines.join('\n');
   }
 
-  // Exact LCS DP table for unified line diff.
+  // Exact LCS DP using a single flat Uint32Array for cache efficiency.
   const n = a.length;
   const m = b.length;
-  const dp: Uint32Array[] = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  const stride = m + 1;
+  const dp = new Uint32Array((n + 1) * stride);
   for (let i = n - 1; i >= 0; i--) {
-    const row = dp[i]!;
-    const nextRow = dp[i + 1]!;
+    const rowOff = i * stride;
+    const nextOff = (i + 1) * stride;
     for (let j = m - 1; j >= 0; j--) {
-      if (a[i] === b[j]) row[j] = nextRow[j + 1]! + 1;
-      else row[j] = Math.max(nextRow[j]!, row[j + 1]!);
+      if (a[i] === b[j]) dp[rowOff + j] = dp[nextOff + j + 1]! + 1;
+      else dp[rowOff + j] = Math.max(dp[nextOff + j]!, dp[rowOff + j + 1]!);
     }
   }
 
@@ -683,7 +719,7 @@ export function unifiedLineDiff(prev: string, next: string, labelA = 'previous',
       ops.push({ kind: ' ', line: a[i]!, oldLine: oldLine++, newLine: newLine++ });
       i++;
       j++;
-    } else if (dp[i + 1]![j]! >= dp[i]![j + 1]!) {
+    } else if (dp[(i + 1) * stride + j]! >= dp[i * stride + j + 1]!) {
       ops.push({ kind: '-', line: a[i]!, oldLine: oldLine++, newLine });
       i++;
     } else {
@@ -727,13 +763,203 @@ export function unifiedLineDiff(prev: string, next: string, labelA = 'previous',
   return out.join('\n');
 }
 
+function projectBoard(
+  problems: ProblemMeta[],
+  submissions: ReplaySubmission[],
+  timeLimitMs: number,
+  atElapsedMs: number,
+  scoringMode: ScoringMode,
+): ScoreProjection {
+  const t = Math.max(0, Math.floor(atElapsedMs));
+  const subsByProblem = new Map<string, ReplaySubmission[]>();
+  let submissionsUsed = 0;
+
+  for (const sub of submissions) {
+    if (sub.received_ms <= t) {
+      submissionsUsed++;
+      const list = subsByProblem.get(sub.problem_id) ?? [];
+      list.push(sub);
+      subsByProblem.set(sub.problem_id, list);
+    }
+  }
+
+  let totalScore = 0;
+  let totalMaxScore = 0;
+  let totalPenaltyMin = 0;
+  let totalPenaltyMs = 0;
+  let solvedCount = 0;
+  let lastAcMs = 0;
+  let lastIoiImprovementMs = 0;
+
+  const projectedProblems: ProjectedProblem[] = problems.map(problem => {
+    const list = (subsByProblem.get(problem.id) ?? []).slice().sort((a, b) => a.received_ms - b.received_ms);
+    let attempts = 0;
+    let wrongBeforeAc = 0;
+    let isAccepted = false;
+    let firstAcMs: number | undefined;
+    let bestPartial = 0;
+    let lastImprovement = 0;
+    let hasPending = false;
+    let lastVerdict: string | undefined;
+
+    for (const sub of list) {
+      attempts++;
+      // Never prematurely reveal verdicts judged after atElapsedMs (including post-contest settling).
+      const verdictKnown = !isPendingVerdict(sub.verdict) && (
+        sub.judged_ms === undefined ? true : sub.judged_ms <= t
+      );
+      if (!verdictKnown) {
+        hasPending = true;
+        if (!isAccepted) lastVerdict = 'pending';
+        continue;
+      }
+
+      if (!isAccepted) lastVerdict = sub.verdict;
+      const rawPoints = sub.score !== undefined
+        ? (problem.max_points > 0 ? Math.min(problem.max_points, sub.score) : sub.score)
+        : isAcceptedVerdict(sub.verdict) ? problem.max_points : 0;
+
+      const subAccepted = isAcceptedVerdict(sub.verdict) || (
+        scoringMode === 'ioi' && problem.max_points > 0 && rawPoints >= problem.max_points && !isAlreadyAcceptedVerdict(sub.verdict)
+      );
+
+      if (isAlreadyAcceptedVerdict(sub.verdict)) continue;
+
+      if (scoringMode === 'ioi') {
+        if (rawPoints > bestPartial) {
+          bestPartial = rawPoints;
+          lastImprovement = sub.received_ms;
+        }
+        if (subAccepted) {
+          isAccepted = true;
+          firstAcMs = Math.min(firstAcMs ?? Infinity, sub.received_ms);
+          lastVerdict = sub.verdict;
+        } else if (!isAccepted && !isNoPenaltyVerdict(sub.verdict)) {
+          wrongBeforeAc++;
+        }
+      } else {
+        if (subAccepted) {
+          isAccepted = true;
+          firstAcMs = Math.min(firstAcMs ?? Infinity, sub.received_ms);
+          lastVerdict = sub.verdict;
+        } else if (!isAccepted && !isNoPenaltyVerdict(sub.verdict)) {
+          wrongBeforeAc++;
+          if (rawPoints > bestPartial) bestPartial = rawPoints;
+        }
+      }
+    }
+
+    let probScore = 0;
+    if (scoringMode === 'icpc') {
+      probScore = isAccepted ? 1 : 0;
+      totalMaxScore += 1;
+      if (isAccepted && firstAcMs !== undefined) {
+        totalPenaltyMin += Math.floor(firstAcMs / 60_000) + 20 * wrongBeforeAc;
+        totalPenaltyMs += firstAcMs + wrongBeforeAc * 20 * 60_000;
+      }
+    } else if (scoringMode === 'cf') {
+      totalMaxScore += problem.max_points;
+      if (isAccepted && firstAcMs !== undefined) {
+        const pMax = problem.max_points;
+        const frac = timeLimitMs > 0 ? Math.min(1, Math.max(0, firstAcMs / timeLimitMs)) : 0;
+        const wrongPenalty = (pMax >= 500 ? 50 : 0.1 * pMax) * wrongBeforeAc;
+        probScore = roundScore(Math.max(0.3 * pMax, pMax * (1 - 0.5 * frac) - wrongPenalty));
+      }
+    } else if (scoringMode === 'ioi') {
+      totalMaxScore += problem.max_points;
+      probScore = roundScore(bestPartial);
+      if (bestPartial > 0) lastIoiImprovementMs = Math.max(lastIoiImprovementMs, lastImprovement);
+    } else {
+      // last_ac
+      totalMaxScore += problem.max_points;
+      probScore = roundScore(isAccepted ? problem.max_points : bestPartial);
+    }
+
+    totalScore += probScore;
+    if (isAccepted) {
+      solvedCount++;
+      if (firstAcMs !== undefined) lastAcMs = Math.max(lastAcMs, firstAcMs);
+    }
+
+    let probStatus: ProblemStatus;
+    if (isAccepted) probStatus = 'accepted';
+    else if (hasPending) probStatus = 'pending';
+    else if (probScore > 0) probStatus = 'partial';
+    else if (attempts > 0) probStatus = 'wrong';
+    else probStatus = 'unattempted';
+
+    return {
+      id: problem.id,
+      status: probStatus,
+      attempts,
+      wrong_attempts: wrongBeforeAc,
+      score: probScore,
+      max_points: scoringMode === 'icpc' ? 1 : problem.max_points,
+      ...(firstAcMs !== undefined ? { first_ac_ms: firstAcMs } : {}),
+      ...(lastVerdict !== undefined ? { last_verdict: lastVerdict } : {}),
+    };
+  });
+
+  const penalty = scoringMode === 'icpc'
+    ? totalPenaltyMin
+    : scoringMode === 'ioi'
+    ? lastIoiImprovementMs
+    : scoringMode === 'last_ac'
+    ? lastAcMs
+    : 0;
+
+  const penaltyMs = scoringMode === 'icpc'
+    ? totalPenaltyMs
+    : scoringMode === 'ioi'
+    ? lastIoiImprovementMs
+    : lastAcMs;
+
+  return scoreProjectionSchema.parse({
+    at_elapsed_ms: t,
+    scoring_mode: scoringMode,
+    score: roundScore(totalScore),
+    max_score: roundScore(totalMaxScore),
+    penalty,
+    penalty_ms: penaltyMs,
+    solved_count: solvedCount,
+    last_ac_ms: lastAcMs,
+    submissions_used: submissionsUsed,
+    problems: projectedProblems,
+  });
+}
+
+interface ParsedRunState {
+  runId: string;
+  meta: z.infer<typeof runMetaSchema>;
+  scoringMode: ScoringMode;
+  explicitScoringMode?: ScoringMode;
+  status: 'running' | 'completed' | 'void' | 'unknown';
+  reason?: string;
+  startedAt?: string;
+  timeLimitMs: number;
+  maxSubmissions: number;
+  lastEventElapsedMs: number;
+  lastActivityType?: string;
+  terminalScore?: number;
+  terminalMaxScore?: number;
+  seededProblems: boolean;
+  problems: ProblemMeta[];
+  problemLastElapsed: Map<string, number>;
+  submissions: ReplaySubmission[];
+  activities: RunProgressActivity[];
+  frames: ReplayFrame[];
+  telemetry: RunProgressTelemetry;
+}
+
 async function parseRunState(root: string, runId: string, opts: { includeSources?: boolean } = {}): Promise<ParsedRunState> {
   const validRunId = z.uuid().parse(runId);
   const directory = join(root, validRunId);
+  await assertRealDirectory(directory);
   const meta = runMetaSchema.parse(await readNoFollowJson(join(directory, 'run.json'), 4 * 1024 * 1024));
   if (meta.run_id !== validRunId) throw new Error('Run ID mismatch');
 
-  const events = await streamRunEvents(join(directory, 'events.jsonl'));
+  const includeSources = opts.includeSources === true;
+  const events = await streamRunEvents(join(directory, 'events.jsonl'), includeSources);
   const explicitScoringMode = meta.scoring_mode ?? meta.rules?.scoring_mode;
   const scoringMode: ScoringMode = explicitScoringMode ?? 'last_ac';
   const timeLimitMs = meta.rules?.time_limit_ms ?? 900_000;
@@ -745,7 +971,7 @@ async function parseRunState(root: string, runId: string, opts: { includeSources
     initialProblems = meta.problems.map(p => ({ id: p.id, max_points: p.max_points }));
     seededProblems = true;
   } else {
-    const discovered = await discoverProblemsFromLocalInputs(meta.local_inputs);
+    const discovered = await discoverProblemsFromLocalInputs(meta.local_inputs, meta.input_sha256);
     if (discovered.length) {
       initialProblems = discovered;
       seededProblems = true;
@@ -753,26 +979,22 @@ async function parseRunState(root: string, runId: string, opts: { includeSources
   }
 
   const problemsOrder: string[] = [];
-  const problemMap = new Map<string, ParsedRunState['problemMap'] extends Map<string, infer V> ? V : never>();
-  const ensureProblem = (id: string, fallbackPoints = 1) => {
-    let entry = problemMap.get(id);
+  const problemMetaMap = new Map<string, { id: string; max_points: number; validCount: number }>();
+  const problemLastElapsed = new Map<string, number>();
+
+  const ensureProblem = (id: string, fallbackPoints = 1, allowInsert = !seededProblems) => {
+    let entry = problemMetaMap.get(id);
     if (!entry) {
-      entry = {
-        id,
-        max_points: fallbackPoints,
-        attempts: 0,
-        pending_count: 0,
-        accepted: false,
-        best_score: 0,
-      };
-      problemMap.set(id, entry);
+      if (!allowInsert) return undefined;
+      entry = { id, max_points: fallbackPoints, validCount: 0 };
+      problemMetaMap.set(id, entry);
       problemsOrder.push(id);
     }
     return entry;
   };
-  for (const p of initialProblems) ensureProblem(p.id, p.max_points);
+  for (const p of initialProblems) ensureProblem(p.id, p.max_points, true);
 
-  const submissions = new Map<string, ParsedRunState['submissions'] extends Map<string, infer V> ? V : never>();
+  const submissionsMap = new Map<string, ReplaySubmission>();
   const prevSourceByProblem = new Map<string, { submission_id: string; source: string }>();
   const activities: RunProgressActivity[] = [];
   const frames: ReplayFrame[] = [];
@@ -785,6 +1007,7 @@ async function parseRunState(root: string, runId: string, opts: { includeSources
   const turnFrameIndex = new Map<number, number>();
   const seenTurns = new Set<number>();
   let syntheticTurnCounter = 0;
+  let activeSyntheticTurn: number | undefined;
 
   let status: ParsedRunState['status'] = events.length > 0 ? 'running' : 'unknown';
   let reason: string | undefined;
@@ -793,15 +1016,23 @@ async function parseRunState(root: string, runId: string, opts: { includeSources
   let lastActivityType: string | undefined;
   let terminalScore: number | undefined;
   let terminalMaxScore: number | undefined;
+  let replayPayloadBytesUsed = 0;
 
-  const currentTotals = () => {
-    let totalScore = 0;
-    let solved = 0;
-    for (const p of problemMap.values()) {
-      totalScore += p.best_score;
-      if (p.accepted) solved++;
-    }
-    return { score: roundScore(totalScore), solved };
+  const currentProblemsList = (): ProblemMeta[] =>
+    problemsOrder.map(id => {
+      const p = problemMetaMap.get(id)!;
+      return { id: p.id, max_points: p.max_points };
+    });
+
+  const currentTotals = (atMs: number) => {
+    const projected = projectBoard(
+      currentProblemsList(),
+      [...submissionsMap.values()],
+      timeLimitMs,
+      atMs,
+      scoringMode,
+    );
+    return { score: projected.score, solved: projected.solved_count };
   };
 
   for (const event of events) {
@@ -818,7 +1049,7 @@ async function parseRunState(root: string, runId: string, opts: { includeSources
 
     if (event.type === 'run_started') {
       if (typeof raw.started_at === 'string' && raw.started_at.trim()) startedAt = raw.started_at;
-      const totals = currentTotals();
+      const totals = currentTotals(event.elapsed_ms);
       frames.push({
         seq: event.seq,
         elapsed_ms: event.elapsed_ms,
@@ -828,11 +1059,19 @@ async function parseRunState(root: string, runId: string, opts: { includeSources
         solved_count: totals.solved,
       });
     } else if (event.type === 'model_request') {
-      const t = turnRaw ?? ++syntheticTurnCounter;
+      const t = turnRaw ?? (activeSyntheticTurn = ++syntheticTurnCounter);
       seenTurns.add(t);
       turnStarts.set(t, event.elapsed_ms);
     } else if (event.type === 'model_response' || event.type === 'model_usage') {
-      const t = turnRaw ?? (event.type === 'model_response' ? ++syntheticTurnCounter : syntheticTurnCounter || 1);
+      let t: number;
+      if (turnRaw !== undefined) {
+        t = turnRaw;
+      } else if (activeSyntheticTurn !== undefined) {
+        t = activeSyntheticTurn;
+        if (event.type === 'model_usage') activeSyntheticTurn = undefined;
+      } else {
+        t = event.type === 'model_response' ? ++syntheticTurnCounter : (syntheticTurnCounter || 1);
+      }
       seenTurns.add(t);
       const explicitDuration = toNonNegNum(raw.duration_ms);
       if (explicitDuration !== undefined) {
@@ -853,7 +1092,7 @@ async function parseRunState(root: string, runId: string, opts: { includeSources
         if (usage.input !== undefined) existing.input_tokens = usage.input;
         if (usage.output !== undefined) existing.output_tokens = usage.output;
       } else {
-        const totals = currentTotals();
+        const totals = currentTotals(event.elapsed_ms);
         turnFrameIndex.set(t, frames.length);
         frames.push({
           seq: event.seq,
@@ -872,34 +1111,47 @@ async function parseRunState(root: string, runId: string, opts: { includeSources
       if (turnRaw !== undefined) seenTurns.add(turnRaw);
     } else if (event.type === 'submission_received') {
       const submissionId = typeof raw.submission_id === 'string' && raw.submission_id.trim()
-        ? raw.submission_id.trim() : `s${submissions.size + 1}`;
+        ? raw.submission_id.trim() : `s${submissionsMap.size + 1}`;
       const problemId = typeof raw.problem_id === 'string' && raw.problem_id.trim()
         ? raw.problem_id.trim() : 'unknown';
       const language = typeof raw.language === 'string' && raw.language.trim() ? raw.language.trim() : undefined;
-      const sanitizedSrc = opts.includeSources && typeof raw.source === 'string' ? sanitizeSource(raw.source) : undefined;
-      const prob = ensureProblem(problemId, toNonNegNum(raw.max_points) ?? 1);
-      prob.attempts++;
-      prob.pending_count++;
-      prob.last_elapsed_ms = event.elapsed_ms;
-      if (!prob.accepted) prob.last_verdict = 'pending';
 
-      let diff: string | undefined;
-      if (sanitizedSrc !== undefined) {
+      // Only add to problem table if seeded or inferred later; unknown IDs under seededProblems are never added.
+      const prob = ensureProblem(problemId, toNonNegNum(raw.max_points) ?? 1, !seededProblems);
+      if (prob) {
+        prob.validCount++;
+        problemLastElapsed.set(problemId, Math.max(problemLastElapsed.get(problemId) ?? 0, event.elapsed_ms));
+      }
+
+      let frameSource: string | undefined;
+      let frameDiff: string | undefined;
+      if (includeSources && typeof raw.source === 'string') {
+        const sanitizedSrc = sanitizeSource(raw.source);
+        const srcBytes = Buffer.byteLength(sanitizedSrc, 'utf8');
+        if (replayPayloadBytesUsed + srcBytes <= MAX_REPLAY_SOURCE_DIFF_BYTES) {
+          frameSource = sanitizedSrc;
+          replayPayloadBytesUsed += srcBytes;
+        }
         const previous = prevSourceByProblem.get(problemId);
         if (previous) {
           const computed = unifiedLineDiff(previous.source, sanitizedSrc, previous.submission_id, submissionId);
-          if (computed) diff = computed;
+          if (computed) {
+            const diffBytes = Buffer.byteLength(computed, 'utf8');
+            if (replayPayloadBytesUsed + diffBytes <= MAX_REPLAY_SOURCE_DIFF_BYTES) {
+              frameDiff = computed;
+              replayPayloadBytesUsed += diffBytes;
+            }
+          }
         }
         prevSourceByProblem.set(problemId, { submission_id: submissionId, source: sanitizedSrc });
       }
 
-      submissions.set(submissionId, {
+      submissionsMap.set(submissionId, {
         submission_id: submissionId,
         problem_id: problemId,
         received_ms: event.elapsed_ms,
         verdict: 'pending',
-        language,
-        source: sanitizedSrc,
+        ...(language !== undefined ? { language } : {}),
       });
 
       activityProblemId = problemId;
@@ -907,7 +1159,7 @@ async function parseRunState(root: string, runId: string, opts: { includeSources
       activityLanguage = language;
       activityVerdict = 'pending';
 
-      const totals = currentTotals();
+      const totals = currentTotals(event.elapsed_ms);
       frames.push({
         seq: event.seq,
         elapsed_ms: event.elapsed_ms,
@@ -917,63 +1169,58 @@ async function parseRunState(root: string, runId: string, opts: { includeSources
         submission_id: submissionId,
         language,
         verdict: 'pending',
-        source: sanitizedSrc,
-        diff,
+        source: frameSource,
+        diff: frameDiff,
         cumulative_score: totals.score,
         solved_count: totals.solved,
       });
     } else if (event.type === 'submission_delivered') {
       const submissionId = typeof raw.submission_id === 'string' ? raw.submission_id : undefined;
       activitySubmissionId = submissionId;
-      if (submissionId && submissions.has(submissionId)) {
-        activityProblemId = submissions.get(submissionId)!.problem_id;
+      if (submissionId && submissionsMap.has(submissionId)) {
+        activityProblemId = submissionsMap.get(submissionId)!.problem_id;
       }
     } else if (event.type === 'submission_judged') {
       const submissionId = typeof raw.submission_id === 'string' && raw.submission_id.trim()
         ? raw.submission_id.trim() : undefined;
-      const sub = submissionId ? submissions.get(submissionId) : undefined;
+      const sub = submissionId ? submissionsMap.get(submissionId) : undefined;
       const problemId = (typeof raw.problem_id === 'string' && raw.problem_id.trim() ? raw.problem_id.trim() : undefined)
         ?? sub?.problem_id;
       const verdict = typeof raw.verdict === 'string' && raw.verdict.trim() ? raw.verdict.trim() : 'unknown';
       const eventMaxPoints = toNonNegNum(raw.max_points);
       const explicitPoints = toNonNegNum(raw.points_awarded) ?? toNonNegNum(raw.score);
+      const invalidVerdict = isInvalidSubmissionVerdict(verdict);
 
       let awarded = explicitPoints;
       if (problemId) {
-        const prob = ensureProblem(problemId, eventMaxPoints ?? explicitPoints ?? 1);
-        if (eventMaxPoints !== undefined && (!seededProblems || prob.max_points < eventMaxPoints)) {
-          prob.max_points = Math.max(prob.max_points, eventMaxPoints);
-        }
-        if (explicitPoints !== undefined && !seededProblems && explicitPoints > prob.max_points) {
-          prob.max_points = explicitPoints;
-        }
-        if (sub && isPendingVerdict(sub.verdict) && !isPendingVerdict(verdict)) {
-          prob.pending_count = Math.max(0, prob.pending_count - 1);
-        }
-
-        if (isAcceptedVerdict(verdict)) {
-          if (awarded === undefined) awarded = prob.max_points;
-          prob.best_score = Math.max(prob.best_score, Math.min(prob.max_points, awarded));
-          if (!prob.accepted) {
-            prob.accepted = true;
-            prob.first_ac_ms = sub ? sub.received_ms : event.elapsed_ms;
-          }
-          prob.last_verdict = verdict;
-          prob.last_elapsed_ms = event.elapsed_ms;
-        } else if (isAlreadyAcceptedVerdict(verdict)) {
-          prob.last_verdict = prob.accepted ? (prob.last_verdict ?? 'accepted') : verdict;
-          prob.last_elapsed_ms = event.elapsed_ms;
-        } else if (!isPendingVerdict(verdict)) {
-          if (awarded !== undefined && awarded > 0) {
-            const capped = prob.max_points > 0 ? Math.min(prob.max_points, awarded) : awarded;
-            prob.best_score = Math.max(prob.best_score, capped);
-            if ((isPartialVerdict(verdict) || scoringMode === 'ioi') && prob.max_points > 0 && prob.best_score >= prob.max_points && !prob.accepted) {
-              prob.accepted = true;
-              prob.first_ac_ms = sub ? sub.received_ms : event.elapsed_ms;
+        if (invalidVerdict) {
+          // Prune phantom inferred problem if its only submission(s) were invalid_submission.
+          if (!seededProblems) {
+            const existing = problemMetaMap.get(problemId);
+            if (existing) {
+              existing.validCount = Math.max(0, existing.validCount - 1);
+              if (existing.validCount === 0) {
+                problemMetaMap.delete(problemId);
+                const idx = problemsOrder.indexOf(problemId);
+                if (idx !== -1) problemsOrder.splice(idx, 1);
+                problemLastElapsed.delete(problemId);
+              }
             }
           }
-          if (!prob.accepted) prob.last_verdict = verdict;
-          prob.last_elapsed_ms = event.elapsed_ms;
+        } else {
+          const prob = ensureProblem(problemId, eventMaxPoints ?? explicitPoints ?? 1, !seededProblems);
+          if (prob) {
+            if (eventMaxPoints !== undefined && (!seededProblems || prob.max_points < eventMaxPoints)) {
+              prob.max_points = Math.max(prob.max_points, eventMaxPoints);
+            }
+            if (explicitPoints !== undefined && !seededProblems && explicitPoints > prob.max_points) {
+              prob.max_points = explicitPoints;
+            }
+            if (isAcceptedVerdict(verdict) && awarded === undefined) {
+              awarded = prob.max_points;
+            }
+            problemLastElapsed.set(problemId, Math.max(problemLastElapsed.get(problemId) ?? 0, event.elapsed_ms));
+          }
         }
 
         if (sub) {
@@ -990,7 +1237,7 @@ async function parseRunState(root: string, runId: string, opts: { includeSources
       activityVerdict = verdict;
       activityScore = awarded;
 
-      const totals = currentTotals();
+      const totals = currentTotals(event.elapsed_ms);
       frames.push({
         seq: event.seq,
         elapsed_ms: event.elapsed_ms,
@@ -1006,7 +1253,7 @@ async function parseRunState(root: string, runId: string, opts: { includeSources
         solved_count: totals.solved,
       });
     } else if (event.type === 'settling' || event.type === 'judge_error' || event.type === 'finish') {
-      const totals = currentTotals();
+      const totals = currentTotals(event.elapsed_ms);
       frames.push({
         seq: event.seq,
         elapsed_ms: event.elapsed_ms,
@@ -1020,7 +1267,7 @@ async function parseRunState(root: string, runId: string, opts: { includeSources
       reason = typeof raw.reason === 'string' && raw.reason.trim() ? sanitizeString(raw.reason.trim()) : undefined;
       terminalScore = toNonNegNum(raw.score);
       terminalMaxScore = toNonNegNum(raw.max_score);
-      const totals = currentTotals();
+      const totals = currentTotals(event.elapsed_ms);
       frames.push({
         seq: event.seq,
         elapsed_ms: event.elapsed_ms,
@@ -1029,7 +1276,7 @@ async function parseRunState(root: string, runId: string, opts: { includeSources
         status,
         reason,
         score: terminalScore,
-        cumulative_score: terminalScore ?? totals.score,
+        cumulative_score: totals.score,
         solved_count: totals.solved,
       });
     }
@@ -1077,9 +1324,9 @@ async function parseRunState(root: string, runId: string, opts: { includeSources
     terminalScore,
     terminalMaxScore,
     seededProblems,
-    problemsOrder,
-    problemMap,
-    submissions,
+    problems: currentProblemsList(),
+    problemLastElapsed,
+    submissions: [...submissionsMap.values()],
     activities,
     frames,
     telemetry,
@@ -1104,33 +1351,38 @@ export async function readRunProgress(
   }
   const remainingMs = Math.max(0, state.timeLimitMs - elapsedMs);
 
-  const problems: RunProgressProblem[] = state.problemsOrder.map(id => {
-    const p = state.problemMap.get(id)!;
-    let problemStatus: ProblemStatus;
-    if (p.accepted) problemStatus = 'accepted';
-    else if (p.pending_count > 0) problemStatus = 'pending';
-    else if (p.best_score > 0) problemStatus = 'partial';
-    else if (p.attempts > 0) problemStatus = 'wrong';
-    else problemStatus = 'unattempted';
+  // Use the exact same scoring projection as replay/ghost-race for consistent numbers.
+  const projectionTime = Math.max(
+    state.lastEventElapsedMs,
+    ...state.submissions.map(s => Math.max(s.received_ms, s.judged_ms ?? s.received_ms)),
+  );
+  const projected = projectBoard(
+    state.problems,
+    state.submissions,
+    state.timeLimitMs,
+    projectionTime,
+    state.scoringMode,
+  );
 
+  const problems: RunProgressProblem[] = projected.problems.map(p => {
+    const lastElapsed = state.problemLastElapsed.get(p.id);
     return {
       id: p.id,
       max_points: p.max_points,
       attempts: p.attempts,
-      status: problemStatus,
-      best_score: roundScore(p.best_score),
+      status: p.status,
+      best_score: p.score,
       ...(p.first_ac_ms !== undefined ? { first_ac_ms: p.first_ac_ms } : {}),
       ...(p.last_verdict !== undefined ? { last_verdict: p.last_verdict } : {}),
-      ...(p.last_elapsed_ms !== undefined ? { last_elapsed_ms: p.last_elapsed_ms } : {}),
+      ...(lastElapsed !== undefined ? { last_elapsed_ms: lastElapsed } : {}),
     };
   });
 
-  const computedScore = roundScore(problems.reduce((sum, p) => sum + p.best_score, 0));
-  const computedMaxScore = roundScore(problems.reduce((sum, p) => sum + p.max_points, 0));
-  const score = state.status === 'completed' && state.terminalScore !== undefined && !state.seededProblems && state.terminalScore > computedScore
-    ? roundScore(state.terminalScore) : computedScore;
-  const maxScore = Math.max(computedMaxScore, state.terminalMaxScore ?? state.meta.max_score ?? 0);
-  const solvedCount = problems.filter(p => p.status === 'accepted').length;
+  const maxScore = state.scoringMode === 'icpc'
+    ? projected.max_score
+    : Math.max(projected.max_score, state.terminalMaxScore ?? state.meta.max_score ?? 0);
+  const score = state.status === 'completed' && state.terminalScore !== undefined && !state.seededProblems && state.scoringMode !== 'icpc' && state.terminalScore > projected.score
+    ? roundScore(state.terminalScore) : projected.score;
   const recentActivity = maxActivity === 0 ? [] : state.activities.slice(-maxActivity).reverse();
 
   return runProgressSchema.parse({
@@ -1147,14 +1399,14 @@ export async function readRunProgress(
     elapsed_ms: elapsedMs,
     time_limit_ms: state.timeLimitMs,
     remaining_ms: remainingMs,
-    submissions_used: state.submissions.size,
+    submissions_used: state.submissions.length,
     max_submissions: state.maxSubmissions,
     model_turns: state.telemetry.model_turns,
     last_activity_ms: state.lastEventElapsedMs,
     ...(state.lastActivityType !== undefined ? { last_activity_type: state.lastActivityType } : {}),
     score,
     max_score: maxScore,
-    solved_count: solvedCount,
+    solved_count: projected.solved_count,
     problem_count: problems.length,
     problems,
     recent_activity: recentActivity,
@@ -1200,7 +1452,7 @@ export function summarizeLiveRun(progress: RunProgress): LiveRunSummary {
   });
 }
 
-function trimIncompleteUtf8Tail(buffer: Buffer, length: number): number {
+function trimIncompleteUtf8Tail(buffer: Buffer, length: number, allowEmptyTrim: boolean): number {
   if (length <= 0) return 0;
   const lastByte = buffer[length - 1]!;
   if ((lastByte & 0x80) === 0) return length; // ASCII
@@ -1211,7 +1463,7 @@ function trimIncompleteUtf8Tail(buffer: Buffer, length: number): number {
     leadIdx--;
     continuations++;
   }
-  if (leadIdx < 0) return length; // Invalid lone continuation bytes; don't stall.
+  if (leadIdx < 0) return length; // Invalid lone continuation bytes; do not stall.
 
   const lead = buffer[leadIdx]!;
   let expectedLength = 1;
@@ -1221,7 +1473,7 @@ function trimIncompleteUtf8Tail(buffer: Buffer, length: number): number {
   else return length; // Invalid lead byte; leave untouched.
 
   const actualLength = length - leadIdx;
-  if (actualLength < expectedLength && leadIdx > 0) return leadIdx;
+  if (actualLength < expectedLength && (allowEmptyTrim || leadIdx > 0)) return leadIdx;
   return length;
 }
 
@@ -1235,9 +1487,25 @@ export async function readRunLogSlice(
   const validRunId = z.uuid().parse(runId);
   const validStream = z.enum(['stdout', 'stderr']).parse(stream);
   const requestedOffset = Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0;
-  const clampedMaxBytes = Number.isFinite(maxBytes) ? Math.max(1, Math.min(4 * 1024 * 1024, Math.floor(maxBytes))) : 65536;
-  const logPath = join(root, validRunId, `agent.${validStream}.log`);
+  const clampedMaxBytes = Number.isFinite(maxBytes) ? Math.max(4, Math.min(4 * 1024 * 1024, Math.floor(maxBytes))) : 65536;
+  const runDir = join(root, validRunId);
+  try {
+    await assertRealDirectory(runDir);
+  } catch (error) {
+    if (missing(error)) {
+      return logSliceSchema.parse({
+        stream: validStream,
+        offset: 0,
+        next_offset: 0,
+        total_bytes: 0,
+        has_more: false,
+        chunk: '',
+      });
+    }
+    throw error;
+  }
 
+  const logPath = join(runDir, `agent.${validStream}.log`);
   let handle;
   try {
     handle = await open(logPath, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
@@ -1283,7 +1551,8 @@ export async function readRunLogSlice(
     }
 
     const rawHasMore = startOffset + totalRead < totalBytes;
-    const safeLength = rawHasMore ? trimIncompleteUtf8Tail(buffer, totalRead) : totalRead;
+    // Always hold back incomplete trailing multi-byte UTF-8 sequences (including live EOF partial writes).
+    const safeLength = trimIncompleteUtf8Tail(buffer, totalRead, !rawHasMore);
     const nextOffset = startOffset + safeLength;
 
     return logSliceSchema.parse({
@@ -1291,7 +1560,7 @@ export async function readRunLogSlice(
       offset: startOffset,
       next_offset: nextOffset,
       total_bytes: totalBytes,
-      has_more: nextOffset < totalBytes,
+      has_more: rawHasMore,
       chunk: buffer.subarray(0, safeLength).toString('utf8'),
     });
   } finally {
@@ -1301,6 +1570,13 @@ export async function readRunLogSlice(
 
 async function readSessionSummaries(runDir: string): Promise<SessionSummary[]> {
   const sessionDir = join(runDir, 'session');
+  try {
+    await assertRealDirectory(sessionDir);
+  } catch (error) {
+    if (missing(error)) return [];
+    throw error;
+  }
+
   let entries;
   try {
     entries = await readdir(sessionDir, { withFileTypes: true });
@@ -1421,22 +1697,8 @@ export async function buildRunReplay(
   opts: { includeSession?: boolean; includeSources?: boolean } = {},
 ): Promise<RunReplay> {
   const state = await parseRunState(root, runId, { includeSources: opts.includeSources === true });
-  const problems: ProblemMeta[] = state.problemsOrder.map(id => {
-    const p = state.problemMap.get(id)!;
-    return { id: p.id, max_points: p.max_points };
-  });
-  const submissions: ReplaySubmission[] = [...state.submissions.values()].map(sub => ({
-    submission_id: sub.submission_id,
-    problem_id: sub.problem_id,
-    received_ms: sub.received_ms,
-    ...(sub.judged_ms !== undefined ? { judged_ms: sub.judged_ms } : {}),
-    verdict: sub.verdict,
-    ...(sub.score !== undefined ? { score: sub.score } : {}),
-    ...(sub.max_points !== undefined ? { max_points: sub.max_points } : {}),
-    ...(sub.language !== undefined ? { language: sub.language } : {}),
-  }));
-
   const sessionSummaries = opts.includeSession ? await readSessionSummaries(join(root, state.runId)) : undefined;
+  const contestRevision = state.meta.contest_revision ?? state.meta.input_sha256?.contest;
 
   return runReplaySchema.parse({
     run_id: state.runId,
@@ -1447,184 +1709,19 @@ export async function buildRunReplay(
     contest_id: state.meta.contest_id,
     ...(state.meta.contest_title !== undefined ? { contest_title: state.meta.contest_title } : {}),
     data_version: state.meta.data_version,
+    ...(contestRevision !== undefined ? { contest_revision: contestRevision } : {}),
+    ...(state.meta.protocol_id !== undefined ? { protocol_id: state.meta.protocol_id } : {}),
+    ...(state.meta.protocol_version !== undefined ? { protocol_version: state.meta.protocol_version } : {}),
+    ...(state.meta.protocol_sha256 !== undefined ? { protocol_sha256: state.meta.protocol_sha256 } : {}),
     scoring_mode: state.scoringMode,
     ...(state.startedAt !== undefined ? { started_at: state.startedAt } : {}),
     time_limit_ms: state.timeLimitMs,
     duration_ms: state.lastEventElapsedMs,
-    problems,
-    submissions,
+    problems: state.problems,
+    submissions: state.submissions,
     frames: state.frames,
     telemetry: state.telemetry,
     ...(sessionSummaries !== undefined ? { session_summaries: sessionSummaries } : {}),
-  });
-}
-
-function projectBoard(
-  problems: ProblemMeta[],
-  submissions: ReplaySubmission[],
-  timeLimitMs: number,
-  durationMs: number,
-  runStatus: 'running' | 'completed' | 'void' | 'unknown',
-  atElapsedMs: number,
-  scoringMode: ScoringMode,
-): ScoreProjection {
-  const t = Math.max(0, Math.floor(atElapsedMs));
-  const settled = t >= timeLimitMs || (runStatus === 'completed' && t >= durationMs);
-  const subsByProblem = new Map<string, ReplaySubmission[]>();
-  let submissionsUsed = 0;
-
-  for (const sub of submissions) {
-    if (sub.received_ms <= t) {
-      submissionsUsed++;
-      const list = subsByProblem.get(sub.problem_id) ?? [];
-      list.push(sub);
-      subsByProblem.set(sub.problem_id, list);
-    }
-  }
-
-  let totalScore = 0;
-  let totalMaxScore = 0;
-  let totalPenaltyMin = 0;
-  let totalPenaltyMs = 0;
-  let solvedCount = 0;
-  let lastAcMs = 0;
-  let lastIoiImprovementMs = 0;
-
-  const projectedProblems: ProjectedProblem[] = problems.map(problem => {
-    const list = (subsByProblem.get(problem.id) ?? []).slice().sort((a, b) => a.received_ms - b.received_ms);
-    let attempts = 0;
-    let wrongBeforeAc = 0;
-    let isAccepted = false;
-    let firstAcMs: number | undefined;
-    let bestPartial = 0;
-    let lastImprovement = 0;
-    let hasPending = false;
-    let lastVerdict: string | undefined;
-
-    for (const sub of list) {
-      attempts++;
-      const verdictKnown = !isPendingVerdict(sub.verdict) && (
-        sub.judged_ms === undefined ? true : sub.judged_ms <= t || settled
-      );
-      if (!verdictKnown) {
-        hasPending = true;
-        if (!isAccepted) lastVerdict = 'pending';
-        continue;
-      }
-
-      if (!isAccepted) lastVerdict = sub.verdict;
-      const rawPoints = sub.score !== undefined
-        ? (problem.max_points > 0 ? Math.min(problem.max_points, sub.score) : sub.score)
-        : isAcceptedVerdict(sub.verdict) ? problem.max_points : 0;
-
-      const subAccepted = isAcceptedVerdict(sub.verdict) || (
-        scoringMode === 'ioi' && problem.max_points > 0 && rawPoints >= problem.max_points && !isAlreadyAcceptedVerdict(sub.verdict)
-      );
-
-      if (isAlreadyAcceptedVerdict(sub.verdict)) continue;
-
-      if (scoringMode === 'ioi') {
-        if (rawPoints > bestPartial) {
-          bestPartial = rawPoints;
-          lastImprovement = sub.received_ms;
-        }
-        if (subAccepted && !isAccepted) {
-          isAccepted = true;
-          firstAcMs = sub.received_ms;
-          lastVerdict = sub.verdict;
-        } else if (!subAccepted && !isAccepted && !isNoPenaltyVerdict(sub.verdict)) {
-          wrongBeforeAc++;
-        }
-      } else {
-        if (subAccepted) {
-          if (!isAccepted) {
-            isAccepted = true;
-            firstAcMs = sub.received_ms;
-            lastVerdict = sub.verdict;
-          }
-        } else if (!isAccepted && !isNoPenaltyVerdict(sub.verdict)) {
-          wrongBeforeAc++;
-          if (rawPoints > bestPartial) bestPartial = rawPoints;
-        }
-      }
-    }
-
-    let probScore = 0;
-    if (scoringMode === 'icpc') {
-      probScore = isAccepted ? 1 : 0;
-      totalMaxScore += 1;
-      if (isAccepted && firstAcMs !== undefined) {
-        totalPenaltyMin += Math.floor(firstAcMs / 60_000) + 20 * wrongBeforeAc;
-        totalPenaltyMs += firstAcMs + wrongBeforeAc * 20 * 60_000;
-      }
-    } else if (scoringMode === 'cf') {
-      totalMaxScore += problem.max_points;
-      if (isAccepted && firstAcMs !== undefined) {
-        const pMax = problem.max_points;
-        const frac = timeLimitMs > 0 ? Math.min(1, Math.max(0, firstAcMs / timeLimitMs)) : 0;
-        const wrongPenalty = (pMax >= 500 ? 50 : 0.1 * pMax) * wrongBeforeAc;
-        probScore = roundScore(Math.max(0.3 * pMax, pMax * (1 - 0.5 * frac) - wrongPenalty));
-      }
-    } else if (scoringMode === 'ioi') {
-      totalMaxScore += problem.max_points;
-      probScore = roundScore(bestPartial);
-      if (bestPartial > 0) lastIoiImprovementMs = Math.max(lastIoiImprovementMs, lastImprovement);
-    } else {
-      // last_ac
-      totalMaxScore += problem.max_points;
-      probScore = roundScore(isAccepted ? problem.max_points : bestPartial);
-    }
-
-    totalScore += probScore;
-    if (isAccepted) {
-      solvedCount++;
-      if (firstAcMs !== undefined) lastAcMs = Math.max(lastAcMs, firstAcMs);
-    }
-
-    let probStatus: ProblemStatus;
-    if (isAccepted) probStatus = 'accepted';
-    else if (hasPending) probStatus = 'pending';
-    else if (scoringMode === 'ioi' && bestPartial > 0) probStatus = 'partial';
-    else if (attempts > 0) probStatus = 'wrong';
-    else probStatus = 'unattempted';
-
-    return {
-      id: problem.id,
-      status: probStatus,
-      attempts,
-      wrong_attempts: wrongBeforeAc,
-      score: probScore,
-      max_points: scoringMode === 'icpc' ? 1 : problem.max_points,
-      ...(firstAcMs !== undefined ? { first_ac_ms: firstAcMs } : {}),
-      ...(lastVerdict !== undefined ? { last_verdict: lastVerdict } : {}),
-    };
-  });
-
-  const penalty = scoringMode === 'icpc'
-    ? totalPenaltyMin
-    : scoringMode === 'ioi'
-    ? lastIoiImprovementMs
-    : scoringMode === 'last_ac'
-    ? lastAcMs
-    : 0;
-
-  const penaltyMs = scoringMode === 'icpc'
-    ? totalPenaltyMs
-    : scoringMode === 'ioi'
-    ? lastIoiImprovementMs
-    : lastAcMs;
-
-  return scoreProjectionSchema.parse({
-    at_elapsed_ms: t,
-    scoring_mode: scoringMode,
-    score: roundScore(totalScore),
-    max_score: roundScore(totalMaxScore),
-    penalty,
-    penalty_ms: penaltyMs,
-    solved_count: solvedCount,
-    last_ac_ms: lastAcMs,
-    submissions_used: submissionsUsed,
-    problems: projectedProblems,
   });
 }
 
@@ -1638,25 +1735,33 @@ export function projectScoreAt(
     replay.problems,
     replay.submissions,
     replay.time_limit_ms,
-    replay.duration_ms,
-    replay.status,
     atElapsedMs,
     mode,
   );
 }
 
+function compareEffectiveLastAc(a: Omit<GhostRaceStanding, 'rank'>, b: Omit<GhostRaceStanding, 'rank'>): number {
+  const aTime = a.solved_count > 0 ? a.last_ac_ms : Infinity;
+  const bTime = b.solved_count > 0 ? b.last_ac_ms : Infinity;
+  if (aTime === bTime) return 0;
+  return aTime - bTime;
+}
+
 function compareStandings(a: Omit<GhostRaceStanding, 'rank'>, b: Omit<GhostRaceStanding, 'rank'>, mode: ScoringMode): number {
+  if (a.unranked !== b.unranked) return a.unranked ? 1 : -1;
+  if (a.unranked && b.unranked) return 0;
+
   if (mode === 'icpc') {
-    return (b.score - a.score) || (a.penalty - b.penalty) || (a.penalty_ms - b.penalty_ms) || (a.last_ac_ms - b.last_ac_ms);
+    return (b.score - a.score) || (a.penalty - b.penalty) || (a.penalty_ms - b.penalty_ms) || compareEffectiveLastAc(a, b);
   }
   if (mode === 'cf') {
-    return (b.score - a.score) || (b.solved_count - a.solved_count) || (a.last_ac_ms - b.last_ac_ms);
+    return (b.score - a.score) || (b.solved_count - a.solved_count) || compareEffectiveLastAc(a, b);
   }
   if (mode === 'ioi') {
     return (b.score - a.score) || (b.solved_count - a.solved_count) || (a.penalty - b.penalty);
   }
   // last_ac
-  return (b.score - a.score) || (a.last_ac_ms - b.last_ac_ms) || (b.solved_count - a.solved_count);
+  return (b.score - a.score) || (b.solved_count - a.solved_count) || compareEffectiveLastAc(a, b);
 }
 
 export function evaluateGhostRaceAt(
@@ -1667,26 +1772,29 @@ export function evaluateGhostRaceAt(
   const mode = scoringModeSchema.parse(scoringMode);
   const t = Math.max(0, Math.floor(atElapsedMs));
 
-  const rows = race.participants.map(participant => {
+  const rows: Array<Omit<GhostRaceStanding, 'rank'>> = race.participants.map(participant => {
+    const isVoid = participant.status === 'void';
+    const isProvisional = participant.status === 'running' || participant.status === 'unknown';
     const projected = projectBoard(
       race.problems,
       participant.submissions,
-      race.time_limit_ms,
-      participant.duration_ms,
-      participant.status,
+      participant.time_limit_ms,
       t,
       mode,
     );
     return {
+      status: participant.status,
+      provisional: isProvisional,
+      unranked: isVoid,
       run_id: participant.run_id,
       agent_id: participant.agent_id,
       ...(participant.agent_name !== undefined ? { agent_name: participant.agent_name } : {}),
-      score: projected.score,
+      score: isVoid ? 0 : projected.score,
       max_score: projected.max_score,
-      solved_count: projected.solved_count,
-      penalty: projected.penalty,
-      penalty_ms: projected.penalty_ms,
-      last_ac_ms: projected.last_ac_ms,
+      solved_count: isVoid ? 0 : projected.solved_count,
+      penalty: isVoid ? 0 : projected.penalty,
+      penalty_ms: isVoid ? 0 : projected.penalty_ms,
+      last_ac_ms: isVoid ? 0 : projected.last_ac_ms,
       submissions_used: projected.submissions_used,
       finished: participant.status !== 'running' && t >= participant.duration_ms,
       problems: projected.problems,
@@ -1695,11 +1803,19 @@ export function evaluateGhostRaceAt(
 
   rows.sort((a, b) => compareStandings(a, b, mode) || a.run_id.localeCompare(b.run_id));
 
-  let currentRank = 1;
-  const standings: GhostRaceStanding[] = rows.map((row, idx) => {
-    if (idx > 0 && compareStandings(rows[idx - 1]!, row, mode) !== 0) {
-      currentRank = idx + 1;
+  let currentRank = 0;
+  let rankedIndex = 0;
+  let prevRanked: Omit<GhostRaceStanding, 'rank'> | undefined;
+
+  const standings: GhostRaceStanding[] = rows.map(row => {
+    if (row.unranked) {
+      return { rank: null, ...row };
     }
+    rankedIndex++;
+    if (!prevRanked || compareStandings(prevRanked, row, mode) !== 0) {
+      currentRank = rankedIndex;
+    }
+    prevRanked = row;
     return { rank: currentRank, ...row };
   });
 
@@ -1724,16 +1840,34 @@ export async function buildGhostRace(
     validatedIds.map(id => buildRunReplay(root, id, { includeSession: false, includeSources: false })),
   );
 
-  const contestId = replays[0]!.contest_id;
+  const baseline = replays[0]!;
+  const contestId = baseline.contest_id;
   const contestTitle = replays.find(r => r.contest_title)?.contest_title;
-  for (const replay of replays) {
-    if (replay.contest_id !== contestId) {
-      throw new Error(`Contest mismatch in ghost race: expected ${contestId}, got ${replay.contest_id}`);
+
+  for (const replay of replays.slice(1)) {
+    if (replay.contest_id !== baseline.contest_id) {
+      throw new Error(`Contest mismatch in ghost race: expected ${baseline.contest_id}, got ${replay.contest_id}`);
+    }
+    if (replay.data_version !== baseline.data_version) {
+      throw new Error(`Data version mismatch in ghost race: expected ${baseline.data_version}, got ${replay.data_version}`);
+    }
+    if (replay.contest_revision !== baseline.contest_revision) {
+      throw new Error('Contest revision mismatch in ghost race');
+    }
+    if (
+      replay.protocol_id !== baseline.protocol_id ||
+      replay.protocol_version !== baseline.protocol_version ||
+      replay.protocol_sha256 !== baseline.protocol_sha256
+    ) {
+      throw new Error('Protocol mismatch in ghost race');
+    }
+    if (replay.time_limit_ms !== baseline.time_limit_ms) {
+      throw new Error(`Time limit mismatch in ghost race: expected ${baseline.time_limit_ms}, got ${replay.time_limit_ms}`);
     }
   }
 
-  const scoringMode: ScoringMode = opts.scoringMode ? scoringModeSchema.parse(opts.scoringMode) : replays[0]!.scoring_mode;
-  const maxTimeLimitMs = Math.max(...replays.map(r => r.time_limit_ms));
+  const scoringMode: ScoringMode = opts.scoringMode ? scoringModeSchema.parse(opts.scoringMode) : baseline.scoring_mode;
+  const timeLimitMs = baseline.time_limit_ms;
 
   const problemOrder: string[] = [];
   const problemPoints = new Map<string, number>();
@@ -1742,21 +1876,26 @@ export async function buildGhostRace(
       if (!problemPoints.has(p.id)) {
         problemOrder.push(p.id);
         problemPoints.set(p.id, p.max_points);
-      } else {
-        problemPoints.set(p.id, Math.max(problemPoints.get(p.id)!, p.max_points));
+      } else if (problemPoints.get(p.id) !== p.max_points) {
+        throw new Error(`Problem weight mismatch for ${p.id} in ghost race`);
       }
     }
   }
   const problems: ProblemMeta[] = problemOrder.map(id => ({ id, max_points: problemPoints.get(id)! }));
 
+  const timelineEndMs = Math.max(
+    timeLimitMs,
+    ...replays.map(r => r.duration_ms),
+    ...replays.flatMap(r => r.submissions.map(s => s.judged_ms ?? s.received_ms)),
+  );
+
   const participants: GhostRaceParticipant[] = replays.map(replay => {
+    const isVoid = replay.status === 'void';
     const finalProjection = projectBoard(
       problems,
       replay.submissions,
-      maxTimeLimitMs,
-      replay.duration_ms,
-      replay.status,
-      Math.max(maxTimeLimitMs, replay.duration_ms),
+      replay.time_limit_ms,
+      timelineEndMs,
       scoringMode,
     );
     return {
@@ -1766,9 +1905,9 @@ export async function buildGhostRace(
       status: replay.status,
       time_limit_ms: replay.time_limit_ms,
       duration_ms: replay.duration_ms,
-      final_score: finalProjection.score,
-      final_solved_count: finalProjection.solved_count,
-      final_penalty: finalProjection.penalty,
+      final_score: isVoid ? 0 : finalProjection.score,
+      final_solved_count: isVoid ? 0 : finalProjection.solved_count,
+      final_penalty: isVoid ? 0 : finalProjection.penalty,
       submissions: replay.submissions,
     };
   });
@@ -1801,26 +1940,36 @@ export async function buildGhostRace(
   }
   milestones.sort((a, b) => (a.elapsed_ms - b.elapsed_ms) || a.run_id.localeCompare(b.run_id) || (a.seq - b.seq));
 
-  const baseData: GhostRaceData = ghostRaceSchema.parse({
+  const baseData: GhostRaceData = {
     contest_id: contestId,
     ...(contestTitle !== undefined ? { contest_title: contestTitle } : {}),
-    time_limit_ms: maxTimeLimitMs,
+    data_version: baseline.data_version,
+    ...(baseline.contest_revision !== undefined ? { contest_revision: baseline.contest_revision } : {}),
+    ...(baseline.protocol_id !== undefined ? { protocol_id: baseline.protocol_id } : {}),
+    ...(baseline.protocol_version !== undefined ? { protocol_version: baseline.protocol_version } : {}),
+    ...(baseline.protocol_sha256 !== undefined ? { protocol_sha256: baseline.protocol_sha256 } : {}),
+    time_limit_ms: timeLimitMs,
+    timeline_end_ms: timelineEndMs,
     scoring_mode: scoringMode,
     problems,
     participants,
     milestones,
-  });
+  };
 
   if (opts.sampleStepMs !== undefined) {
     const step = Math.floor(opts.sampleStepMs);
     if (!Number.isFinite(step) || step <= 0) throw new Error('sampleStepMs must be a positive integer');
     const samples: GhostRaceSnapshot[] = [];
     const maxSamples = 500;
-    const effectiveStep = Math.max(step, Math.ceil(maxTimeLimitMs / maxSamples));
-    for (let t = 0; t < maxTimeLimitMs; t += effectiveStep) {
+    const effectiveStep = Math.max(step, Math.ceil(timelineEndMs / maxSamples));
+    for (let t = 0; t < timelineEndMs; t += effectiveStep) {
       samples.push(evaluateGhostRaceAt(baseData, t, scoringMode));
     }
-    samples.push(evaluateGhostRaceAt(baseData, maxTimeLimitMs, scoringMode));
+    if (timelineEndMs > timeLimitMs && !samples.some(s => s.at_elapsed_ms === timeLimitMs)) {
+      samples.push(evaluateGhostRaceAt(baseData, timeLimitMs, scoringMode));
+      samples.sort((a, b) => a.at_elapsed_ms - b.at_elapsed_ms);
+    }
+    samples.push(evaluateGhostRaceAt(baseData, timelineEndMs, scoringMode));
     baseData.samples = samples;
   }
 

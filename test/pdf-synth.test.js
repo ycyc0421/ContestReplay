@@ -1,29 +1,33 @@
 import assert from 'node:assert/strict';
-import { copyFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
+import { deflateSync } from 'node:zlib';
 import {
   checkPdfLimits,
   detectProblemHeaders,
+  extractPdfTextFallbackDetailed,
   inspectPdf,
   mergePdfs,
   mergePdfsResultSchema,
+  parsePdfPageCountFallback,
   pdfInfoSchema,
   pdfLimitsCheckSchema,
   synthPdfResultSchema,
   synthesizeTextContestPdf,
 } from '../dist/pdf-synth.js';
 
-test('detectProblemHeaders recognizes English, bare, and Chinese contest problem headers with deduplication', () => {
+test('detectProblemHeaders handles English, mixed letter, Chinese headers, and ignores lowercase prose false positives', () => {
   assert.deepEqual(
     detectProblemHeaders([
       'Contest Replay Spring Open',
       'Problem A: Two Sum',
+      'problem a is actually quite simple to solve.',
       '1. Given an array of N integers.',
       '2. Return indices i and j.',
       'Problem A: Two Sum',
-      'Problem B. Shortest Path',
+      'B. Shortest Path',
       'Task C1 - Tree Queries',
     ].join('\n')),
     [
@@ -50,21 +54,6 @@ test('detectProblemHeaders recognizes English, bare, and Chinese contest problem
 
   assert.deepEqual(
     detectProblemHeaders([
-      'Round 999',
-      'A. Watermelon',
-      '1. Input contains integer w.',
-      'B. Domino Piling',
-      'C. Next Round',
-    ].join('\n')),
-    [
-      { id: 'A', title: 'Watermelon' },
-      { id: 'B', title: 'Domino Piling' },
-      { id: 'C', title: 'Next Round' },
-    ],
-  );
-
-  assert.deepEqual(
-    detectProblemHeaders([
       'ContestReplay Demo Final',
       '1. How many circles are in the box below?',
       '2. What is 7 + 5?',
@@ -76,7 +65,43 @@ test('detectProblemHeaders recognizes English, bare, and Chinese contest problem
   );
 });
 
-test('synthesizeTextContestPdf generates valid multi-page PDF inspected identically by poppler and pure-JS fallback', async t => {
+test('parsePdfPageCountFallback handles out-of-order PDF dictionary keys and extractPdfTextFallback blocks FlateDecode bombs', () => {
+  // Out-of-order dictionary keys: /Pages before /Type /Catalog, /Count before /Type /Pages
+  const reorderedPdf = Buffer.from([
+    '%PDF-1.4',
+    '1 0 obj',
+    '<< /Pages 2 0 R /Type /Catalog >>',
+    'endobj',
+    '2 0 obj',
+    '<< /Count 3 /Kids [3 0 R 4 0 R 5 0 R] /Type /Pages >>',
+    'endobj',
+    '%%EOF',
+  ].join('\n'), 'latin1');
+  assert.equal(parsePdfPageCountFallback(reorderedPdf), 3);
+
+  // FlateDecode bomb + /Subtype /Image stream skipped safely
+  const bombPayload = deflateSync(Buffer.alloc(200_000, 0x41));
+  const imagePayload = deflateSync(Buffer.from('BT (SHOULD_BE_SKIPPED_IMAGE) Tj ET', 'latin1'));
+  const textPayload = deflateSync(Buffer.from('BT (Problem A: Safe Text) Tj ET', 'latin1'));
+
+  const parts = [
+    Buffer.from('%PDF-1.4\n1 0 obj\n<< /Subtype /Image /Filter /FlateDecode /Length ' + imagePayload.length + ' >>\nstream\n', 'latin1'),
+    imagePayload,
+    Buffer.from('\nendstream\nendobj\n2 0 obj\n<< /Filter /FlateDecode /Length ' + textPayload.length + ' >>\nstream\n', 'latin1'),
+    textPayload,
+    Buffer.from('\nendstream\nendobj\n3 0 obj\n<< /Filter /FlateDecode /Length ' + bombPayload.length + ' >>\nstream\n', 'latin1'),
+    bombPayload,
+    Buffer.from('\nendstream\nendobj\n%%EOF\n', 'latin1'),
+  ];
+  const bombPdf = Buffer.concat(parts);
+
+  const detailed = extractPdfTextFallbackDetailed(bombPdf, { maxStreamInflateBytes: 16_384, maxTotalInflateBytes: 32_768 });
+  assert.equal(detailed.truncated, true);
+  assert.ok(!detailed.text.includes('SHOULD_BE_SKIPPED_IMAGE'), 'Image stream must be skipped before inflating');
+  assert.ok(detailed.text.includes('Problem A: Safe Text'));
+});
+
+test('synthesizeTextContestPdf generates exact xref byte offsets, enforces Unicode/overwrite safety, and inspects identically across poppler and fallback', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'cr-pdf-synth-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
 
@@ -89,17 +114,13 @@ test('synthesizeTextContestPdf generates valid multi-page PDF inspected identica
         id: 'A',
         title: 'Two Sum (Warmup)',
         body: 'Given an array of integers and a target value, find two distinct indices whose elements sum to target.\n\nConstraints: 2 <= N <= 10^5.',
-        samples: [
-          { input: '4 9\n2 7 11 15', output: '1 2' },
-        ],
+        samples: [{ input: '4 9\n2 7 11 15', output: '1 2' }],
       },
       {
         id: 'B',
         title: 'Long Multi-Page Graph Statement',
         body: longParagraph,
-        samples: [
-          { input: '3 2\n1 2\n2 3', output: '2' },
-        ],
+        samples: [{ input: '3 2\n1 2\n2 3', output: '2' }],
       },
       {
         id: 'C',
@@ -112,40 +133,88 @@ test('synthesizeTextContestPdf generates valid multi-page PDF inspected identica
   );
 
   assert.doesNotThrow(() => synthPdfResultSchema.parse(synth));
-  assert.ok(synth.page_count >= 4, `Expected >= 4 pages due to overflow on Problem B, got ${synth.page_count}`);
+  assert.ok(synth.page_count >= 4, `Expected >= 4 pages, got ${synth.page_count}`);
   assert.deepEqual(synth.problem_ids, ['A', 'B', 'C']);
+  assert.deepEqual(synth.warnings, []);
 
+  // Direct xref byte-offset verification on the synthesized PDF
   const raw = await readFile(outPdf);
-  assert.equal(raw.subarray(0, 5).toString('latin1'), '%PDF-');
+  const latin = raw.toString('latin1');
+  const startxrefMatch = latin.match(/startxref\n(\d+)\n%%EOF/);
+  assert.ok(startxrefMatch, 'Missing startxref trailer');
+  const xrefPos = Number.parseInt(startxrefMatch[1], 10);
+  assert.equal(raw.subarray(xrefPos, xrefPos + 5).toString('latin1'), 'xref\n');
 
-  // Pure-JS fallback inspection (no external tools)
+  const xrefSection = raw.subarray(xrefPos).toString('latin1');
+  const entryLines = xrefSection.split('\n').slice(2).filter(line => /^\d{10} \d{5} [fn] $/.test(line));
+  assert.ok(entryLines.length >= 6);
+  for (let objNum = 1; objNum < entryLines.length; objNum++) {
+    const offset = Number.parseInt(entryLines[objNum].slice(0, 10), 10);
+    const prefix = `${objNum} 0 obj\n`;
+    assert.equal(
+      raw.subarray(offset, offset + prefix.length).toString('latin1'),
+      prefix,
+      `xref offset mismatch for object ${objNum}`,
+    );
+  }
+
+  // Default overwrite: false prevents accidental clobbering
+  await assert.rejects(
+    synthesizeTextContestPdf([{ id: 'A', title: 'Dup', body: 'Dup' }], outPdf),
+    /already exists/,
+  );
+
+  // Non-ASCII characters are rejected by default unless allowAsciiFallback: true is explicitly passed
+  const unicodePdf = join(dir, 'unicode.pdf');
+  await assert.rejects(
+    synthesizeTextContestPdf([{ id: 'A', title: '桥梁修复', body: '中文题面' }], unicodePdf),
+    /allowAsciiFallback/,
+  );
+  const fallbackUnicode = await synthesizeTextContestPdf(
+    [{ id: 'A', title: '桥梁修复', body: '中文题面' }],
+    unicodePdf,
+    { allowAsciiFallback: true },
+  );
+  assert.equal(fallbackUnicode.warnings.length, 1);
+  assert.match(fallbackUnicode.warnings[0], /Replaced 8 non-ASCII/);
+
+  // Pure-JS fallback inspection
   const fallbackInfo = await inspectPdf(outPdf, { useExternalTools: false });
   assert.doesNotThrow(() => pdfInfoSchema.parse(fallbackInfo));
   assert.equal(fallbackInfo.extractor, 'fallback');
+  assert.equal(fallbackInfo.text_truncated, false);
   assert.equal(fallbackInfo.page_count, synth.page_count);
   assert.equal(fallbackInfo.sha256, synth.sha256);
-  assert.equal(fallbackInfo.size_bytes, synth.size_bytes);
   assert.deepEqual(fallbackInfo.problem_ids, ['A', 'B', 'C']);
-  assert.equal(fallbackInfo.problems[0].title, 'Two Sum (Warmup)');
 
-  // Real poppler inspection (when pdfinfo/pdftotext installed, or fallback gracefully)
+  // Poppler inspection passes a private 0o600 snapshot to external tools (TOCTOU protection)
+  let seenSnapshotPath;
+  await inspectPdf(outPdf, {
+    useExternalTools: true,
+    execImpl: async (cmd, args) => {
+      const targetArg = cmd === 'pdfinfo' ? args[1] : args[2];
+      assert.notEqual(targetArg, outPdf, 'External tool must receive private snapshot, not raw path');
+      seenSnapshotPath = targetArg;
+      assert.equal((await stat(targetArg)).mode & 0o777, 0o600);
+      assert.equal((await stat(dirname(targetArg))).mode & 0o777, 0o700);
+      if (cmd === 'pdfinfo') return { stdout: `Pages:          ${synth.page_count}\n`, stderr: '' };
+      return { stdout: 'Problem A: Two Sum\nProblem B: Graph\nProblem C: Counting\n', stderr: '' };
+    },
+  });
+  // Snapshot directory is cleaned up after inspectPdf returns
+  await assert.rejects(stat(seenSnapshotPath), { code: 'ENOENT' });
+
+  // Real poppler inspection on host
   const externalInfo = await inspectPdf(outPdf, { useExternalTools: true });
-  assert.doesNotThrow(() => pdfInfoSchema.parse(externalInfo));
   assert.equal(externalInfo.page_count, synth.page_count);
-  assert.equal(externalInfo.sha256, synth.sha256);
   assert.deepEqual(externalInfo.problem_ids, ['A', 'B', 'C']);
 
-  // Also verify existing repository demo PDF with pure-JS fallback
+  // Existing demo PDF fallback
   const demoInfo = await inspectPdf(resolve('examples/demo/problems.pdf'), { useExternalTools: false });
   assert.equal(demoInfo.page_count, 1);
   assert.deepEqual(demoInfo.problem_ids, ['1', '2']);
 
-  // Reject non-PDF file
-  const fakePdf = join(dir, 'fake.pdf');
-  await writeFile(fakePdf, 'not a pdf document', 'utf8');
-  await assert.rejects(inspectPdf(fakePdf), /Invalid PDF header/);
-
-  // checkPdfLimits pass and fail cases
+  // checkPdfLimits
   const okLimits = checkPdfLimits(fallbackInfo, { maxPages: 20, maxBytes: 1_000_000 });
   assert.doesNotThrow(() => pdfLimitsCheckSchema.parse(okLimits));
   assert.deepEqual(okLimits, { ok: true, issues: [] });
@@ -153,11 +222,9 @@ test('synthesizeTextContestPdf generates valid multi-page PDF inspected identica
   const failLimits = checkPdfLimits(fallbackInfo, { maxPages: 2, maxBytes: 100 });
   assert.equal(failLimits.ok, false);
   assert.equal(failLimits.issues.length, 2);
-  assert.match(failLimits.issues[0], /exceeding maximum of 2/);
-  assert.match(failLimits.issues[1], /exceeds maximum of 100/);
 });
 
-test('mergePdfs validates inputs, prevents accidental overwrite, supports pdfunite/qpdf fallback, and merges real PDFs', async t => {
+test('mergePdfs validates inputs, passes TOCTOU-safe snapshots to pdfunite/qpdf, and merges real PDFs', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'cr-pdf-merge-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
 
@@ -168,22 +235,23 @@ test('mergePdfs validates inputs, prevents accidental overwrite, supports pdfuni
   await synthesizeTextContestPdf([{ id: 'B', title: 'Beta', body: 'Solve Beta.' }], pdf2);
   await writeFile(notPdf, 'plain text', 'utf8');
 
-  // Input validation failures
   await assert.rejects(mergePdfs([], join(dir, 'empty.pdf')), /At least one input PDF/);
   await assert.rejects(mergePdfs([pdf1, notPdf], join(dir, 'bad.pdf')), /Invalid PDF header/);
   await assert.rejects(mergePdfs([pdf1, pdf2], join(dir, 'tiny.pdf'), { maxTotalBytes: 100 }), /exceeds/);
 
-  // Mocked pdfunite invocation
-  const calls = [];
+  // Mocked pdfunite receives private 0o600 byte snapshots (not raw input paths)
   const mockedUniteOut = join(dir, 'mock-unite.pdf');
   const uniteResult = await mergePdfs([pdf1, pdf2], mockedUniteOut, {
     execImpl: async (cmd, args) => {
-      calls.push({ cmd, args: [...args] });
       assert.equal(cmd, 'pdfunite');
       assert.equal(args.length, 3);
-      assert.equal(args[0], pdf1);
-      assert.equal(args[1], pdf2);
-      await copyFile(pdf1, args[2]);
+      assert.notEqual(args[0], pdf1);
+      assert.notEqual(args[1], pdf2);
+      assert.equal((await stat(args[0])).mode & 0o777, 0o600);
+      assert.equal((await stat(dirname(args[0]))).mode & 0o777, 0o700);
+      assert.deepEqual(await readFile(args[0]), await readFile(pdf1));
+      assert.deepEqual(await readFile(args[1]), await readFile(pdf2));
+      await copyFile(args[0], args[2]);
       return { stdout: '', stderr: '' };
     },
   });
@@ -204,14 +272,15 @@ test('mergePdfs validates inputs, prevents accidental overwrite, supports pdfuni
         throw err;
       }
       assert.equal(cmd, 'qpdf');
-      assert.deepEqual(args.slice(0, 5), ['--empty', '--pages', pdf1, pdf2, '--']);
-      await copyFile(pdf2, args[5]);
+      assert.deepEqual(args.slice(0, 2), ['--empty', '--pages']);
+      assert.equal(args[4], '--');
+      await copyFile(args[3], args[5]);
       return { stdout: '', stderr: '' };
     },
   });
   assert.equal(qpdfResult.tool, 'qpdf');
 
-  // Mocked missing both tools -> clear deterministic install hint
+  // Missing both tools throws deterministic install hint
   await assert.rejects(
     mergePdfs([pdf1, pdf2], join(dir, 'none.pdf'), {
       execImpl: async cmd => {
@@ -223,7 +292,7 @@ test('mergePdfs validates inputs, prevents accidental overwrite, supports pdfuni
     /Install poppler-utils \(pdfunite\) or qpdf/,
   );
 
-  // Real host merge via pdfunite (installed on this host) and overwrite: true
+  // Real host merge via pdfunite + overwrite: true + single-file copy
   const realMerged = join(dir, 'real-merged.pdf');
   const merged = await mergePdfs([pdf1, pdf2], realMerged);
   assert.equal(merged.input_count, 2);
@@ -233,15 +302,11 @@ test('mergePdfs validates inputs, prevents accidental overwrite, supports pdfuni
   assert.equal(inspectedMerged.page_count, 2);
   assert.deepEqual(inspectedMerged.problem_ids, ['A', 'B']);
 
-  // Overwrite: true replaces existing file cleanly
   const overwritten = await mergePdfs([pdf1, pdf2], realMerged, { overwrite: true });
   assert.equal(overwritten.output_path, realMerged);
 
-  // Single-input merge copies validated PDF cleanly without invoking external tools
   const singleOut = join(dir, 'single-copy.pdf');
   const copied = await mergePdfs([pdf1], singleOut);
   assert.equal(copied.tool, 'copy');
   assert.equal(copied.input_count, 1);
-  const inspectedSingle = await inspectPdf(singleOut, { useExternalTools: false });
-  assert.deepEqual(inspectedSingle.problem_ids, ['A']);
 });

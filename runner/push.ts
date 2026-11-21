@@ -9,11 +9,47 @@ import { credentialJson } from './credential-redaction.js';
 
 export const pushTargetId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
 
+const BLOCKED_METADATA_HOSTS = new Set([
+  'metadata.google.internal',
+  'metadata.goog',
+  'metadata.azure.internal',
+  'instance-data',
+]);
+
+function isLoopbackHost(hostname: string): boolean {
+  const lower = hostname.toLowerCase();
+  return lower === '127.0.0.1' || lower === 'localhost' || lower === '[::1]';
+}
+
+function isBlockedHost(hostname: string): boolean {
+  const lower = hostname.toLowerCase().replace(/\.+$/, '');
+  if (BLOCKED_METADATA_HOSTS.has(lower)) return true;
+
+  const bare = lower.startsWith('[') && lower.endsWith(']') ? lower.slice(1, -1) : lower;
+
+  // Unspecified IPv4 / IPv6 addresses
+  if (bare === '0.0.0.0' || bare === '::' || bare === '::0' || /^0(?::0){1,7}$/.test(bare)) return true;
+
+  // IPv4 link-local / cloud IMDS (169.254.0.0/16) and 0.0.0.0/8
+  if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(bare)) return true;
+  if (/^0\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(bare)) return true;
+
+  // IPv6 link-local (fe80::/10 -> fe80..febf)
+  if (/^fe[89ab][0-9a-f]:/.test(bare)) return true;
+
+  // IPv4-mapped IPv6 forms (both dotted-quad and URL-normalized hex, e.g. ::ffff:a9fe:a9fe or ::ffff:0:0)
+  if (/^::ffff:(?:169\.254\.\d{1,3}\.\d{1,3}|a9fe:[0-9a-f]{1,4}|0\.0\.0\.0|0:0)$/i.test(bare)) return true;
+
+  return false;
+}
+
 export const pushUrlSchema = z.url({ protocol: /^https?$/ }).max(4096).refine(value => {
   const u = new URL(value);
-  return !u.username && !u.password && !u.hash &&
-    (u.protocol === 'https:' || ['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname));
-}, 'Use HTTPS or loopback HTTP without credentials or a fragment').transform(value => new URL(value).href);
+  if (u.username || u.password || u.search || u.hash) return false;
+  if (isBlockedHost(u.hostname)) return false;
+  return u.protocol === 'https:' || isLoopbackHost(u.hostname);
+}, 'Use HTTPS or loopback HTTP without credentials, query parameters, fragments, or link-local/metadata hosts')
+  .transform(value => new URL(value).href);
 
 export const pushEventTypeSchema = z.enum(['run.completed', 'run.progress', 'batch.completed']);
 export type PushEventType = z.infer<typeof pushEventTypeSchema>;
@@ -25,7 +61,7 @@ export const pushAuthModeSchema = z.enum(['none', 'bearer', 'hmac-sha256']);
 export type PushAuthMode = z.infer<typeof pushAuthModeSchema>;
 
 const pushBackendSchema = z.enum(['secret-service', 'file']);
-const pushSecretSchema = z.string().trim().min(1).max(8192).regex(/^[\x21-\x7e]+$/);
+const pushSecretSchema = z.string().trim().min(8).max(8192).regex(/^[\x21-\x7e]+$/);
 
 const pushEventsSchema = z.array(pushEventTypeSchema).min(1).max(3).refine(
   events => new Set(events).size === events.length,
@@ -128,6 +164,136 @@ export const pushDeliverySchema = z.strictObject({
 });
 export type PushDelivery = z.infer<typeof pushDeliverySchema>;
 
+// Outbound webhook public payload whitelists.
+// All schemas use Zod strip mode so undeclared private fields (source, answer,
+// stdout, stderr, local_inputs, session transcripts, host paths) are removed.
+const nonNegInt = z.number().int().nonnegative();
+const nonNegNum = z.number().nonnegative();
+const safeReason = z.string().max(128).transform(value =>
+  value
+    .replace(/\bBearer\s+[\x21-\x7e]+/gi, 'Bearer [REDACTED]')
+    .replace(/(?:^|[\s([{'",=:]|file:\/\/)((?:\/(?:home|Users|tmp|var|etc|root|opt|srv|private|mnt|media|run))(?:\/[^\s)\]}'"`,;]+)+)/g,
+      (full, p: string) => full.replace(p, '[path]'))
+    .replace(/(?:^|[\s([{'",=:]|file:\/\/\/?)([A-Za-z]:\\[^\s)\]}'"`,;]+)/g,
+      (full, p: string) => full.replace(p, '[path]'))
+    .trim(),
+);
+
+const publicSubmissionSchema = z.object({
+  id: z.string().max(128).optional(),
+  submission_id: z.string().max(128).optional(),
+  problem_id: z.string().min(1).max(128),
+  elapsed_ms: nonNegInt,
+  verdict: z.string().min(1).max(64),
+  language: z.string().max(64).optional(),
+  score: nonNegNum.optional(),
+});
+
+const publicProblemProgressSchema = z.object({
+  id: z.string().min(1).max(128),
+  max_points: nonNegNum,
+  attempts: nonNegInt,
+  status: z.enum(['unattempted', 'pending', 'accepted', 'partial', 'wrong']),
+  best_score: nonNegNum,
+  first_ac_ms: nonNegInt.optional(),
+  last_verdict: z.string().max(64).optional(),
+  last_elapsed_ms: nonNegInt.optional(),
+});
+
+const publicTelemetrySchema = z.object({
+  model_turns: nonNegInt,
+  total_model_wait_ms: nonNegInt,
+  total_input_tokens: nonNegInt,
+  total_output_tokens: nonNegInt,
+});
+
+export const pingPayloadSchema = z.object({
+  type: z.literal('ping'),
+  timestamp: z.iso.datetime(),
+});
+
+export const runCompletedPayloadSchema = z.object({
+  run_id: z.uuid(),
+  contest_id: z.string().min(1).max(128).optional(),
+  contest_title: z.string().max(256).optional(),
+  data_version: nonNegInt.optional(),
+  agent_id: z.string().min(1).max(128).optional(),
+  agent_name: z.string().max(256).optional(),
+  agent_revision: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  status: z.enum(['completed', 'void', 'cancelled', 'interrupted']).optional(),
+  reason: safeReason.optional(),
+  score: nonNegNum.nullable().optional(),
+  max_score: nonNegNum.optional(),
+  solved_count: nonNegInt.optional(),
+  problem_count: nonNegInt.optional(),
+  elapsed_ms: nonNegInt.optional(),
+  duration_ms: nonNegInt.optional(),
+  submissions_used: nonNegInt.optional(),
+  submissions: z.array(publicSubmissionSchema).max(1000).optional(),
+  timestamp: z.iso.datetime().optional(),
+});
+
+export const runProgressPayloadSchema = z.object({
+  run_id: z.uuid(),
+  status: z.enum(['running', 'completed', 'void', 'unknown']),
+  reason: safeReason.optional(),
+  agent_id: z.string().min(1).max(128).optional(),
+  agent_name: z.string().max(256).optional(),
+  contest_id: z.string().min(1).max(128).optional(),
+  contest_title: z.string().max(256).optional(),
+  data_version: nonNegInt.optional(),
+  scoring_mode: z.enum(['icpc', 'cf', 'ioi', 'last_ac']).optional(),
+  started_at: z.string().max(64).optional(),
+  elapsed_ms: nonNegInt.optional(),
+  time_limit_ms: nonNegInt.optional(),
+  remaining_ms: nonNegInt.optional(),
+  submissions_used: nonNegInt.optional(),
+  max_submissions: nonNegInt.optional(),
+  model_turns: nonNegInt.optional(),
+  last_activity_ms: nonNegInt.optional(),
+  last_activity_type: z.string().max(64).optional(),
+  score: nonNegNum.optional(),
+  max_score: nonNegNum.optional(),
+  solved_count: nonNegInt.optional(),
+  problem_count: nonNegInt.optional(),
+  problems: z.array(publicProblemProgressSchema).max(200).optional(),
+  telemetry: publicTelemetrySchema.optional(),
+  timestamp: z.iso.datetime().optional(),
+});
+
+const publicBatchJobSchema = z.object({
+  run_id: z.uuid().optional(),
+  agent_id: z.string().min(1).max(128),
+  agent_name: z.string().max(256).optional(),
+  contest_id: z.string().min(1).max(128),
+  data_version: nonNegInt.optional(),
+  status: z.enum(['queued', 'running', 'completed', 'void', 'cancelled', 'interrupted']),
+  reason: safeReason.optional(),
+  score: nonNegNum.nullable().optional(),
+  max_score: nonNegNum.optional(),
+});
+
+export const batchCompletedPayloadSchema = z.object({
+  batch_id: z.string().min(1).max(128),
+  status: z.enum(['completed', 'stopped', 'partial', 'failed']).optional(),
+  total: nonNegInt.optional(),
+  completed: nonNegInt.optional(),
+  void: nonNegInt.optional(),
+  cancelled: nonNegInt.optional(),
+  interrupted: nonNegInt.optional(),
+  failed: nonNegInt.optional(),
+  duration_ms: nonNegInt.optional(),
+  jobs: z.array(publicBatchJobSchema).max(1000).optional(),
+  timestamp: z.iso.datetime().optional(),
+});
+
+export function sanitizePushPayload(eventType: PushDeliveryEvent, payload: unknown): Record<string, unknown> {
+  if (eventType === 'ping') return pingPayloadSchema.parse(payload);
+  if (eventType === 'run.completed') return runCompletedPayloadSchema.parse(payload);
+  if (eventType === 'run.progress') return runProgressPayloadSchema.parse(payload);
+  return batchCompletedPayloadSchema.parse(payload);
+}
+
 export class PushTargetError extends Error {
   constructor(message: string, readonly status = 400) {
     super(message);
@@ -139,7 +305,7 @@ type StoredPushTarget = z.infer<typeof storedTargetSchema>;
 const missing = (error: unknown) => (error as NodeJS.ErrnoException)?.code === 'ENOENT';
 
 function checkPublicMetadata(secretValue: string, meta: { id: string; label: string; url: string }) {
-  if ([meta.id, meta.label, meta.url].some(field => field === secretValue || (secretValue.length >= 8 && field.includes(secretValue)))) {
+  if ([meta.id, meta.label, meta.url].some(field => field === secretValue || field.includes(secretValue))) {
     throw new PushTargetError('A push credential cannot be part of public target metadata', 400);
   }
 }
@@ -276,7 +442,8 @@ export class PushTargets {
       return value;
     } catch (error) {
       if (missing(error)) throw new PushTargetError('Push target not found', 404);
-      throw error;
+      if (error instanceof PushTargetError) throw error;
+      throw new PushTargetError('Invalid push target record', 500);
     }
   }
 
@@ -310,13 +477,13 @@ export class PushTargets {
     return 'file';
   }
 
-  private async forgetSecret(stored: StoredPushTarget) {
-    if (!stored.credential_ref || !stored.backend) return;
-    if (stored.backend === 'file') {
+  private async forgetSecretRef(ref: string | undefined, backend: z.infer<typeof pushBackendSchema> | undefined) {
+    if (!ref || !backend) return;
+    if (backend === 'file') {
       await assertPrivateDir(this.secrets).catch(error => { if (!missing(error)) throw error; });
-      await rm(join(this.secrets, stored.credential_ref), { force: true });
+      await rm(join(this.secrets, ref), { force: true });
     } else {
-      await secretChannel('clear', stored.credential_ref);
+      await secretChannel('clear', ref);
     }
   }
 
@@ -403,7 +570,7 @@ export class PushTargets {
       try {
         await atomicWrite(this.path(id), JSON.stringify(storedRecord), true);
       } catch (error) {
-        await this.forgetSecret(storedRecord).catch(() => {});
+        await this.forgetSecretRef(storedRecord.credential_ref, storedRecord.backend).catch(() => {});
         throw error;
       }
       return toPublicTarget(storedRecord, storedRecord.auth_mode === 'none' ? undefined : true);
@@ -441,16 +608,26 @@ export class PushTargets {
       }
       checkPublicMetadata(parsed.secret, old);
 
-      const ref = old.credential_ref ?? randomUUID();
-      const backend = await this.putSecret(ref, parsed.secret, old.backend);
+      // Write the new secret under a fresh credential_ref BEFORE swapping metadata atomically.
+      // This guarantees an in-flight delivery can never read an HMAC key under old Bearer metadata.
+      const nextRef = randomUUID();
+      const nextBackend = await this.putSecret(nextRef, parsed.secret, old.backend);
       const updated: StoredPushTarget = storedTargetSchema.parse({
         ...old,
         auth_mode: nextAuthMode,
-        credential_ref: ref,
-        backend,
+        credential_ref: nextRef,
+        backend: nextBackend,
         updated_at: new Date().toISOString(),
       });
-      await atomicWrite(this.path(id), JSON.stringify(updated));
+      try {
+        await atomicWrite(this.path(id), JSON.stringify(updated));
+      } catch (error) {
+        await this.forgetSecretRef(nextRef, nextBackend).catch(() => {});
+        throw error;
+      }
+      if (old.credential_ref && old.credential_ref !== nextRef) {
+        await this.forgetSecretRef(old.credential_ref, old.backend).catch(() => {});
+      }
       return toPublicTarget(updated, true);
     });
   }
@@ -458,23 +635,26 @@ export class PushTargets {
   remove(id: string): Promise<void> {
     return this.locked(async () => {
       const old = await this.readStored(id);
-      await this.forgetSecret(old);
+      await this.forgetSecretRef(old.credential_ref, old.backend);
       await rm(this.path(id));
     });
   }
 
-  async resolveForDelivery(id: string): Promise<{ target: PushTarget; secret?: string }> {
-    const stored = await this.readStored(id);
-    if (stored.auth_mode === 'none') {
-      return { target: toPublicTarget(stored) };
-    }
-    let secretValue: string | undefined;
-    try {
-      secretValue = await this.readSecret(stored);
-    } catch {
-      throw new PushTargetError('Push target credential unavailable; rotate it before delivering', 500);
-    }
-    return { target: toPublicTarget(stored, true), secret: secretValue };
+  resolveForDelivery(id: string): Promise<{ target: PushTarget; secret?: string }> {
+    const validId = pushTargetId.parse(id);
+    return this.locked(async () => {
+      const stored = await this.readStored(validId);
+      if (stored.auth_mode === 'none') {
+        return { target: toPublicTarget(stored) };
+      }
+      let secretValue: string | undefined;
+      try {
+        secretValue = await this.readSecret(stored);
+      } catch {
+        throw new PushTargetError('Push target credential unavailable; rotate it before delivering', 500);
+      }
+      return { target: toPublicTarget(stored, true), secret: secretValue };
+    });
   }
 }
 
@@ -489,7 +669,7 @@ export function verifyPushSignature(
   timestamp: string,
   signatureHeader: string,
 ): boolean {
-  if (!signatureHeader.startsWith('sha256=')) return false;
+  if (signatureHeader.length !== 71 || !/^sha256=[0-9a-f]{64}$/.test(signatureHeader)) return false;
   const expected = signPushPayload(secret, body, timestamp);
   const a = Buffer.from(expected, 'utf8');
   const b = Buffer.from(signatureHeader, 'utf8');
@@ -515,17 +695,17 @@ function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function sanitizeDeliveryError(message: string, secret?: string): string {
+export function sanitizeDeliveryError(message: string, secret?: string): string {
   let clean = message;
-  if (secret && (clean === secret || secret.length >= 8)) {
+  if (secret) {
     clean = clean.replaceAll(secret, '[REDACTED]');
   }
   clean = clean
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{4,}/gi, 'Bearer [REDACTED]')
+    .replace(/\bBearer\s+[\x21-\x7e]+/gi, 'Bearer [REDACTED]')
     .replace(/\bsha256=[a-f0-9]{16,}/gi, 'sha256=[REDACTED]')
     .replace(/\s+/g, ' ')
     .trim();
-  return clean.slice(0, 500) || 'Delivery failed';
+  return clean.slice(0, 500) || 'delivery_failed';
 }
 
 function isRedirectError(error: unknown): boolean {
@@ -534,11 +714,24 @@ function isRedirectError(error: unknown): boolean {
   return /redirect/i.test(`${error.message} ${causeMsg}`);
 }
 
+function isTimeoutError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.name === 'TimeoutError' || /timed?\s*out/i.test(error.message);
+}
+
+function classifyTransportError(error: unknown, callerAborted: boolean): string {
+  if (callerAborted) return 'delivery_aborted';
+  if (isRedirectError(error)) return 'redirect_rejected';
+  if (isTimeoutError(error)) return 'request_timeout';
+  return 'network_error';
+}
+
 export interface PushDispatcherOptions {
   deliveriesFile?: string;
   fetchImpl?: typeof fetch;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   now?: () => number;
+  concurrency?: number;
 }
 
 export interface DeliverOptions {
@@ -553,12 +746,14 @@ export class PushDispatcher {
   private readonly defaultFetch: typeof fetch;
   private readonly defaultSleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly now: () => number;
+  private readonly concurrency: number;
 
   constructor(private readonly targets: PushTargets, opts: PushDispatcherOptions = {}) {
     this.deliveriesFile = resolve(opts.deliveriesFile ?? join(targets.root, 'deliveries.jsonl'));
     this.defaultFetch = opts.fetchImpl ?? globalThis.fetch;
     this.defaultSleep = opts.sleep ?? defaultSleep;
     this.now = opts.now ?? (() => Date.now());
+    this.concurrency = Math.max(1, Math.min(16, Math.floor(opts.concurrency ?? 4)));
   }
 
   private async appendDelivery(record: PushDelivery, secret?: string) {
@@ -574,7 +769,11 @@ export class PushDispatcher {
         throw new PushTargetError('Push delivery log has unsafe permissions', 500);
       }
       const line = credentialJson(record, secret) + '\n';
-      await handle.write(Buffer.from(line, 'utf8'));
+      const buf = Buffer.from(line, 'utf8');
+      const { bytesWritten } = await handle.write(buf, 0, buf.length);
+      if (bytesWritten !== buf.length) {
+        throw new PushTargetError('Short write to push delivery log', 500);
+      }
     } finally {
       await handle.close();
     }
@@ -583,20 +782,28 @@ export class PushDispatcher {
   private async deliverToTarget(
     targetId: string,
     eventType: PushDeliveryEvent,
-    payload: unknown,
+    sanitizedPayload: Record<string, unknown>,
     opts: DeliverOptions,
-  ): Promise<PushDelivery> {
+  ): Promise<PushDelivery | undefined> {
+    if (opts.signal?.aborted) return undefined;
+
     const fetchFn = opts.fetchImpl ?? this.defaultFetch;
     const sleepFn = opts.sleep ?? this.defaultSleep;
     const deliveryId = randomUUID();
     const startMs = this.now();
     const timestampIso = new Date(startMs).toISOString();
-    const timestampHeader = String(Math.floor(startMs / 1000));
 
     let resolved: { target: PushTarget; secret?: string };
     try {
       resolved = await this.targets.resolveForDelivery(targetId);
     } catch (error) {
+      if (eventType !== 'ping' && error instanceof PushTargetError && error.status === 404) {
+        // Target was concurrently removed after listing; skip cleanly.
+        return undefined;
+      }
+      const errorCode = error instanceof PushTargetError && /credential/i.test(error.message)
+        ? 'credential_unavailable'
+        : 'target_unavailable';
       const record = pushDeliverySchema.parse({
         delivery_id: deliveryId,
         target_id: pushTargetId.parse(targetId),
@@ -604,7 +811,7 @@ export class PushDispatcher {
         status: 'failed',
         attempts: 1,
         duration_ms: Math.max(0, Math.floor(this.now() - startMs)),
-        error: sanitizeDeliveryError(error instanceof Error ? error.message : 'Target resolution failed'),
+        error: errorCode,
         timestamp: timestampIso,
       });
       await this.appendDelivery(record);
@@ -612,19 +819,12 @@ export class PushDispatcher {
     }
 
     const { target, secret } = resolved;
-    const body = JSON.stringify(payload ?? {});
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'X-CR-Event': eventType,
-      'X-CR-Delivery-Id': deliveryId,
-      'X-CR-Timestamp': timestampHeader,
-    };
-    if (target.auth_mode === 'bearer' && secret) {
-      headers['Authorization'] = `Bearer ${secret}`;
-    } else if (target.auth_mode === 'hmac-sha256' && secret) {
-      headers['X-CR-Signature-256'] = signPushPayload(secret, body, timestampHeader);
+    // Re-check enabled & event subscription atomically loaded under lock (for non-ping deliveries).
+    if (eventType !== 'ping' && (!target.enabled || !target.events.includes(eventType))) {
+      return undefined;
     }
 
+    const body = JSON.stringify(sanitizedPayload);
     const maxAttempts = 1 + target.max_retries;
     let attempts = 0;
     let lastStatus: number | undefined;
@@ -633,10 +833,24 @@ export class PushDispatcher {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (opts.signal?.aborted) {
-        lastError = 'Delivery aborted';
+        lastError = 'delivery_aborted';
         break;
       }
       attempts = attempt;
+      // Refresh timestamp and HMAC signature on every retry attempt while keeping X-CR-Delivery-Id idempotent.
+      const attemptTimestamp = String(Math.floor(this.now() / 1000));
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'X-CR-Event': eventType,
+        'X-CR-Delivery-Id': deliveryId,
+        'X-CR-Timestamp': attemptTimestamp,
+      };
+      if (target.auth_mode === 'bearer' && secret) {
+        headers['Authorization'] = `Bearer ${secret}`;
+      } else if (target.auth_mode === 'hmac-sha256' && secret) {
+        headers['X-CR-Signature-256'] = signPushPayload(secret, body, attemptTimestamp);
+      }
+
       const attemptSignal = opts.signal
         ? AbortSignal.any([opts.signal, AbortSignal.timeout(target.timeout_ms)])
         : AbortSignal.timeout(target.timeout_ms);
@@ -663,7 +877,7 @@ export class PushDispatcher {
         if (!retryable || attempt >= maxAttempts) break;
       } catch (error) {
         lastStatus = undefined;
-        lastError = sanitizeDeliveryError(error instanceof Error ? error.message : 'Network error', secret);
+        lastError = classifyTransportError(error, Boolean(opts.signal?.aborted));
         if (opts.signal?.aborted || isRedirectError(error) || attempt >= maxAttempts) break;
       }
 
@@ -671,10 +885,12 @@ export class PushDispatcher {
       try {
         await sleepFn(backoffMs, opts.signal);
       } catch {
-        lastError = 'Delivery aborted';
+        lastError = 'delivery_aborted';
         break;
       }
     }
+
+    if (attempts === 0) return undefined;
 
     const record = pushDeliverySchema.parse({
       delivery_id: deliveryId,
@@ -682,7 +898,7 @@ export class PushDispatcher {
       event: eventType,
       status: delivered ? 'delivered' : 'failed',
       ...(lastStatus !== undefined ? { http_status: lastStatus } : {}),
-      attempts: Math.max(1, attempts),
+      attempts,
       duration_ms: Math.max(0, Math.floor(this.now() - startMs)),
       ...(!delivered && lastError ? { error: sanitizeDeliveryError(lastError, secret) } : {}),
       timestamp: timestampIso,
@@ -697,6 +913,9 @@ export class PushDispatcher {
     opts: DeliverOptions = {},
   ): Promise<PushDelivery[]> {
     const validEvent = pushEventTypeSchema.parse(eventType);
+    const sanitizedPayload = sanitizePushPayload(validEvent, payload);
+    if (opts.signal?.aborted) return [];
+
     let selectedIds: string[];
     if (opts.targetIds) {
       const uniqueIds = [...new Set(opts.targetIds.map(id => pushTargetId.parse(id)))];
@@ -716,24 +935,44 @@ export class PushDispatcher {
       selectedIds = all.filter(t => t.enabled && t.events.includes(validEvent)).map(t => t.id);
     }
 
-    const results: PushDelivery[] = [];
-    for (const id of selectedIds) {
-      results.push(await this.deliverToTarget(id, validEvent, payload, opts));
-    }
-    return results;
+    if (!selectedIds.length || opts.signal?.aborted) return [];
+
+    const orderedResults: Array<PushDelivery | undefined> = new Array(selectedIds.length);
+    let nextIndex = 0;
+    const workerCount = Math.min(this.concurrency, selectedIds.length);
+
+    const runWorker = async () => {
+      while (true) {
+        if (opts.signal?.aborted) break;
+        const idx = nextIndex++;
+        if (idx >= selectedIds.length) break;
+        orderedResults[idx] = await this.deliverToTarget(selectedIds[idx]!, validEvent, sanitizedPayload, opts);
+      }
+    };
+
+    await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+    return orderedResults.filter((item): item is PushDelivery => item !== undefined);
   }
 
   async testTarget(id: string, opts: Omit<DeliverOptions, 'targetIds'> = {}): Promise<PushDelivery> {
     const validId = pushTargetId.parse(id);
-    // Ensure target exists before dispatching ping (throws 404 PushTargetError if missing).
     await this.targets.get(validId);
-    const payload = { type: 'ping', timestamp: new Date(this.now()).toISOString() };
-    return this.deliverToTarget(validId, 'ping', payload, opts);
+    const payload = sanitizePushPayload('ping', { type: 'ping', timestamp: new Date(this.now()).toISOString() });
+    const result = await this.deliverToTarget(validId, 'ping', payload, opts);
+    if (!result) throw new PushTargetError('Delivery aborted', 499);
+    return result;
   }
 
   async listDeliveries(limit = 50, targetId?: string): Promise<PushDelivery[]> {
     const cappedLimit = Math.max(1, Math.min(500, Math.floor(limit)));
     const filterId = targetId !== undefined ? pushTargetId.parse(targetId) : undefined;
+
+    try {
+      await assertPrivateDir(dirname(this.deliveriesFile));
+    } catch (error) {
+      if (missing(error)) return [];
+      throw error;
+    }
 
     let handle;
     try {
@@ -746,7 +985,9 @@ export class PushDispatcher {
     const records: PushDelivery[] = [];
     try {
       const info = await handle.stat();
-      if (!info.isFile()) return [];
+      if (!info.isFile() || (info.mode & 0o077) !== 0 || info.uid !== process.getuid?.()) {
+        throw new PushTargetError('Push delivery log has unsafe permissions', 500);
+      }
       const maxRead = 8 * 1024 * 1024;
       const startPos = info.size > maxRead ? info.size - maxRead : 0;
       const toRead = info.size - startPos;

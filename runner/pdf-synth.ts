@@ -1,8 +1,9 @@
 import { execFile as execFileCb } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { link, lstat, mkdir, open, rename, rm, writeFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { chmod, link, lstat, mkdir, mkdtemp, open, rename, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { inflateSync } from 'node:zlib';
 import { z } from 'zod';
@@ -39,6 +40,7 @@ export const pdfInfoSchema = z.strictObject({
   problems: z.array(detectedProblemHeaderSchema),
   problem_ids: z.array(z.string().min(1)),
   text_length: z.number().int().nonnegative(),
+  text_truncated: z.boolean(),
   extractor: z.enum(['poppler', 'fallback']),
 });
 export type PdfInfo = z.infer<typeof pdfInfoSchema>;
@@ -59,14 +61,14 @@ export const mergePdfsResultSchema = z.strictObject({
 export type MergePdfsResult = z.infer<typeof mergePdfsResultSchema>;
 
 export const synthSampleSchema = z.strictObject({
-  input: z.string(),
-  output: z.string(),
+  input: z.string().max(256_000),
+  output: z.string().max(256_000),
 });
 
 export const synthProblemSchema = z.strictObject({
   id: z.string().trim().min(1).max(32),
   title: z.string().trim().min(1).max(200),
-  body: z.string(),
+  body: z.string().max(1_000_000),
   samples: z.array(synthSampleSchema).max(32).optional(),
 });
 export type SynthProblem = z.infer<typeof synthProblemSchema>;
@@ -77,11 +79,26 @@ export const synthPdfResultSchema = z.strictObject({
   size_bytes: z.number().int().positive(),
   sha256: z.string().regex(/^[a-f0-9]{64}$/),
   problem_ids: z.array(z.string().min(1)),
+  warnings: z.array(z.string()),
 });
 export type SynthPdfResult = z.infer<typeof synthPdfResultSchema>;
 
 const PDF_MAGIC = Buffer.from('%PDF-');
+const MAX_STREAM_INFLATE_BYTES = 8 * 1024 * 1024;
+const MAX_TOTAL_INFLATE_BYTES = 32 * 1024 * 1024;
+const MAX_EXTRACTED_TEXT_CHARS = 2_000_000;
+
 const missing = (error: unknown) => (error as NodeJS.ErrnoException)?.code === 'ENOENT';
+
+async function withPrivateTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-pdf-'));
+  await chmod(dir, 0o700);
+  try {
+    return await fn(dir);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
 
 async function readRegularPdfFile(filePath: string, maxBytes: number): Promise<Buffer> {
   const handle = await open(filePath, constants.O_RDONLY | constants.O_NONBLOCK);
@@ -109,22 +126,27 @@ async function readRegularPdfFile(filePath: string, maxBytes: number): Promise<B
 }
 
 function stripPdfStreamsForStructure(latin: string): string {
-  // Replace stream payloads so structure regexes don't accidentally match inside content/image streams.
   return latin.replace(/stream\r?\n[\s\S]*?endstream/g, 'stream\nendstream');
 }
 
 export function parsePdfPageCountFallback(bytes: Buffer): number {
-  const latin = bytes.toString('latin1');
-  const structure = stripPdfStreamsForStructure(latin);
+  const structure = stripPdfStreamsForStructure(bytes.toString('latin1'));
 
-  // 1. Follow /Catalog -> /Pages <obj> <gen> R -> /Count N.
-  const catalogPagesRef = structure.match(/\/Type\s*\/Catalog[\s\S]*?\/Pages\s+(\d+)\s+(\d+)\s+R/);
-  if (catalogPagesRef) {
-    const objNum = catalogPagesRef[1]!;
-    const genNum = catalogPagesRef[2]!;
-    const pagesObjPattern = new RegExp(`(?:^|[\\r\\n])${objNum}\\s+${genNum}\\s+obj\\b([\\s\\S]*?)\\bendobj`);
-    const pagesObj = structure.match(pagesObjPattern);
-    const countMatch = pagesObj?.[1]?.match(/\/Count\s+(\d+)/);
+  // Parse all indirect objects into a map so dictionary key ordering never matters.
+  const objects = new Map<string, string>();
+  const objPattern = /(?:^|[\r\n])(\d+)\s+(\d+)\s+obj\b([\s\S]*?)\bendobj\b/g;
+  for (const match of structure.matchAll(objPattern)) {
+    const key = `${match[1]!} ${match[2]!}`;
+    objects.set(key, match[3] ?? '');
+  }
+
+  // 1. Follow /Catalog -> /Pages <obj> <gen> R -> /Count N regardless of dictionary key order.
+  for (const body of objects.values()) {
+    if (!/\/Type\s*\/Catalog\b/.test(body)) continue;
+    const pagesRef = body.match(/\/Pages\s+(\d+)\s+(\d+)\s+R\b/);
+    if (!pagesRef) continue;
+    const pagesBody = objects.get(`${pagesRef[1]!} ${pagesRef[2]!}`);
+    const countMatch = pagesBody?.match(/\/Count\s+(\d+)/);
     if (countMatch) {
       const parsed = Number.parseInt(countMatch[1]!, 10);
       if (Number.isInteger(parsed) && parsed > 0) return parsed;
@@ -132,15 +154,21 @@ export function parsePdfPageCountFallback(bytes: Buffer): number {
   }
 
   // 2. Count leaf /Type /Page objects (explicitly excluding /Type /Pages).
-  const leafPages = structure.match(/\/Type\s*\/Page(?![A-Za-z])/g);
-  if (leafPages && leafPages.length > 0) return leafPages.length;
+  let leafCount = 0;
+  for (const body of objects.values()) {
+    if (/\/Type\s*\/Page(?![A-Za-z])/.test(body)) leafCount++;
+  }
+  if (leafCount > 0) return leafCount;
 
-  // 3. Fallback to max /Count found on any /Type /Pages dictionary.
+  // 3. Fallback to max /Count found in any /Type /Pages object (order-independent).
   let maxCount = 0;
-  const countMatches = structure.matchAll(/\/Type\s*\/Pages\b[\s\S]*?\/Count\s+(\d+)/g);
-  for (const m of countMatches) {
-    const n = Number.parseInt(m[1]!, 10);
-    if (Number.isInteger(n) && n > maxCount) maxCount = n;
+  for (const body of objects.values()) {
+    if (!/\/Type\s*\/Pages\b/.test(body)) continue;
+    const countMatch = body.match(/\/Count\s+(\d+)/);
+    if (countMatch) {
+      const n = Number.parseInt(countMatch[1]!, 10);
+      if (Number.isInteger(n) && n > maxCount) maxCount = n;
+    }
   }
   return maxCount;
 }
@@ -163,7 +191,6 @@ function decodePdfLiteralString(raw: string): string {
     else if (next === 'f') out += '\f';
     else if (next === '(' || next === ')' || next === '\\') out += next;
     else if (next === '\r' || next === '\n') {
-      // Escaped line continuation in PDF literal string.
       if (next === '\r' && raw[i + 1] === '\n') i++;
     } else if (next >= '0' && next <= '7') {
       let octal = next;
@@ -193,7 +220,6 @@ function extractTextFromContentStream(streamContent: string): string {
     while (i < body.length) {
       const ch = body[i]!;
       if (ch === '(') {
-        // Parse balanced PDF literal string (...)
         let depth = 1;
         let str = '';
         i++;
@@ -212,7 +238,6 @@ function extractTextFromContentStream(streamContent: string): string {
           str += c;
           i++;
         }
-        // Check if followed by Tj / ' / " operator or inside TJ array.
         currentLine += decodePdfLiteralString(str);
       } else if (body.startsWith('T*', i) && (i === 0 || /\s/.test(body[i - 1]!))) {
         if (currentLine.trim()) lines.push(currentLine.trim());
@@ -236,15 +261,26 @@ function extractTextFromContentStream(streamContent: string): string {
   return lines.join('\n');
 }
 
-export function extractPdfTextFallback(bytes: Buffer): string {
+const NON_TEXT_STREAM_DICT = /\/Subtype\s*\/(?:Image|XML)\b|\/FontFile[23]?\b|\/Type\s*\/(?:ObjStm|XRef|Metadata)\b/;
+
+export function extractPdfTextFallbackDetailed(
+  bytes: Buffer,
+  limits: { maxStreamInflateBytes?: number; maxTotalInflateBytes?: number; maxTextChars?: number } = {},
+): { text: string; truncated: boolean } {
+  const maxStreamInflate = limits.maxStreamInflateBytes ?? MAX_STREAM_INFLATE_BYTES;
+  const maxTotalInflate = limits.maxTotalInflateBytes ?? MAX_TOTAL_INFLATE_BYTES;
+  const maxTextChars = limits.maxTextChars ?? MAX_EXTRACTED_TEXT_CHARS;
+
   const latin = bytes.toString('latin1');
   const chunks: string[] = [];
+  let totalInflated = 0;
+  let totalTextChars = 0;
+  let truncated = false;
   let cursor = 0;
 
   while (cursor < latin.length) {
     const streamIdx = latin.indexOf('stream', cursor);
     if (streamIdx === -1) break;
-    // Ensure 'stream' is not 'endstream'.
     if (streamIdx >= 3 && latin.slice(streamIdx - 3, streamIdx) === 'end') {
       cursor = streamIdx + 6;
       continue;
@@ -260,32 +296,68 @@ export function extractPdfTextFallback(bytes: Buffer): string {
     const endIdx = latin.indexOf('endstream', dataStart);
     if (endIdx === -1) break;
 
-    const dictWindow = latin.slice(Math.max(0, streamIdx - 512), streamIdx);
+    const prevEndObj = latin.lastIndexOf('endobj', streamIdx);
+    const windowStart = Math.max(prevEndObj === -1 ? 0 : prevEndObj + 6, streamIdx - 4096);
+    const dictWindow = latin.slice(windowStart, streamIdx);
     let dataEnd = endIdx;
     if (dataEnd > dataStart && bytes[dataEnd - 1] === 0x0a) dataEnd--;
     if (dataEnd > dataStart && bytes[dataEnd - 1] === 0x0d) dataEnd--;
 
+    cursor = endIdx + 9;
+
+    // Skip non-text binary/metadata streams before touching or inflating them.
+    if (NON_TEXT_STREAM_DICT.test(dictWindow)) continue;
+
     const rawSlice = bytes.subarray(dataStart, dataEnd);
     let contentText: string | undefined;
+
     if (/\/Filter\s*(?:\[\s*)?\/FlateDecode\b/.test(dictWindow)) {
+      const remainingBudget = maxTotalInflate - totalInflated;
+      if (remainingBudget <= 0) {
+        truncated = true;
+        break;
+      }
+      const streamLimit = Math.min(maxStreamInflate, remainingBudget);
       try {
-        contentText = inflateSync(rawSlice).toString('latin1');
-      } catch {
+        const inflated = inflateSync(rawSlice, { maxOutputLength: streamLimit });
+        totalInflated += inflated.length;
+        contentText = inflated.toString('latin1');
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException)?.code;
+        if (code === 'ERR_BUFFER_TOO_LARGE' || /output length/i.test(String((error as Error)?.message ?? ''))) {
+          truncated = true;
+        }
         contentText = undefined;
       }
-    } else if (!/\/Subtype\s*\/Image\b/.test(dictWindow)) {
+    } else {
+      if (rawSlice.length > maxStreamInflate || totalInflated + rawSlice.length > maxTotalInflate) {
+        truncated = true;
+        continue;
+      }
+      totalInflated += rawSlice.length;
       contentText = rawSlice.toString('latin1');
     }
 
     if (contentText && contentText.includes('BT') && contentText.includes('ET')) {
       const extracted = extractTextFromContentStream(contentText);
-      if (extracted) chunks.push(extracted);
+      if (extracted) {
+        if (totalTextChars + extracted.length > maxTextChars) {
+          const room = Math.max(0, maxTextChars - totalTextChars);
+          if (room > 0) chunks.push(extracted.slice(0, room));
+          truncated = true;
+          break;
+        }
+        chunks.push(extracted);
+        totalTextChars += extracted.length;
+      }
     }
-
-    cursor = endIdx + 9;
   }
 
-  return chunks.join('\n');
+  return { text: chunks.join('\n'), truncated };
+}
+
+export function extractPdfTextFallback(bytes: Buffer): string {
+  return extractPdfTextFallbackDetailed(bytes).text;
 }
 
 function normalizeProblemId(rawId: string): string {
@@ -301,20 +373,15 @@ function cleanHeaderTitle(rawTitle: string | undefined): string {
 
 export function detectProblemHeaders(text: string): DetectedProblemHeader[] {
   const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-  const explicit: DetectedProblemHeader[] = [];
-  const bareLetter: DetectedProblemHeader[] = [];
-  const bareNumeric: DetectedProblemHeader[] = [];
 
-  const pushUnique = (target: DetectedProblemHeader[], id: string, title: string) => {
-    const normalized = normalizeProblemId(id);
-    if (!target.some(item => item.id === normalized)) {
-      target.push({ id: normalized, title: cleanHeaderTitle(title) });
-    }
-  };
+  type Candidate = { id: string; title: string; kind: 'explicit' | 'bare-letter' | 'bare-numeric' };
+  const candidates: Candidate[] = [];
 
-  const explicitEn = /^(?:Problem|Task|Question)\s+([A-Za-z]\d?|\d{1,2})(?:\s*[:.\-–—]\s*(.*)|\s+(.*))?$/i;
-  const explicitZh1 = /^第\s*([A-Za-z]\d?|\d{1,2})\s*题(?:[\s:：.\-–—]*(.*))?$/i;
-  const explicitZh2 = /^(?:题目|问题)\s*([A-Za-z]\d?|\d{1,2})(?:[\s:：.\-–—]+(.*))?$/i;
+  // Require capitalized keyword (Problem/PROBLEM/Task/TASK/Question/QUESTION) and uppercase letter or digit ID
+  // so prose lines like "problem a is easy" do not trigger false positives.
+  const explicitEn = /^(?:Problem|PROBLEM|Task|TASK|Question|QUESTION)\s+([A-Z]\d?|\d{1,2})(?:\s*[:.\-–—]\s*(.*)|\s+(.+))?$/;
+  const explicitZh1 = /^第\s*([A-Za-z]\d?|\d{1,2})\s*题(?:[\s:：.\-–—]*(.*))?$/;
+  const explicitZh2 = /^(?:题目|问题)\s*([A-Za-z]\d?|\d{1,2})(?:[\s:：.\-–—]+(.*))?$/;
   const bareLetterRe = /^([A-Z]\d?)\.\s+(.{2,140})$/;
   const bareNumericRe = /^(\d{1,2})\.\s+(.{2,140})$/;
 
@@ -323,37 +390,56 @@ export function detectProblemHeaders(text: string): DetectedProblemHeader[] {
 
     const mEn = line.match(explicitEn);
     if (mEn) {
-      pushUnique(explicit, mEn[1]!, mEn[2] ?? mEn[3] ?? '');
+      candidates.push({ id: normalizeProblemId(mEn[1]!), title: cleanHeaderTitle(mEn[2] ?? mEn[3]), kind: 'explicit' });
       continue;
     }
 
     const mZh1 = line.match(explicitZh1);
     if (mZh1) {
-      pushUnique(explicit, mZh1[1]!, mZh1[2] ?? '');
+      candidates.push({ id: normalizeProblemId(mZh1[1]!), title: cleanHeaderTitle(mZh1[2]), kind: 'explicit' });
       continue;
     }
 
     const mZh2 = line.match(explicitZh2);
     if (mZh2) {
-      pushUnique(explicit, mZh2[1]!, mZh2[2] ?? '');
+      candidates.push({ id: normalizeProblemId(mZh2[1]!), title: cleanHeaderTitle(mZh2[2]), kind: 'explicit' });
       continue;
     }
 
     const mLetter = line.match(bareLetterRe);
     if (mLetter) {
-      pushUnique(bareLetter, mLetter[1]!, mLetter[2]!);
+      candidates.push({ id: normalizeProblemId(mLetter[1]!), title: cleanHeaderTitle(mLetter[2]), kind: 'bare-letter' });
       continue;
     }
 
     const mNum = line.match(bareNumericRe);
     if (mNum) {
-      pushUnique(bareNumeric, mNum[1]!, mNum[2]!);
+      candidates.push({ id: normalizeProblemId(mNum[1]!), title: cleanHeaderTitle(mNum[2]), kind: 'bare-numeric' });
     }
   }
 
-  if (explicit.length > 0) return explicit;
-  if (bareLetter.length > 0) return bareLetter;
-  return bareNumeric;
+  const hasExplicit = candidates.some(c => c.kind === 'explicit');
+  const explicitUsesLetters = candidates.some(c => c.kind === 'explicit' && /^[A-Z]/.test(c.id));
+  const hasBareLetter = candidates.some(c => c.kind === 'bare-letter');
+
+  let allowedKinds: Set<Candidate['kind']>;
+  if (hasExplicit) {
+    // Allow mixed letter format (e.g., "Problem A: Alpha" followed by "B. Beta") while excluding numbered statement lists.
+    allowedKinds = explicitUsesLetters ? new Set(['explicit', 'bare-letter']) : new Set(['explicit']);
+  } else if (hasBareLetter) {
+    allowedKinds = new Set(['bare-letter']);
+  } else {
+    allowedKinds = new Set(['bare-numeric']);
+  }
+
+  const out: DetectedProblemHeader[] = [];
+  const seen = new Set<string>();
+  for (const c of candidates) {
+    if (!allowedKinds.has(c.kind) || seen.has(c.id)) continue;
+    seen.add(c.id);
+    out.push({ id: c.id, title: c.title });
+  }
+  return out;
 }
 
 export async function inspectPdf(
@@ -370,34 +456,48 @@ export async function inspectPdf(
 
   let pageCount: number | undefined;
   let text: string | undefined;
+  let textTruncated = false;
   let usedPoppler = false;
 
   if (useExternal) {
-    try {
-      const infoRes = await execFn('pdfinfo', ['--', resolvedPath], { timeout: 10_000 });
-      const pagesMatch = infoRes.stdout.match(/^Pages:\s+(\d+)/m);
-      if (pagesMatch) {
-        pageCount = Number.parseInt(pagesMatch[1]!, 10);
-        usedPoppler = true;
-      }
-    } catch {
-      // Fallback to pure-JS PDF page count parser below.
-    }
+    // Feed external tools a private 0o600 snapshot of the exact verified bytes to prevent TOCTOU swaps.
+    await withPrivateTempDir(async snapDir => {
+      const snapPath = join(snapDir, 'input.pdf');
+      await writeFile(snapPath, bytes, { mode: 0o600, flag: 'wx' });
 
-    try {
-      const textRes = await execFn('pdftotext', ['-enc', 'UTF-8', resolvedPath, '-'], { timeout: 15_000, maxBuffer: 8 * 1024 * 1024 });
-      text = textRes.stdout;
-      usedPoppler = true;
-    } catch {
-      // Fallback to pure-JS literal text extractor below.
-    }
+      try {
+        const infoRes = await execFn('pdfinfo', ['--', snapPath], { timeout: 10_000 });
+        const pagesMatch = infoRes.stdout.match(/^Pages:\s+(\d+)/m);
+        if (pagesMatch) {
+          pageCount = Number.parseInt(pagesMatch[1]!, 10);
+          usedPoppler = true;
+        }
+      } catch {
+        // Fallback to pure-JS PDF page count parser below.
+      }
+
+      try {
+        const textRes = await execFn('pdftotext', ['-enc', 'UTF-8', snapPath, '-'], { timeout: 15_000, maxBuffer: 8 * 1024 * 1024 });
+        if (textRes.stdout.length > MAX_EXTRACTED_TEXT_CHARS) {
+          text = textRes.stdout.slice(0, MAX_EXTRACTED_TEXT_CHARS);
+          textTruncated = true;
+        } else {
+          text = textRes.stdout;
+        }
+        usedPoppler = true;
+      } catch {
+        // Fallback to pure-JS literal text extractor below.
+      }
+    });
   }
 
   if (pageCount === undefined) {
     pageCount = parsePdfPageCountFallback(bytes);
   }
   if (text === undefined) {
-    text = extractPdfTextFallback(bytes);
+    const detailed = extractPdfTextFallbackDetailed(bytes);
+    text = detailed.text;
+    textTruncated = detailed.truncated;
   }
 
   const problems = detectProblemHeaders(text);
@@ -409,6 +509,7 @@ export async function inspectPdf(
     problems,
     problem_ids: problems.map(p => p.id),
     text_length: text.length,
+    text_truncated: textTruncated,
     extractor: usedPoppler ? 'poppler' : 'fallback',
   });
 }
@@ -467,8 +568,8 @@ export async function mergePdfs(
   }
 
   const resolvedInputs = inputPaths.map(p => resolve(p));
+  const verifiedBuffers: Buffer[] = [];
   let totalBytes = 0;
-  let singleInputBytes: Buffer | undefined;
 
   for (const inputPath of resolvedInputs) {
     const bytes = await readRegularPdfFile(inputPath, maxTotalBytes);
@@ -476,7 +577,7 @@ export async function mergePdfs(
     if (totalBytes > maxTotalBytes) {
       throw new Error(`Combined input PDF size (${totalBytes} bytes) exceeds budget of ${maxTotalBytes} bytes`);
     }
-    if (resolvedInputs.length === 1) singleInputBytes = bytes;
+    verifiedBuffers.push(bytes);
   }
 
   await mkdir(dirname(resolvedOutput), { recursive: true });
@@ -485,30 +586,40 @@ export async function mergePdfs(
   let toolUsed: 'pdfunite' | 'qpdf' | 'copy' = 'pdfunite';
 
   try {
-    if (resolvedInputs.length === 1 && singleInputBytes && !opts.execImpl) {
-      await writeFile(tempOutput, singleInputBytes, { mode: 0o600, flag: 'wx' });
+    if (verifiedBuffers.length === 1 && !opts.execImpl) {
+      await writeFile(tempOutput, verifiedBuffers[0]!, { mode: 0o600, flag: 'wx' });
       toolUsed = 'copy';
     } else {
-      try {
-        await execFn('pdfunite', [...resolvedInputs, tempOutput], { timeout: 60_000 });
-        toolUsed = 'pdfunite';
-      } catch (firstError) {
-        if (!isCommandNotFound(firstError)) {
-          throw new Error(`pdfunite failed: ${firstError instanceof Error ? firstError.message : String(firstError)}`);
+      // Write validated input bytes to private 0o600 snapshots so external tools cannot see TOCTOU swaps.
+      await withPrivateTempDir(async snapDir => {
+        const snapInputs: string[] = [];
+        for (let i = 0; i < verifiedBuffers.length; i++) {
+          const snapPath = join(snapDir, `in-${i}.pdf`);
+          await writeFile(snapPath, verifiedBuffers[i]!, { mode: 0o600, flag: 'wx' });
+          snapInputs.push(snapPath);
         }
+
         try {
-          await execFn('qpdf', ['--empty', '--pages', ...resolvedInputs, '--', tempOutput], { timeout: 60_000 });
-          toolUsed = 'qpdf';
-        } catch (secondError) {
-          if (isCommandNotFound(secondError)) {
-            throw new Error(
-              'No PDF merge tool found on PATH. Install poppler-utils (pdfunite) or qpdf ' +
-              '(e.g. apt install poppler-utils, brew install poppler, or pacman -S poppler qpdf).',
-            );
+          await execFn('pdfunite', [...snapInputs, tempOutput], { timeout: 60_000 });
+          toolUsed = 'pdfunite';
+        } catch (firstError) {
+          if (!isCommandNotFound(firstError)) {
+            throw new Error(`pdfunite failed: ${firstError instanceof Error ? firstError.message : String(firstError)}`);
           }
-          throw new Error(`qpdf failed: ${secondError instanceof Error ? secondError.message : String(secondError)}`);
+          try {
+            await execFn('qpdf', ['--empty', '--pages', ...snapInputs, '--', tempOutput], { timeout: 60_000 });
+            toolUsed = 'qpdf';
+          } catch (secondError) {
+            if (isCommandNotFound(secondError)) {
+              throw new Error(
+                'No PDF merge tool found on PATH. Install poppler-utils (pdfunite) or qpdf ' +
+                '(e.g. apt install poppler-utils, brew install poppler, or pacman -S poppler qpdf).',
+              );
+            }
+            throw new Error(`qpdf failed: ${secondError instanceof Error ? secondError.message : String(secondError)}`);
+          }
         }
-      }
+      });
     }
 
     const mergedBytes = await readRegularPdfFile(tempOutput, maxTotalBytes * 2);
@@ -527,7 +638,7 @@ export async function mergePdfs(
   }
 }
 
-function toPdfAscii(text: string): string {
+function encodePdfAscii(text: string, allowAsciiFallback: boolean): { text: string; replacedCount: number } {
   const normalized = text
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
@@ -542,20 +653,31 @@ function toPdfAscii(text: string): string {
     .replace(/\u2265/g, '>=')
     .replace(/\u00D7/g, 'x');
   let out = '';
+  let replacedCount = 0;
   for (const ch of normalized) {
     const code = ch.charCodeAt(0);
-    if (ch === '\n' || (code >= 0x20 && code <= 0x7e)) out += ch;
-    else out += '?';
+    if (ch === '\n' || (code >= 0x20 && code <= 0x7e)) {
+      out += ch;
+    } else if (allowAsciiFallback) {
+      out += '?';
+      replacedCount++;
+    } else {
+      throw new Error(
+        'synthesizeTextContestPdf uses PDF Base-14 ASCII/Type1 fonts and cannot encode non-ASCII characters losslessly. ' +
+        'Use ASCII statements or pass allowAsciiFallback: true to replace unsupported characters with "?".',
+      );
+    }
   }
-  return out;
+  return { text: out, replacedCount };
 }
 
 function escapePdfString(text: string): string {
   return text.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
 }
 
-function wrapText(text: string, maxChars: number): string[] {
-  const paragraphs = toPdfAscii(text).split('\n');
+function wrapText(text: string, maxChars: number, allowAsciiFallback: boolean): { lines: string[]; replacedCount: number } {
+  const encoded = encodePdfAscii(text, allowAsciiFallback);
+  const paragraphs = encoded.text.split('\n');
   const wrapped: string[] = [];
 
   for (const para of paragraphs) {
@@ -585,11 +707,12 @@ function wrapText(text: string, maxChars: number): string[] {
     }
     if (current) wrapped.push(current);
   }
-  return wrapped;
+  return { lines: wrapped, replacedCount: encoded.replacedCount };
 }
 
-function wrapVerbatimLines(text: string, maxChars: number): string[] {
-  const rawLines = toPdfAscii(text).split('\n');
+function wrapVerbatimLines(text: string, maxChars: number, allowAsciiFallback: boolean): { lines: string[]; replacedCount: number } {
+  const encoded = encodePdfAscii(text, allowAsciiFallback);
+  const rawLines = encoded.text.split('\n');
   const out: string[] = [];
   for (const line of rawLines) {
     if (line.length <= maxChars) {
@@ -600,22 +723,23 @@ function wrapVerbatimLines(text: string, maxChars: number): string[] {
       }
     }
   }
-  return out.length ? out : [''];
+  return { lines: out.length ? out : [''], replacedCount: encoded.replacedCount };
 }
 
 export async function synthesizeTextContestPdf(
   rawProblems: SynthProblem[],
   outputPath: string,
-  opts: { title?: string; subtitle?: string; overwrite?: boolean } = {},
+  opts: { title?: string; subtitle?: string; overwrite?: boolean; allowAsciiFallback?: boolean } = {},
 ): Promise<SynthPdfResult> {
   const problems = z.array(synthProblemSchema).min(1).max(100).parse(rawProblems);
   const resolvedOutput = resolve(outputPath);
-  const overwrite = opts.overwrite !== false;
+  const overwrite = opts.overwrite === true;
+  const allowAsciiFallback = opts.allowAsciiFallback === true;
 
   if (!overwrite) {
     try {
       await lstat(resolvedOutput);
-      throw new Error(`Output PDF already exists: ${resolvedOutput}`);
+      throw new Error(`Output PDF already exists (pass overwrite: true to replace): ${resolvedOutput}`);
     } catch (error) {
       if (!missing(error)) throw error;
     }
@@ -631,6 +755,7 @@ export async function synthesizeTextContestPdf(
   const pages: string[][] = [];
   let cmds: string[] = [];
   let y = topY;
+  let totalReplacedChars = 0;
 
   const startPage = () => {
     cmds = [];
@@ -653,11 +778,15 @@ export async function synthesizeTextContestPdf(
   startPage();
 
   if (opts.title?.trim()) {
-    for (const line of wrapText(opts.title.trim(), 48)) {
+    const titleWrapped = wrapText(opts.title.trim(), 48, allowAsciiFallback);
+    totalReplacedChars += titleWrapped.replacedCount;
+    for (const line of titleWrapped.lines) {
       drawTextLine('F2', 18, marginX, line, 24);
     }
     if (opts.subtitle?.trim()) {
-      for (const line of wrapText(opts.subtitle.trim(), 78)) {
+      const subWrapped = wrapText(opts.subtitle.trim(), 78, allowAsciiFallback);
+      totalReplacedChars += subWrapped.replacedCount;
+      for (const line of subWrapped.lines) {
         drawTextLine('F1', 11, marginX, line, 15);
       }
     }
@@ -670,18 +799,19 @@ export async function synthesizeTextContestPdf(
     const problem = problems[idx]!;
     if (idx > 0) startPage();
 
-    // Problem header
     const heading = `Problem ${problem.id}: ${problem.title}`;
-    for (const line of wrapText(heading, 58)) {
+    const headingWrapped = wrapText(heading, 58, allowAsciiFallback);
+    totalReplacedChars += headingWrapped.replacedCount;
+    for (const line of headingWrapped.lines) {
       drawTextLine('F2', 15, marginX, line, 20);
     }
     y -= 2;
     cmds.push(`0.5 w ${marginX} ${y} m ${marginX + contentWidth} ${y} l S`);
     y -= 14;
 
-    // Problem body
-    const bodyLines = wrapText(problem.body, 84);
-    for (const line of bodyLines) {
+    const bodyWrapped = wrapText(problem.body, 84, allowAsciiFallback);
+    totalReplacedChars += bodyWrapped.replacedCount;
+    for (const line of bodyWrapped.lines) {
       if (line === '') {
         y -= 8;
         if (y < bottomY) startPage();
@@ -690,7 +820,6 @@ export async function synthesizeTextContestPdf(
       }
     }
 
-    // Sample I/O blocks
     if (problem.samples?.length) {
       y -= 10;
       for (let sIdx = 0; sIdx < problem.samples.length; sIdx++) {
@@ -700,7 +829,9 @@ export async function synthesizeTextContestPdf(
           [`Sample Output ${sIdx + 1}`, sample.output],
         ];
         for (const [label, content] of sections) {
-          const sampleLines = wrapVerbatimLines(content, 76);
+          const sampleWrapped = wrapVerbatimLines(content, 76, allowAsciiFallback);
+          totalReplacedChars += sampleWrapped.replacedCount;
+          const sampleLines = sampleWrapped.lines;
           const lineHeight = 13;
           const padY = 6;
           const boxHeight = sampleLines.length * lineHeight + padY * 2;
@@ -710,7 +841,6 @@ export async function synthesizeTextContestPdf(
 
           drawTextLine('F2', 10, marginX, label, 14);
           const boxTop = y + 4;
-          const fittedHeight = Math.min(boxHeight, Math.max(lineHeight + padY * 2, boxTop - bottomY));
           if (boxHeight <= boxTop - bottomY) {
             cmds.push(`0.4 w ${marginX} ${boxTop - boxHeight} ${contentWidth} ${boxHeight} re S`);
             y = boxTop - padY - 10;
@@ -720,8 +850,6 @@ export async function synthesizeTextContestPdf(
             }
             y = boxTop - boxHeight - 10;
           } else {
-            // Very tall sample: stream line-by-line across pages cleanly without clipping.
-            void fittedHeight;
             for (const line of sampleLines) {
               drawTextLine('F3', 9.5, marginX + 8, line, lineHeight);
             }
@@ -732,13 +860,11 @@ export async function synthesizeTextContestPdf(
     }
   }
 
-  // Append page footers.
   const totalPages = pages.length;
   for (let p = 0; p < totalPages; p++) {
     pages[p]!.push(`BT /F1 9 Tf ${marginX} 36 Td (Page ${p + 1} of ${totalPages}) Tj ET`);
   }
 
-  // Assemble PDF 1.4 objects with exact byte offsets.
   const objects: string[] = [];
   const pageObjectIds: number[] = [];
   for (let p = 0; p < totalPages; p++) pageObjectIds.push(6 + p * 2);
@@ -795,11 +921,17 @@ export async function synthesizeTextContestPdf(
     await rm(tempOutput, { force: true });
   }
 
+  const warnings: string[] = [];
+  if (totalReplacedChars > 0) {
+    warnings.push(`Replaced ${totalReplacedChars} non-ASCII character(s) with "?" due to Base-14 ASCII font fallback`);
+  }
+
   return synthPdfResultSchema.parse({
     output_path: resolvedOutput,
     page_count: totalPages,
     size_bytes: pdfBytes.length,
     sha256: sha256(pdfBytes),
     problem_ids: problems.map(p => p.id),
+    warnings,
   });
 }

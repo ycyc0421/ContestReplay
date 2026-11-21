@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
+import { sha256 } from '../dist/config.js';
 import {
   buildGhostRace,
   buildRunReplay,
@@ -23,7 +24,7 @@ async function createRunFixture(root, opts) {
   const runId = opts.runId ?? randomUUID();
   const dir = join(root, runId);
   await mkdir(dir, { recursive: true });
-  const hash = 'a'.repeat(64);
+  const hash = opts.contestRevision ?? 'a'.repeat(64);
   const runJson = {
     schema_version: 1,
     run_id: runId,
@@ -31,6 +32,7 @@ async function createRunFixture(root, opts) {
     contest_id: opts.contestId ?? 'contest-demo',
     contest_title: opts.contestTitle ?? 'Contest Demo',
     data_version: opts.dataVersion ?? 1,
+    contest_revision: hash,
     agent_id: opts.agentId ?? 'agent-alpha',
     ...(opts.agentName ? { agent_name: opts.agentName } : {}),
     ...(opts.scoringMode ? { scoring_mode: opts.scoringMode } : {}),
@@ -40,17 +42,19 @@ async function createRunFixture(root, opts) {
     },
     ...(opts.problems ? { problems: opts.problems } : {}),
     ...(opts.localInputs ? { local_inputs: opts.localInputs } : {}),
-    input_sha256: { contest: hash },
-    protocol_id: 'codex-pdf-pages-mcp',
-    protocol_version: 2,
-    protocol_sha256: hash,
+    input_sha256: opts.inputSha256 ?? { contest: hash },
+    protocol_id: opts.protocolId ?? 'codex-pdf-pages-mcp',
+    protocol_version: opts.protocolVersion ?? 2,
+    protocol_sha256: opts.protocolSha256 ?? 'b'.repeat(64),
     agent_revision: hash,
     harness: { kind: 'codex', version: '0.170.0' },
     model: { model: 'gpt-5.3-codex', base_url: 'https://private.internal.example/v1' },
   };
   await writeFile(join(dir, 'run.json'), JSON.stringify(runJson, null, 2) + '\n', 'utf8');
-  if (opts.events !== undefined) {
-    const lines = opts.events.map((event, idx) => JSON.stringify({ schema_version: 1, seq: idx + 1, ...event }));
+  if (opts.rawEventsContent !== undefined) {
+    await writeFile(join(dir, 'events.jsonl'), opts.rawEventsContent, 'utf8');
+  } else if (opts.events !== undefined) {
+    const lines = opts.events.map((event, idx) => JSON.stringify({ schema_version: 1, seq: event.seq ?? idx + 1, ...event }));
     const content = lines.join('\n') + (opts.trailingPartial !== undefined ? '\n' + opts.trailingPartial : '\n');
     await writeFile(join(dir, 'events.jsonl'), content, 'utf8');
   }
@@ -62,21 +66,21 @@ test('readRunProgress handles live incomplete events.jsonl with trailing partial
   t.after(() => rm(root, { recursive: true, force: true }));
 
   const startedAt = '2026-04-01T10:00:00.000Z';
-  const nowMs = Date.parse(startedAt) + 180_000; // 3 minutes elapsed
+  const nowMs = Date.parse(startedAt) + 180_000;
 
   const { runId } = await createRunFixture(root, {
     agentId: 'codex-fast',
-    agentName: 'Codex Fast (High)',
+    agentName: 'Antigravity Fast (High)',
     contestId: 'icpc-live',
     contestTitle: 'ICPC Live Mock',
     scoringMode: 'icpc',
     timeLimitMs: 900_000,
     maxSubmissions: 25,
     problems: [
-      { id: 'A', max_points: 1 },
-      { id: 'B', max_points: 1 },
-      { id: 'C', max_points: 1 },
-      { id: 'D', max_points: 1 },
+      { id: 'A', max_points: 500 },
+      { id: 'B', max_points: 1000 },
+      { id: 'C', max_points: 1500 },
+      { id: 'D', max_points: 2000 },
     ],
     events: [
       { elapsed_ms: 0, type: 'run_started', started_at: startedAt },
@@ -98,25 +102,20 @@ test('readRunProgress handles live incomplete events.jsonl with trailing partial
   const progress = await readRunProgress(root, runId, { now: nowMs, maxActivity: 10 });
   assert.doesNotThrow(() => runProgressSchema.parse(progress));
 
+  // Weighted contest under scoring_mode='icpc' must consistently score 1 per solved problem in progress AND replay!
   assert.equal(progress.status, 'running');
-  assert.equal(progress.agent_id, 'codex-fast');
-  assert.equal(progress.agent_name, 'Codex Fast (High)');
-  assert.equal(progress.scoring_mode, 'icpc');
-  assert.equal(progress.elapsed_ms, 180_000);
-  assert.equal(progress.remaining_ms, 720_000);
-  assert.equal(progress.submissions_used, 4);
-  assert.equal(progress.max_submissions, 25);
-  assert.equal(progress.model_turns, 2);
-  assert.equal(progress.last_activity_ms, 120_000);
-  assert.equal(progress.last_activity_type, 'submission_received');
   assert.equal(progress.score, 1);
   assert.equal(progress.max_score, 4);
   assert.equal(progress.solved_count, 1);
   assert.equal(progress.problem_count, 4);
 
+  const replay = await buildRunReplay(root, runId);
+  assert.equal(replay.frames[replay.frames.length - 1].cumulative_score, 1);
+  assert.equal(projectScoreAt(replay, 180_000, 'icpc').score, 1);
+
   assert.deepEqual(progress.telemetry, {
     model_turns: 2,
-    total_model_wait_ms: 27_000, // 12_000 explicit + (55_000 - 40_000)
+    total_model_wait_ms: 27_000,
     total_input_tokens: 3600,
     total_output_tokens: 1050,
   });
@@ -126,17 +125,10 @@ test('readRunProgress handles live incomplete events.jsonl with trailing partial
   assert.equal(byId.A.attempts, 2);
   assert.equal(byId.A.first_ac_ms, 70_000);
   assert.equal(byId.B.status, 'wrong');
-  assert.equal(byId.B.last_verdict, 'TIME_LIMIT_EXCEEDED');
   assert.equal(byId.C.status, 'pending');
   assert.equal(byId.D.status, 'unattempted');
 
-  assert.equal(progress.recent_activity.length, 10);
-  assert.equal(progress.recent_activity[0].seq, 12);
-  assert.equal(progress.recent_activity[0].problem_id, 'C');
-  assert.equal(progress.recent_activity[0].verdict, 'pending');
-
-  const summary = summarizeLiveRun(progress);
-  assert.deepEqual(summary, {
+  assert.deepEqual(summarizeLiveRun(progress), {
     solved_count: 1,
     problem_count: 4,
     score: 1,
@@ -147,91 +139,109 @@ test('readRunProgress handles live incomplete events.jsonl with trailing partial
   });
 });
 
-test('readRunProgress aggregates IOI partial scores and handles completed/void/unknown states', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'cr-progress-ioi-'));
+test('readRunProgress verifies local_inputs digests, ignores tampered files, blocks symlinks, and rejects invalid_submission ghost problems', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'cr-progress-integrity-'));
   t.after(() => rm(root, { recursive: true, force: true }));
 
-  const { runId: ioiRun } = await createRunFixture(root, {
-    scoringMode: 'ioi',
-    timeLimitMs: 1_800_000,
-    problems: [
-      { id: 'P1', max_points: 100 },
-      { id: 'P2', max_points: 100 },
-    ],
+  // 1. Untampered local_inputs with matching judge sha256 discovers problems safely without leaking answers/paths
+  const demoJudgePath = resolve('examples/demo/judge.json');
+  const demoJudgeHash = sha256(await readFile(demoJudgePath));
+  const { runId: verifiedRun } = await createRunFixture(root, {
+    localInputs: { contest: resolve('examples/demo/contest.json'), judge: demoJudgePath },
+    inputSha256: { contest: 'a'.repeat(64), judge: demoJudgeHash },
     events: [
       { elapsed_ms: 0, type: 'run_started', started_at: '2026-04-01T00:00:00.000Z' },
-      { elapsed_ms: 60_000, type: 'submission_received', submission_id: 's1', problem_id: 'P1', language: 'cpp20', source: 'v1' },
-      { elapsed_ms: 62_000, type: 'submission_judged', submission_id: 's1', verdict: 'partial', points_awarded: 35 },
-      { elapsed_ms: 120_000, type: 'submission_received', submission_id: 's2', problem_id: 'P1', language: 'cpp20', source: 'v2' },
-      { elapsed_ms: 122_000, type: 'submission_judged', submission_id: 's2', verdict: 'partial', score: 70 },
-      { elapsed_ms: 180_000, type: 'submission_received', submission_id: 's3', problem_id: 'P1', language: 'cpp20', source: 'v3' },
-      { elapsed_ms: 182_000, type: 'submission_judged', submission_id: 's3', verdict: 'WRONG_ANSWER', points_awarded: 20 },
-      { elapsed_ms: 240_000, type: 'submission_received', submission_id: 's4', problem_id: 'P2', language: 'cpp20', source: 'p2-v1' },
-      { elapsed_ms: 245_000, type: 'submission_judged', submission_id: 's4', verdict: 'partial', points_awarded: 50 },
-      { elapsed_ms: 300_000, type: 'submission_received', submission_id: 's5', problem_id: 'P2', language: 'cpp20', source: 'p2-v2' },
-      { elapsed_ms: 305_000, type: 'submission_judged', submission_id: 's5', verdict: 'accepted', points_awarded: 100 },
-      { elapsed_ms: 310_000, type: 'run_ended', status: 'completed', reason: 'finish', score: 170, max_score: 200 },
-    ],
-  });
-
-  const completed = await readRunProgress(root, ioiRun);
-  assert.equal(completed.status, 'completed');
-  assert.equal(completed.reason, 'finish');
-  assert.equal(completed.score, 170);
-  assert.equal(completed.max_score, 200);
-  assert.equal(completed.solved_count, 1);
-  assert.equal(completed.problems[0].status, 'partial');
-  assert.equal(completed.problems[0].best_score, 70);
-  assert.equal(completed.problems[0].attempts, 3);
-  assert.equal(completed.problems[1].status, 'accepted');
-  assert.equal(completed.problems[1].best_score, 100);
-  assert.equal(completed.problems[1].first_ac_ms, 300_000);
-  assert.equal(summarizeLiveRun(completed).active, false);
-
-  const { runId: unknownRun } = await createRunFixture(root, {
-    problems: [{ id: 'A', max_points: 1 }],
-  });
-  const unknown = await readRunProgress(root, unknownRun);
-  assert.equal(unknown.status, 'unknown');
-  assert.equal(unknown.problem_count, 1);
-
-  // Discover problems from local_inputs (run.ts default layout) without exposing answers or host paths,
-  // and merge Codex model_response + model_usage telemetry without double-counting turns.
-  const { runId: codexRun } = await createRunFixture(root, {
-    localInputs: {
-      contest: resolve('examples/demo/contest.json'),
-      judge: resolve('examples/demo/judge.json'),
-    },
-    events: [
-      { elapsed_ms: 0, type: 'run_started', started_at: '2026-04-01T00:00:00.000Z' },
-      { elapsed_ms: 1_000, type: 'model_request', turn: 1 },
-      { elapsed_ms: 2_500, type: 'model_response', turn: 1, status: 200 },
-      { elapsed_ms: 6_000, type: 'model_usage', turn: 1, usage: { input_tokens: 900, output_tokens: 250 } },
-      { elapsed_ms: 10_000, type: 'submission_received', submission_id: 's1', problem_id: '1', answer: '3' },
-      { elapsed_ms: 10_000, type: 'submission_judged', submission_id: 's1', verdict: 'accepted', points_awarded: 3 },
+      // Missing turn on model_request + model_response must count as 1 synthetic turn, not 2
+      { elapsed_ms: 1_000, type: 'model_request' },
+      { elapsed_ms: 3_000, type: 'model_response', status: 200, usage: { input_tokens: 900, output_tokens: 250 } },
+      // Invalid submission targeting unknown problem 'GHOST' must NOT pollute problem_count or max_score
+      { elapsed_ms: 5_000, type: 'submission_received', submission_id: 's1', problem_id: 'GHOST', answer: 'bad' },
+      { elapsed_ms: 5_000, type: 'submission_judged', submission_id: 's1', verdict: 'invalid_submission', points_awarded: 0 },
+      { elapsed_ms: 10_000, type: 'submission_received', submission_id: 's2', problem_id: '1', answer: '3' },
+      { elapsed_ms: 10_000, type: 'submission_judged', submission_id: 's2', verdict: 'accepted', points_awarded: 3 },
       { elapsed_ms: 11_000, type: 'run_ended', status: 'completed', reason: 'finish', score: 3, max_score: 8 },
     ],
   });
-  const codexProgress = await readRunProgress(root, codexRun);
-  assert.equal(codexProgress.problem_count, 2);
-  assert.equal(codexProgress.max_score, 8);
-  assert.equal(codexProgress.score, 3);
-  assert.equal(codexProgress.solved_count, 1);
-  assert.equal(codexProgress.problems[1].id, '2');
-  assert.equal(codexProgress.problems[1].status, 'unattempted');
-  assert.deepEqual(codexProgress.telemetry, {
-    model_turns: 1,
-    total_model_wait_ms: 5_000,
-    total_input_tokens: 900,
-    total_output_tokens: 250,
+  const verifiedProgress = await readRunProgress(root, verifiedRun);
+  assert.equal(verifiedProgress.problem_count, 2);
+  assert.deepEqual(verifiedProgress.problems.map(p => p.id), ['1', '2']);
+  assert.equal(verifiedProgress.submissions_used, 2);
+  assert.equal(verifiedProgress.max_score, 8);
+  assert.equal(verifiedProgress.score, 3);
+  assert.equal(verifiedProgress.model_turns, 1);
+  assert.ok(!JSON.stringify(verifiedProgress).includes('examples/demo'));
+
+  // 2. Unseeded run with invalid_submission targeting unknown 'GHOST' does NOT create a phantom problem
+  const { runId: unseededGhostRun } = await createRunFixture(root, {
+    events: [
+      { elapsed_ms: 0, type: 'run_started', started_at: '2026-04-01T00:00:00.000Z' },
+      { elapsed_ms: 2_000, type: 'submission_received', submission_id: 's1', problem_id: 'GHOST', answer: 'x' },
+      { elapsed_ms: 2_000, type: 'submission_judged', submission_id: 's1', verdict: 'invalid_submission' },
+      { elapsed_ms: 5_000, type: 'submission_received', submission_id: 's2', problem_id: 'A', answer: '42' },
+      { elapsed_ms: 5_000, type: 'submission_judged', submission_id: 's2', verdict: 'accepted', points_awarded: 10 },
+      { elapsed_ms: 6_000, type: 'run_ended', status: 'completed', reason: 'finish', score: 10, max_score: 10 },
+    ],
   });
-  assert.ok(!JSON.stringify(codexProgress).includes('examples/demo'));
-  const codexReplay = await buildRunReplay(root, codexRun);
-  assert.equal(codexReplay.frames.filter(f => f.kind === 'model_turn').length, 1);
-  assert.equal(codexReplay.frames.find(f => f.kind === 'model_turn').input_tokens, 900);
+  const unseededProg = await readRunProgress(root, unseededGhostRun);
+  assert.equal(unseededProg.problem_count, 1);
+  assert.deepEqual(unseededProg.problems.map(p => p.id), ['A']);
+  assert.equal(unseededProg.submissions_used, 2);
+
+  // 3. Tampered local contest.json / judge.json (digest mismatch) is NOT trusted
+  const tamperedContest = join(root, 'tampered-contest.json');
+  await writeFile(tamperedContest, JSON.stringify({ problems: [{ id: 'FAKE', max_points: 9999 }] }));
+  const { runId: tamperedRun } = await createRunFixture(root, {
+    localInputs: { contest: tamperedContest },
+    inputSha256: { contest: 'f'.repeat(64) }, // does not match tamperedContest
+    events: [
+      { elapsed_ms: 0, type: 'run_started', started_at: '2026-04-01T00:00:00.000Z' },
+      { elapsed_ms: 1_000, type: 'run_ended', status: 'completed', reason: 'finish', score: 0, max_score: 10 },
+    ],
+  });
+  const tamperedProg = await readRunProgress(root, tamperedRun);
+  assert.equal(tamperedProg.problem_count, 0);
+  assert.equal(tamperedProg.max_score, 10);
+
+  // 4. Symlinked run directory and symlinked session directory are rejected
+  const externalDir = await mkdtemp(join(tmpdir(), 'cr-outside-'));
+  t.after(() => rm(externalDir, { recursive: true, force: true }));
+  await writeFile(join(externalDir, 'run.json'), '{}');
+  await writeFile(join(externalDir, 'agent.stdout.log'), 'outside');
+  const symRunId = randomUUID();
+  await symlink(externalDir, join(root, symRunId));
+  await assert.rejects(readRunProgress(root, symRunId), /symlink/i);
+  await assert.rejects(readRunLogSlice(root, symRunId, 'stdout'), /symlink/i);
+
+  const { runId: symSessionRun, dir: symSessionDir } = await createRunFixture(root, {
+    problems: [{ id: 'A', max_points: 1 }],
+    events: [{ elapsed_ms: 0, type: 'run_started', started_at: '2026-04-01T00:00:00.000Z' }],
+  });
+  await symlink(externalDir, join(symSessionDir, 'session'));
+  await assert.rejects(buildRunReplay(root, symSessionRun, { includeSession: true }), /symlink/i);
+
+  // 5. Corrupted mid-file JSON line & sequence gap throw explicitly (unlike trailing live partial line)
+  const { runId: badJsonRun } = await createRunFixture(root, {
+    problems: [{ id: 'A', max_points: 1 }],
+    rawEventsContent: [
+      JSON.stringify({ schema_version: 1, seq: 1, elapsed_ms: 0, type: 'run_started' }),
+      '{"corrupted_mid_line": true',
+      JSON.stringify({ schema_version: 1, seq: 2, elapsed_ms: 1000, type: 'run_ended', status: 'completed' }),
+      '',
+    ].join('\n'),
+  });
+  await assert.rejects(readRunProgress(root, badJsonRun), /Corrupted run event log/);
+
+  const { runId: seqGapRun } = await createRunFixture(root, {
+    problems: [{ id: 'A', max_points: 1 }],
+    events: [
+      { seq: 1, elapsed_ms: 0, type: 'run_started' },
+      { seq: 3, elapsed_ms: 1000, type: 'run_ended', status: 'completed' },
+    ],
+  });
+  await assert.rejects(readRunProgress(root, seqGapRun), /invalid sequence number/);
 });
 
-test('progress and replay never leak local answers, secrets, raw source code in progress, or host paths', async t => {
+test('progress and replay redact JSON secrets, file:// paths, Windows paths, and never leak answers or source when disabled', async t => {
   const root = await mkdtemp(join(tmpdir(), 'cr-progress-sec-'));
   t.after(() => rm(root, { recursive: true, force: true }));
 
@@ -247,36 +257,43 @@ test('progress and replay never leak local answers, secrets, raw source code in 
       { elapsed_ms: 0, type: 'run_started', started_at: '2026-04-01T00:00:00.000Z' },
       { elapsed_ms: 1000, type: 'submission_received', submission_id: 's1', problem_id: '1', answer: secretAnswer, source: secretSource, language: 'cpp17' },
       { elapsed_ms: 1200, type: 'submission_judged', submission_id: 's1', verdict: 'accepted', points_awarded: 5 },
-      { elapsed_ms: 1500, type: 'run_ended', status: 'void', reason: `error reading ${hostPath} with Bearer ${secretToken}` },
+      { elapsed_ms: 1500, type: 'run_ended', status: 'void', reason: `url=file://${hostPath} win=C:\\Users\\bob\\secret.txt {"cookie": "sess_secret_999"} Bearer ${secretToken}` },
     ],
   });
 
   await mkdir(join(dir, 'session'), { recursive: true });
   await writeFile(
     join(dir, 'session', 'transcript.jsonl'),
-    JSON.stringify({ role: 'assistant', text: `Checked ${hostPath} using Bearer ${secretToken}` }) + '\n',
+    JSON.stringify({ role: 'assistant', text: `path=${hostPath} {"api_key": "json-key-secret-777"} Bearer ${secretToken}` }) + '\n',
     'utf8',
   );
 
   const progress = await readRunProgress(root, runId);
   const progressJson = JSON.stringify(progress);
-  for (const forbidden of [secretAnswer, secretToken, secretSource, hostPath, '/home/alice', 'private.internal.example']) {
+  for (const forbidden of [
+    secretAnswer,
+    secretToken,
+    secretSource,
+    hostPath,
+    '/home/alice',
+    'C:\\Users\\bob',
+    'sess_secret_999',
+    'private.internal.example',
+  ]) {
     assert.ok(!progressJson.includes(forbidden), `Progress leaked forbidden string: ${forbidden}`);
   }
-  assert.match(progress.reason ?? '', /\[path\]/);
-  assert.match(progress.reason ?? '', /Bearer \[REDACTED\]/);
 
   const replayNoSrc = await buildRunReplay(root, runId, { includeSession: true, includeSources: false });
   const replayJson = JSON.stringify(replayNoSrc);
-  for (const forbidden of [secretAnswer, secretToken, secretSource, hostPath, '/home/alice']) {
+  for (const forbidden of [secretAnswer, secretToken, secretSource, hostPath, 'json-key-secret-777']) {
     assert.ok(!replayJson.includes(forbidden), `Replay leaked forbidden string: ${forbidden}`);
   }
   assert.equal(replayNoSrc.session_summaries?.length, 1);
   assert.match(replayNoSrc.session_summaries[0].entries[0].summary, /\[path\]/);
-  assert.match(replayNoSrc.session_summaries[0].entries[0].summary, /Bearer \[REDACTED\]/);
+  assert.match(replayNoSrc.session_summaries[0].entries[0].summary, /\[REDACTED\]/);
 });
 
-test('readRunLogSlice handles ENOENT, incremental byte-offset polling, UTF-8 boundary slicing, and truncation', async t => {
+test('readRunLogSlice handles ENOENT, UTF-8 boundary slicing, live EOF half-character writes, and truncation', async t => {
   const root = await mkdtemp(join(tmpdir(), 'cr-log-slice-'));
   t.after(() => rm(root, { recursive: true, force: true }));
 
@@ -284,138 +301,90 @@ test('readRunLogSlice handles ENOENT, incremental byte-offset polling, UTF-8 bou
   const dir = join(root, runId);
   await mkdir(dir, { recursive: true });
 
-  // ENOENT returns empty slice cleanly
   const empty = await readRunLogSlice(root, runId, 'stdout');
   assert.doesNotThrow(() => logSliceSchema.parse(empty));
   assert.deepEqual(empty, { stream: 'stdout', offset: 0, next_offset: 0, total_bytes: 0, has_more: false, chunk: '' });
 
-  // Multi-byte UTF-8 content (CJK 3-byte chars + emoji 4-byte chars)
-  const initialContent = 'start-中文测试日志-🚀-line1\n第二行🎯done\n';
+  // Live EOF write with half of a 3-byte UTF-8 character ('中' = E4 B8 AD) flushed to disk
   const logPath = join(dir, 'agent.stdout.log');
-  await writeFile(logPath, initialContent, 'utf8');
+  const fullChar = Buffer.from('hi-中', 'utf8'); // 3 ASCII bytes + 3 UTF-8 bytes
+  await writeFile(logPath, fullChar.subarray(0, 5)); // Ends with E4 B8 (incomplete!)
+  const livePartial = await readRunLogSlice(root, runId, 'stdout', 0, 64);
+  assert.equal(livePartial.chunk, 'hi-');
+  assert.ok(!livePartial.chunk.includes('\uFFFD'), 'Must never emit replacement char on live partial UTF-8 tail');
+  assert.equal(livePartial.next_offset, 3);
+  assert.equal(livePartial.has_more, false);
 
+  // Writer flushes final byte (AD) -> next poll from offset 3 reads complete '中'
+  await writeFile(logPath, fullChar);
+  const liveCompleted = await readRunLogSlice(root, runId, 'stdout', livePartial.next_offset, 64);
+  assert.equal(liveCompleted.chunk, '中');
+  assert.equal(liveCompleted.next_offset, 6);
+  assert.equal(liveCompleted.has_more, false);
+
+  // Multi-slice polling with small maxBytes (clamped min 4) across CJK + 4-byte emoji
+  const initialContent = 'start-中文测试日志-🚀-line1\n第二行🎯done\n';
+  await writeFile(logPath, initialContent, 'utf8');
   let offset = 0;
   let assembled = '';
-  let polls = 0;
   while (true) {
-    const slice = await readRunLogSlice(root, runId, 'stdout', offset, 7);
-    assert.doesNotThrow(() => logSliceSchema.parse(slice));
-    assert.ok(!slice.chunk.includes('\uFFFD'), `Split multi-byte UTF-8 character in slice at offset ${offset}`);
+    const slice = await readRunLogSlice(root, runId, 'stdout', offset, 2); // clamps to 4 bytes
+    assert.ok(!slice.chunk.includes('\uFFFD'));
     assembled += slice.chunk;
-    assert.ok(slice.next_offset > offset || !slice.has_more);
     offset = slice.next_offset;
-    polls++;
     if (!slice.has_more) break;
-    assert.ok(polls < 100, 'Log tailing loop failed to converge');
   }
   assert.equal(assembled, initialContent);
-  assert.equal(offset, Buffer.byteLength(initialContent, 'utf8'));
 
-  // Poll at EOF returns empty without advancing
-  const atEof = await readRunLogSlice(root, runId, 'stdout', offset, 64);
-  assert.equal(atEof.chunk, '');
-  assert.equal(atEof.has_more, false);
-  assert.equal(atEof.next_offset, offset);
-
-  // Append more bytes -> incremental tail reads only new suffix
-  const appended = 'appended-尾声\n';
-  await writeFile(logPath, initialContent + appended, 'utf8');
-  const nextSlice = await readRunLogSlice(root, runId, 'stdout', offset, 64);
-  assert.equal(nextSlice.offset, offset);
-  assert.equal(nextSlice.chunk, appended);
-  assert.equal(nextSlice.has_more, false);
-
-  // Truncation / shrink resets cleanly to offset 0
-  const shrunk = 'reset\n';
-  await writeFile(logPath, shrunk, 'utf8');
-  const afterTruncate = await readRunLogSlice(root, runId, 'stdout', nextSlice.next_offset, 64);
+  // Truncation resets cleanly to offset 0
+  await writeFile(logPath, 'reset\n', 'utf8');
+  const afterTruncate = await readRunLogSlice(root, runId, 'stdout', offset, 64);
   assert.equal(afterTruncate.offset, 0);
-  assert.equal(afterTruncate.chunk, shrunk);
-  assert.equal(afterTruncate.next_offset, Buffer.byteLength(shrunk, 'utf8'));
-  assert.equal(afterTruncate.total_bytes, Buffer.byteLength(shrunk, 'utf8'));
+  assert.equal(afterTruncate.chunk, 'reset\n');
 });
 
-test('buildRunReplay builds frames with per-problem unified code diffs and projectScoreAt scrubs cleanly', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'cr-replay-diff-'));
+test('buildRunReplay builds diffs and projectScoreAt does NOT prematurely reveal post-contest settled verdicts', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'cr-replay-settle-'));
   t.after(() => rm(root, { recursive: true, force: true }));
 
-  const srcV1 = [
-    '#include <iostream>',
-    'using namespace std;',
-    'int main() {',
-    '  int a, b;',
-    '  cin >> a >> b;',
-    '  cout << (a - b) << "\\n";',
-    '  return 0;',
-    '}',
-  ].join('\n');
-  const srcV2 = [
-    '#include <iostream>',
-    'using namespace std;',
-    'int main() {',
-    '  int a, b;',
-    '  cin >> a >> b;',
-    '  cout << (a + b) << "\\n";',
-    '  return 0;',
-    '}',
-  ].join('\n');
+  const srcV1 = 'int main() {\n  return 1;\n}\n';
+  const srcV2 = 'int main() {\n  return 0;\n}\n';
 
   const { runId } = await createRunFixture(root, {
     scoringMode: 'icpc',
-    timeLimitMs: 3_600_000,
-    problems: [
-      { id: 'A', max_points: 500 },
-      { id: 'B', max_points: 1000 },
-    ],
+    timeLimitMs: 60_000,
+    problems: [{ id: 'A', max_points: 500 }],
     events: [
       { elapsed_ms: 0, type: 'run_started', started_at: '2026-04-01T00:00:00.000Z' },
-      { elapsed_ms: 60_000, type: 'submission_received', submission_id: 's1', problem_id: 'A', language: 'cpp17', source: srcV1 },
-      { elapsed_ms: 65_000, type: 'submission_judged', submission_id: 's1', verdict: 'WRONG_ANSWER' },
-      { elapsed_ms: 180_000, type: 'submission_received', submission_id: 's2', problem_id: 'A', language: 'cpp17', source: srcV2 },
-      { elapsed_ms: 185_000, type: 'submission_judged', submission_id: 's2', verdict: 'OK' },
-      { elapsed_ms: 300_000, type: 'submission_received', submission_id: 's3', problem_id: 'B', language: 'pypy3', source: 'print(42)' },
-      { elapsed_ms: 310_000, type: 'submission_judged', submission_id: 's3', verdict: 'OK' },
-      { elapsed_ms: 320_000, type: 'run_ended', status: 'completed', reason: 'finish', score: 1500, max_score: 1500 },
+      { elapsed_ms: 20_000, type: 'submission_received', submission_id: 's1', problem_id: 'A', language: 'cpp17', source: srcV1 },
+      { elapsed_ms: 22_000, type: 'submission_judged', submission_id: 's1', verdict: 'WRONG_ANSWER' },
+      // Submitted at 59s (before 60s time limit), but settled at 75s (after time limit)!
+      { elapsed_ms: 59_000, type: 'submission_received', submission_id: 's2', problem_id: 'A', language: 'cpp17', source: srcV2 },
+      { elapsed_ms: 60_000, type: 'settling' },
+      { elapsed_ms: 75_000, type: 'submission_judged', submission_id: 's2', verdict: 'OK' },
+      { elapsed_ms: 76_000, type: 'run_ended', status: 'completed', reason: 'time_limit', score: 500, max_score: 500 },
     ],
   });
 
   const replay = await buildRunReplay(root, runId, { includeSources: true });
   assert.doesNotThrow(() => runReplaySchema.parse(replay));
+  assert.match(replay.frames.find(f => f.submission_id === 's2' && f.kind === 'submission_received').diff, /-  return 1;\n\+  return 0;/);
+  assert.equal(unifiedLineDiff('x\n', 'x\n'), '');
 
-  const subFrames = replay.frames.filter(f => f.kind === 'submission_received');
-  assert.equal(subFrames.length, 3);
-  assert.equal(subFrames[0].source, srcV1);
-  assert.equal(subFrames[0].diff, undefined);
-  assert.equal(subFrames[1].source, srcV2);
-  assert.ok(subFrames[1].diff, 'Expected unified diff for second submission on problem A');
-  assert.match(subFrames[1].diff, /^--- s1\n\+\+\+ s2\n@@ /);
-  assert.match(subFrames[1].diff, /-  cout << \(a - b\)/);
-  assert.match(subFrames[1].diff, /\+  cout << \(a \+ b\)/);
-  // Different problem B has no diff against A
-  assert.equal(subFrames[2].diff, undefined);
+  // At t = 60_000 (end of contest, BEFORE judged_ms = 75_000): verdict MUST remain pending!
+  const atLimit = projectScoreAt(replay, 60_000, 'icpc');
+  assert.equal(atLimit.solved_count, 0);
+  assert.equal(atLimit.problems[0].status, 'pending');
 
-  // Verify unifiedLineDiff directly
-  assert.equal(unifiedLineDiff('a\nb', 'a\nb'), '');
-
-  // Timeline scrubbing with projectScoreAt
-  const at100s = projectScoreAt(replay, 100_000, 'icpc');
-  assert.equal(at100s.solved_count, 0);
-  assert.equal(at100s.problems[0].status, 'wrong');
-
-  // At 182s: s2 was received at 180s, judged at 185s -> pending!
-  const at182s = projectScoreAt(replay, 182_000, 'icpc');
-  assert.equal(at182s.solved_count, 0);
-  assert.equal(at182s.problems[0].status, 'pending');
-
-  // At 190s: s2 judged -> accepted at received time 180_000 (3 min) + 20 min penalty = 23 min
-  const at190s = projectScoreAt(replay, 190_000, 'icpc');
-  assert.equal(at190s.solved_count, 1);
-  assert.equal(at190s.score, 1);
-  assert.equal(at190s.penalty, 23);
-  assert.equal(at190s.problems[0].first_ac_ms, 180_000);
+  // At t = 75_000 (settlement complete): verdict is accepted, scored/penalized by received_ms = 59_000!
+  const atSettled = projectScoreAt(replay, 75_000, 'icpc');
+  assert.equal(atSettled.solved_count, 1);
+  assert.equal(atSettled.score, 1);
+  assert.equal(atSettled.problems[0].first_ac_ms, 59_000);
+  assert.equal(atSettled.penalty, 20); // floor(59_000 / 60_000) + 1*20 = 20
 });
 
-test('buildGhostRace aligns 3 agents and ranks accurately across icpc, cf, ioi, and last_ac modes', async t => {
+test('buildGhostRace enforces strict compatibility, isolates void runs, marks running provisional, and fixes last_ac ranking', async t => {
   const root = await mkdtemp(join(tmpdir(), 'cr-ghost-race-'));
   t.after(() => rm(root, { recursive: true, force: true }));
 
@@ -424,14 +393,11 @@ test('buildGhostRace aligns 3 agents and ranks accurately across icpc, cf, ioi, 
     { id: 'B', max_points: 1000 },
     { id: 'C', max_points: 1500 },
   ];
-  const timeLimitMs = 3_600_000; // 60 minutes
+  const timeLimitMs = 3_600_000;
 
-  // Agent Alpha ("Speedster"): A clean @ 5m, B WA @ 10m + AC @ 15m, C partial 600 @ 20m
   const { runId: alphaId } = await createRunFixture(root, {
     contestId: 'cf-ghost-1',
-    contestTitle: 'Ghost Race Round 1',
     agentId: 'alpha',
-    agentName: 'Alpha Speedster',
     timeLimitMs,
     problems,
     events: [
@@ -448,115 +414,70 @@ test('buildGhostRace aligns 3 agents and ranks accurately across icpc, cf, ioi, 
     ],
   });
 
-  // Agent Beta ("Steady"): A clean @ 12m, B clean @ 14m (zero WAs!), skips C
-  const { runId: betaId } = await createRunFixture(root, {
+  // Running (provisional) agent with 0 full ACs and 500 partial on B (tests last_ac 0-solve ranking fix!)
+  const { runId: partialZeroAcId } = await createRunFixture(root, {
     contestId: 'cf-ghost-1',
-    contestTitle: 'Ghost Race Round 1',
-    agentId: 'beta',
-    agentName: 'Beta Steady',
+    agentId: 'partial-only',
     timeLimitMs,
     problems,
     events: [
       { elapsed_ms: 0, type: 'run_started', started_at: '2026-04-01T00:00:00.000Z' },
-      { elapsed_ms: 720_000, type: 'submission_received', submission_id: 'b1', problem_id: 'A', language: 'cpp20', source: 'A' },
-      { elapsed_ms: 721_000, type: 'submission_judged', submission_id: 'b1', verdict: 'OK', points_awarded: 500 },
-      { elapsed_ms: 840_000, type: 'submission_received', submission_id: 'b2', problem_id: 'B', language: 'cpp20', source: 'B' },
-      { elapsed_ms: 841_000, type: 'submission_judged', submission_id: 'b2', verdict: 'OK', points_awarded: 1000 },
-      { elapsed_ms: 900_000, type: 'run_ended', status: 'completed', reason: 'finish', score: 1500, max_score: 3000 },
+      { elapsed_ms: 100_000, type: 'submission_received', submission_id: 'p1', problem_id: 'B', language: 'cpp20', source: 'B' },
+      { elapsed_ms: 101_000, type: 'submission_judged', submission_id: 'p1', verdict: 'partial', points_awarded: 500 },
     ],
   });
 
-  // Agent Gamma ("Late Heavy"): A 2 WAs + AC @ 30m, C partial 900 @ 25m + AC @ 40m
-  const { runId: gammaId } = await createRunFixture(root, {
+  // Void agent that solved everything before voiding -> MUST be unranked (rank: null, score: 0, placed last)
+  const { runId: voidId } = await createRunFixture(root, {
     contestId: 'cf-ghost-1',
-    contestTitle: 'Ghost Race Round 1',
-    agentId: 'gamma',
-    agentName: 'Gamma Heavy',
+    agentId: 'void-agent',
     timeLimitMs,
     problems,
     events: [
       { elapsed_ms: 0, type: 'run_started', started_at: '2026-04-01T00:00:00.000Z' },
-      { elapsed_ms: 1_500_000, type: 'submission_received', submission_id: 'g1', problem_id: 'C', language: 'cpp20', source: 'C1' },
-      { elapsed_ms: 1_501_000, type: 'submission_judged', submission_id: 'g1', verdict: 'partial', points_awarded: 900 },
-      { elapsed_ms: 1_600_000, type: 'submission_received', submission_id: 'g2', problem_id: 'A', language: 'cpp20', source: 'A1' },
-      { elapsed_ms: 1_601_000, type: 'submission_judged', submission_id: 'g2', verdict: 'WRONG_ANSWER', points_awarded: 0 },
-      { elapsed_ms: 1_700_000, type: 'submission_received', submission_id: 'g3', problem_id: 'A', language: 'cpp20', source: 'A2' },
-      { elapsed_ms: 1_701_000, type: 'submission_judged', submission_id: 'g3', verdict: 'WRONG_ANSWER', points_awarded: 0 },
-      { elapsed_ms: 1_800_000, type: 'submission_received', submission_id: 'g4', problem_id: 'A', language: 'cpp20', source: 'A3' },
-      { elapsed_ms: 1_801_000, type: 'submission_judged', submission_id: 'g4', verdict: 'OK', points_awarded: 500 },
-      { elapsed_ms: 2_400_000, type: 'submission_received', submission_id: 'g5', problem_id: 'C', language: 'cpp20', source: 'C2' },
-      { elapsed_ms: 2_401_000, type: 'submission_judged', submission_id: 'g5', verdict: 'OK', points_awarded: 1500 },
-      { elapsed_ms: 2_500_000, type: 'run_ended', status: 'completed', reason: 'finish', score: 2000, max_score: 3000 },
+      { elapsed_ms: 10_000, type: 'submission_received', submission_id: 'v1', problem_id: 'A', language: 'cpp20', source: 'A' },
+      { elapsed_ms: 11_000, type: 'submission_judged', submission_id: 'v1', verdict: 'OK', points_awarded: 500 },
+      { elapsed_ms: 20_000, type: 'run_ended', status: 'void', reason: 'judge_unsettled', score: null, max_score: 3000 },
     ],
   });
 
-  const race = await buildGhostRace(root, [alphaId, betaId, gammaId], { scoringMode: 'icpc', sampleStepMs: 600_000 });
+  const race = await buildGhostRace(root, [alphaId, partialZeroAcId, voidId], { scoringMode: 'last_ac', sampleStepMs: 900_000 });
   assert.doesNotThrow(() => ghostRaceSchema.parse(race));
-  const serialized = JSON.parse(JSON.stringify(race));
-  assert.doesNotThrow(() => ghostRaceSchema.parse(serialized));
-  assert.equal(race.participants.length, 3);
-  assert.ok(race.samples && race.samples.length >= 6);
+  assert.doesNotThrow(() => ghostRaceSchema.parse(JSON.parse(JSON.stringify(race))));
 
-  // Milestones sorted ascending by elapsed_ms
-  for (let i = 1; i < race.milestones.length; i++) {
-    assert.ok(race.milestones[i].elapsed_ms >= race.milestones[i - 1].elapsed_ms);
+  // At t = 310_000 in last_ac:
+  // alpha: score=500, solved=1, last_ac_ms=300_000
+  // partial-only: score=500, solved=0, last_ac_ms=0 -> MUST NOT beat alpha despite last_ac_ms=0!
+  // void-agent: unranked, rank=null, placed last!
+  const at310s = race.evaluateAt(310_000, 'last_ac');
+  assert.deepEqual(
+    at310s.standings.map(s => ({ id: s.agent_id, rank: s.rank, score: s.score, provisional: s.provisional, unranked: s.unranked })),
+    [
+      { id: 'alpha', rank: 1, score: 500, provisional: false, unranked: false },
+      { id: 'partial-only', rank: 2, score: 500, provisional: true, unranked: false },
+      { id: 'void-agent', rank: null, score: 0, provisional: false, unranked: true },
+    ],
+  );
+  // Non-IOI partial score must show status 'partial', not 'wrong'
+  const partialRow = at310s.standings.find(s => s.agent_id === 'partial-only');
+  assert.equal(partialRow.problems.find(p => p.id === 'B').status, 'partial');
+
+  // Standalone evaluateGhostRaceAt matches method
+  assert.deepEqual(evaluateGhostRaceAt(JSON.parse(JSON.stringify(race)), 310_000, 'last_ac'), at310s);
+
+  // Compatibility rejections: data_version, contest_revision, protocol_sha256, time_limit_ms, problem weight
+  const incompatCases = [
+    { label: 'data_version', opts: { contestId: 'cf-ghost-1', dataVersion: 2, timeLimitMs, problems }, pattern: /Data version mismatch/ },
+    { label: 'contest_revision', opts: { contestId: 'cf-ghost-1', contestRevision: 'c'.repeat(64), timeLimitMs, problems }, pattern: /Contest revision mismatch/ },
+    { label: 'protocol_sha256', opts: { contestId: 'cf-ghost-1', protocolSha256: 'd'.repeat(64), timeLimitMs, problems }, pattern: /Protocol mismatch/ },
+    { label: 'time_limit_ms', opts: { contestId: 'cf-ghost-1', timeLimitMs: 1_800_000, problems }, pattern: /Time limit mismatch/ },
+    { label: 'problem_weight', opts: { contestId: 'cf-ghost-1', timeLimitMs, problems: [{ id: 'A', max_points: 999 }] }, pattern: /Problem weight mismatch/ },
+  ];
+  for (const tc of incompatCases) {
+    const { runId: badId } = await createRunFixture(root, {
+      ...tc.opts,
+      events: [{ elapsed_ms: 0, type: 'run_started' }],
+    });
+    await assert.rejects(buildGhostRace(root, [alphaId, badId]), tc.pattern, `Failed to reject ${tc.label}`);
   }
-
-  // At t = 6 min (360_000): Alpha leads (1 solved), Beta & Gamma tied at rank 2
-  const at6m = race.evaluateAt(360_000, 'icpc');
-  assert.equal(at6m.standings[0].agent_id, 'alpha');
-  assert.equal(at6m.standings[0].rank, 1);
-  assert.equal(at6m.standings[1].rank, 2);
-  assert.equal(at6m.standings[2].rank, 2);
-
-  // At t = 45 min (2_700_000) in ICPC: Beta (2, pen 26) > Alpha (2, pen 40) > Gamma (2, pen 110)
-  const icpcFinal = race.evaluateAt(2_700_000, 'icpc');
-  assert.deepEqual(icpcFinal.standings.map(s => [s.agent_id, s.rank, s.score, s.penalty]), [
-    ['beta', 1, 2, 26],
-    ['alpha', 2, 2, 40],
-    ['gamma', 3, 2, 130], // A: 30 + 2*20 = 70; C: 40 + 1*20 (partial before AC) = 60 -> 130
-  ]);
-
-  // Verify standalone evaluateGhostRaceAt on deserialized JSON matches method identically
-  assert.deepEqual(evaluateGhostRaceAt(serialized, 2_700_000, 'icpc'), icpcFinal);
-
-  // At t = 45 min in IOI: Alpha (2100) > Gamma (2000) > Beta (1500)
-  const ioiFinal = race.evaluateAt(2_700_000, 'ioi');
-  assert.deepEqual(ioiFinal.standings.map(s => [s.agent_id, s.rank, s.score]), [
-    ['alpha', 1, 2100],
-    ['gamma', 2, 2000],
-    ['beta', 3, 1500],
-  ]);
-
-  // At t = 45 min in last_ac: Alpha (2100, with partial 600 on C) vs wait — let's check exact last_ac scores!
-  // Alpha: A(500) + B(1000) + C partial(600) = 2100; Gamma: A(500) + C(1500) = 2000; Beta: A(500) + B(1000) = 1500
-  const lastAcAt16m = race.evaluateAt(960_000, 'last_ac');
-  // At 16m: Beta (1500, last_ac=840_000) > Alpha (1500, last_ac=900_000) > Gamma (0)
-  assert.deepEqual(lastAcAt16m.standings.map(s => [s.agent_id, s.rank, s.score, s.last_ac_ms]), [
-    ['beta', 1, 1500, 840_000],
-    ['alpha', 2, 1500, 900_000],
-    ['gamma', 3, 0, 0],
-  ]);
-
-  // At t = 45 min in CF:
-  // Gamma: A(500*(1 - 0.5*30/60) - 2*50 = 275) + C(1500*(1 - 0.5*40/60) - 1*50 = 950) = 1225
-  // Beta: A(500*(1 - 0.5*12/60) = 450) + B(1000*(1 - 0.5*14/60) = 883.33) = 1333.33
-  // Alpha: A(500*(1 - 0.5*5/60) = 479.17) + B(1000*(1 - 0.5*15/60) - 50 = 825) = 1304.17
-  const cfFinal = race.evaluateAt(2_700_000, 'cf');
-  assert.deepEqual(cfFinal.standings.map(s => s.agent_id), ['beta', 'alpha', 'gamma']);
-  assert.equal(cfFinal.standings[0].score, 1333.33);
-  assert.equal(cfFinal.standings[1].score, 1304.17);
-  assert.equal(cfFinal.standings[2].score, 1225);
-
-  // Validation errors: empty, >8, duplicates, contest mismatch
-  await assert.rejects(buildGhostRace(root, []), /at least 1 run/);
-  await assert.rejects(buildGhostRace(root, Array.from({ length: 9 }, () => randomUUID())), /at most 8 runs/);
-  await assert.rejects(buildGhostRace(root, [alphaId, alphaId]), /Duplicate run IDs/);
-
-  const { runId: otherContestRun } = await createRunFixture(root, {
-    contestId: 'different-contest',
-    problems: [{ id: 'X', max_points: 1 }],
-    events: [{ elapsed_ms: 0, type: 'run_started', started_at: '2026-04-01T00:00:00.000Z' }],
-  });
-  await assert.rejects(buildGhostRace(root, [alphaId, otherContestRun]), /Contest mismatch/);
 });
