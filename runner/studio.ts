@@ -6,19 +6,25 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { makePlan, type Plan } from './plan.js';
 import { dispatch, enqueue, listBatches, lookupRun, readRunLog, requestBatchStop, requestRunCancel, summarize, type QueueOptions } from './queue.js';
 import { page, browserCode } from './studio-page.js';
+import { Connections } from './connections.js';
+import { configError, configRoute, isConfigRoute } from './studio-config-api.js';
 
 class HttpError extends Error { constructor(readonly status: number, message: string) { super(message); } }
-async function body(req: IncomingMessage) {
+async function body(req: IncomingMessage, limit = 64 * 1024) {
   if (req.headers['content-type']?.split(';')[0] !== 'application/json') throw new HttpError(415, 'Expected application/json');
-  if (Number(req.headers['content-length'] ?? 0) > 64 * 1024) throw new HttpError(413, 'Request too large');
+  if (Number(req.headers['content-length'] ?? 0) > limit) throw new HttpError(413, 'Request too large');
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     size += (chunk as Buffer).length;
-    if (size > 64 * 1024) throw new HttpError(413, 'Request too large');
+    if (size > limit) throw new HttpError(413, 'Request too large');
     chunks.push(chunk as Buffer);
   }
-  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
+  let data: unknown;
+  try { data = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+  catch { throw new HttpError(400, 'Invalid JSON'); }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) throw new HttpError(400, 'Expected JSON object');
+  return data as Record<string, unknown>;
 }
 function reply(res: ServerResponse, status: number, content: string, type = 'application/json; charset=utf-8') {
   res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
@@ -26,7 +32,9 @@ function reply(res: ServerResponse, status: number, content: string, type = 'app
     'Referrer-Policy': 'no-referrer' });
   res.end(content);
 }
-export async function startStudio(root: string, port = 0, opts: { base?: string; getImage?: Parameters<typeof makePlan>[2]; queue?: QueueOptions } = {}) {
+export async function startStudio(root: string, port = 0, opts: { base?: string; getImage?: Parameters<typeof makePlan>[2]; queue?: QueueOptions; store?: Connections } = {}) {
+  const base = resolve(opts.base ?? process.cwd());
+  const store = opts.store ?? new Connections();
   const plans = new Map<string, Plan>();
   const control = new AbortController();
   let worker: Promise<unknown> | undefined;
@@ -37,7 +45,7 @@ export async function startStudio(root: string, port = 0, opts: { base?: string;
     if (worker || control.signal.aborted) throw new HttpError(409, 'Studio is already running a batch or shutting down');
     lastError = null;
     const id = start();
-    const task = id.then(batchId => dispatch(root, batchId, control.signal, opts.queue));
+    const task = id.then(batchId => dispatch(root, batchId, control.signal, { ...opts.queue, store }));
     worker = task.catch(error => { lastError = error instanceof Error ? error.message : 'Batch failed'; })
       .finally(() => { worker = undefined; });
     return id;
@@ -47,10 +55,20 @@ export async function startStudio(root: string, port = 0, opts: { base?: string;
       if (req.headers.host !== host) throw new HttpError(403, 'Invalid host');
       const origin = req.headers.origin;
       if ((origin && origin !== `http://${host}`) || req.headers['sec-fetch-site'] === 'cross-site') throw new HttpError(403, 'Invalid origin');
-      if (req.method === 'POST' && (origin !== `http://${host}` || req.headers['x-cr-studio'] !== '1')) throw new HttpError(403, 'Same-origin Studio requests only');
+      if (['POST', 'PATCH', 'DELETE'].includes(req.method ?? '') && (origin !== `http://${host}` || req.headers['x-cr-studio'] !== '1')) throw new HttpError(403, 'Same-origin Studio requests only');
       const path = new URL(req.url ?? '/', 'http://' + host).pathname;
       if (req.method === 'GET' && path === '/') return reply(res, 200, page, 'text/html; charset=utf-8');
       if (req.method === 'GET' && path === '/studio.js') return reply(res, 200, browserCode, 'text/javascript; charset=utf-8');
+      if (isConfigRoute(path)) {
+        try {
+          const result = await configRoute(path, req, { root, base, store, signal: control.signal, getImage: opts.getImage }, () => body(req, 512 * 1024));
+          return json(res, result.data, result.status);
+        } catch (error) {
+          if (error instanceof HttpError) return json(res, { error: error.message, issues: [] }, error.status);
+          const { status, ...failure } = configError(error);
+          return json(res, path === '/api/agents/validate' ? { valid: false, ...failure, warnings: [] } : failure, status);
+        }
+      }
       if (req.method === 'GET' && path === '/api/batches') {
         const batches = (await listBatches(root)).map(summarize);
         return json(res, { batches, error: lastError, busy: !!worker });
@@ -69,7 +87,7 @@ export async function startStudio(root: string, port = 0, opts: { base?: string;
         return json(res, await exportBatch(root, exported[1]!));
       }
       if (req.method === 'POST' && path === '/api/plan') {
-        const plan = await makePlan(await body(req), opts.base ?? process.cwd(), opts.getImage);
+        const plan = await makePlan(await body(req), base, opts.getImage, store);
         while (plans.size >= 8) plans.delete(plans.keys().next().value!);
         const token = randomUUID();
         plans.set(token, plan);

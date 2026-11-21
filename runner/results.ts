@@ -11,12 +11,17 @@ const submission = z.strictObject({ id: z.string(), problem_id: z.string(), elap
 export const resultSchema = z.strictObject({ run_id: z.uuid(), contest_id: z.string(), contest_title: z.string().optional(),
   data_version: count, contest_revision: digest, protocol_id: z.string(), protocol_version: count, protocol_sha256: digest,
   agent_id: z.string(), agent_revision: digest, harness: z.object({ kind: z.string(), version: z.string() }).strict(),
-  model: z.strictObject({ requested: z.string(), observed: z.array(z.string()), family: z.string().optional(), reasoning_effort: z.string().optional() }),
+  model: z.strictObject({ requested: z.string(), observed: z.array(z.string()), family: z.string().optional(), vendor: z.string().optional(), reasoning_effort: z.string().optional() }),
   score: count, max_score: count, submissions: z.array(submission) });
-export const resultsSchema = z.strictObject({ schema_version: z.literal(1), results: z.array(resultSchema) });
+const v1ResultSchema = resultSchema.extend({ model: resultSchema.shape.model.omit({ vendor: true }) });
+export const resultsSchema = z.discriminatedUnion('schema_version', [
+  z.strictObject({ schema_version: z.literal(1), results: z.array(v1ResultSchema) }),
+  z.strictObject({ schema_version: z.literal(2), results: z.array(resultSchema) }),
+]);
+export const resultBundle = (results: z.infer<typeof resultSchema>[]) => ({ schema_version: 2 as const, results });
 const metadata = resultSchema.omit({ score: true, max_score: true, submissions: true, model: true }).strip().extend({
   contest_revision: digest.optional(),
-  input_sha256: z.object({ contest: digest }), model: z.object({ model: z.string(), model_family_id: z.string().optional(), reasoning_effort: z.string().optional() }),
+  input_sha256: z.object({ contest: digest }), model: z.object({ model: z.string(), model_family_id: z.string().optional(), vendor: z.string().optional(), reasoning_effort: z.string().optional() }),
 });
 export async function exportRun(root: string, id: string) {
   const directory = join(root, z.uuid().parse(id));
@@ -39,13 +44,13 @@ export async function exportRun(root: string, id: string) {
   } finally { lines.close(); }
   if (terminal?.status !== 'completed') throw new Error(`Run ${id} did not complete`);
   return resultSchema.parse({ ...meta, contest_revision: meta.contest_revision ?? input_sha256.contest, score: terminal.score, max_score: terminal.max_score,
-    model: { requested: model.model, observed: [...observed], family: model.model_family_id, reasoning_effort: model.reasoning_effort }, submissions: [...rows.values()] });
+    model: { requested: model.model, observed: [...observed], family: model.model_family_id, vendor: model.vendor, reasoning_effort: model.reasoning_effort }, submissions: [...rows.values()] });
 }
 export async function exportBatch(root: string, batchId: string) {
   const batch = await getBatch(root, batchId);
   const results = [];
   for (const job of batch.jobs) if (job.status === 'completed') results.push(await exportRun(root, job.run_id!));
-  return { schema_version: 1, results };
+  return resultBundle(results);
 }
 export function mergeResults(bundles: unknown[]) {
   const results = new Map<string, z.infer<typeof resultSchema>>();
@@ -54,12 +59,12 @@ export function mergeResults(bundles: unknown[]) {
     if (current && JSON.stringify(current) !== JSON.stringify(result)) throw new Error(`Conflicting run ${result.run_id}`);
     results.set(result.run_id, result);
   }
-  return { schema_version: 1, results: [...results.values()] };
+  return resultBundle([...results.values()]);
 }
-export function rankResults(bundle: unknown, family?: string) {
+export function rankResults(bundle: unknown, family?: string, vendor?: string) {
   const group = new Map<string, z.infer<typeof resultSchema>[]>();
   for (const result of resultsSchema.parse(bundle).results) {
-    if (family && result.model.family !== family) continue;
+    if ((family && result.model.family !== family) || (vendor && (!('vendor' in result.model) || result.model.vendor !== vendor))) continue;
     const key = JSON.stringify([result.contest_id, result.data_version, result.contest_revision, result.protocol_id, result.protocol_version, result.protocol_sha256]);
     const rows = group.get(key) ?? [];
     rows.push(result); group.set(key, rows);

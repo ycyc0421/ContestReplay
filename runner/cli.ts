@@ -2,19 +2,23 @@
 import { parseArgs } from 'node:util';
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { Connections, createConnectionSchema, rotateConnectionSchema } from './connections.js';
 import { loadAgent, loadContest, modelKey } from './config.js';
 import { makePlan, planFromFile, planSchema, readJson } from './plan.js';
-import { saveAgent, saveContest, codeforcesContest } from './author.js';
-import { exportBatch, exportRun, mergeResults, rankResults } from './results.js';
+import { saveAgent, saveAgentManifest, saveContest, codeforcesContest } from './author.js';
+import { agentKind } from './agent-manifest.js';
+import { harness, harnessKind } from './harnesses.js';
+import { exportBatch, exportRun, mergeResults, rankResults, resultBundle } from './results.js';
 import { dispatch, enqueue, getBatch, listBatches, lookupRun, readRunLog, requestBatchStop, requestRunCancel, summarize, workdir } from './queue.js';
 
 const usage = `Usage:
-  cr bench run <contest.json> --agent <agent.toml> [--out <dir>]
+  cr bench run <contest.json> --agent <agent.toml|agent.yaml|agent.json> [--out <dir>]
   cr contest init <contest.json> --pdf <relative-path> --answers <relative-path> [--id <id>] [--title <title>]
   cr contest import-codeforces <contest.json> --contest <number> --pdf <path> --handle <handle> --languages <json>
   cr contest validate <contest.json>
+  cr agent init <agent.toml|agent.yaml|agent.json> --id <id> --harness <kind> --model <model> --provider <id> [--vendor <id>] [--reasoning-effort <level>] [--temperature <value>]
   cr agent init <agent.toml> --id <id> --harness <kind> --model <model> [--api <protocol>] [--base-url <url>] [--key-env <name>] [--reasoning-effort <level>] [--family <id>]
-  cr agent validate <agent.toml>
+  cr agent validate <agent.toml|agent.yaml|agent.json>
   cr batch plan <batch.json> [--out <plan.json>]
   cr batch run <plan.json> [--workspace <dir>] [--json]
   cr batch resume <batch-id> [--workspace <dir>] [--json]
@@ -25,7 +29,10 @@ const usage = `Usage:
   cr run cancel <run-id> [--workspace <dir>]
   cr results export (--batch <id> | --run <id>) [--workspace <dir>] [--out <file>]
   cr results merge <results.json>... [--out <file>]
-  cr results rank <results.json> [--family <id>]
+  cr results rank <results.json> [--vendor <id>] [--family <legacy-id>]
+  cr provider add <id> [--label <label>] --base-url <url> --secret-stdin
+  cr provider rotate <id> --secret-stdin
+  cr connection add|rotate ...  # legacy alias
   cr studio [--workspace <dir>] [--port <number>]`;
 const str = { type: 'string' } as const;
 const bool = { type: 'boolean' } as const;
@@ -49,7 +56,7 @@ async function main(args: string[]) {
   try {
     const [group, command, ...rest] = args;
     if (!group || args.includes('--help') || args.includes('-h') ||
-        (args.length === 1 && ['bench', 'batch', 'run', 'contest', 'agent'].includes(group))) {
+        (args.length === 1 && ['bench', 'batch', 'run', 'contest', 'agent', 'connection', 'provider'].includes(group))) {
       console.log(usage); return 0;
     }
     if (group === 'bench' && command === 'run') {
@@ -58,7 +65,7 @@ async function main(args: string[]) {
       const file = position(positionals)!;
       if (!values.agent || values.out === '') throw new Error(usage);
       const root = workdir(values.out);
-      modelKey((await loadAgent(values.agent)).profile);
+      await modelKey(await loadAgent(values.agent));
       const plan = await makePlan({ schema_version: 1, agents: [values.agent], contests: [file] }, process.cwd());
       const { id: batchId } = await enqueue(root, plan);
       const batch = await abortable(signal => dispatch(root, batchId, signal, { onJobStart: (id, directory) => {
@@ -68,6 +75,22 @@ async function main(args: string[]) {
       const result = batch.jobs[0]!;
       console.log(`${result.status}: ${result.reason}`);
       return result.status === 'completed' ? 0 : 2;
+    }
+    if ((group === 'provider' || group === 'connection') && (command === 'add' || command === 'rotate')) {
+      const { positionals, values: v } = parseArgs({ args: rest, allowPositionals: true, options: { label: str, 'base-url': str, 'secret-stdin': bool } });
+      const id = position(positionals)!;
+      if (!v['secret-stdin'] || process.stdin.isTTY) throw new Error('Pipe the API key via stdin with --secret-stdin; never use a command-line argument');
+      let secret = '';
+      for await (const part of process.stdin.setEncoding('utf8')) {
+        secret += part;
+        if (secret.length > 8194) throw new Error('API credential too long');
+      }
+      const store = new Connections();
+      try {
+        if (command === 'add') print(await store.create(createConnectionSchema.parse({ id, label: v.label ?? id, protocol: 'responses', base_url: v['base-url'], secret })));
+        else print(await store.rotate(id, rotateConnectionSchema.parse({ secret }).secret));
+      } catch { throw new Error('Could not save provider; check ID, label, endpoint and credential storage'); }
+      return 0;
     }
     if (group === 'contest' && command === 'init') {
       const { positionals, values: v } = parseArgs({ args: rest, allowPositionals: true, options: { pdf: str, answers: str, id: str, title: str } });
@@ -90,23 +113,41 @@ async function main(args: string[]) {
     }
     if (group === 'agent' && command === 'init') {
       const { positionals, values: v } = parseArgs({ args: rest, allowPositionals: true, options: { id: str, harness: str, model: str,
-        api: str, 'base-url': str, 'key-env': str, 'reasoning-effort': str, family: str } });
-      console.log(await saveAgent(position(positionals)!, { id: v.id, harness: v.harness, model: v.model, api: v.api, base_url: v['base-url'],
-        api_key_env: v['key-env'], model_family_id: v.family, ...(v['reasoning-effort'] ? { reasoning_effort: v['reasoning-effort'] } : {}) }));
+        api: str, 'base-url': str, 'key-env': str, 'reasoning-effort': str, family: str,
+        connection: str, provider: str, vendor: str, temperature: str } });
+      const out = position(positionals)!;
+      const provider = v.provider ?? v.connection;
+      if (v.provider && v.connection) throw new Error('Use only one of --provider and legacy --connection');
+      if (provider !== undefined) {
+        if ([v.api, v['base-url'], v['key-env'], v.family].some(value => value !== undefined)) {
+          throw new Error('--provider (or legacy --connection) cannot be combined with legacy API or family options');
+        }
+        const kind = harnessKind.parse(v.harness);
+        const options = {
+          ...(v['reasoning-effort'] !== undefined ? { reasoning_effort: v['reasoning-effort'] } : {}),
+          ...(v.temperature !== undefined ? { temperature: v.temperature } : {}),
+        };
+        console.log(await saveAgentManifest(out, { kind: agentKind, schema_version: 1, id: v.id, model: v.model,
+          provider, vendor: v.vendor, harness: { kind, version: harness(kind).version, options } }));
+      } else {
+        if (v.vendor !== undefined || v.temperature !== undefined) throw new Error('--vendor and --temperature require --provider (or legacy --connection)');
+        console.log(await saveAgent(out, { id: v.id, harness: v.harness, model: v.model, api: v.api, base_url: v['base-url'],
+          api_key_env: v['key-env'], model_family_id: v.family, ...(v['reasoning-effort'] !== undefined ? { reasoning_effort: v['reasoning-effort'] } : {}) }));
+      }
       return 0;
     }
     if (group === 'results' && (command === 'export' || command === 'merge' || command === 'rank')) {
       const { positionals, values: v } = parseArgs({ args: rest, allowPositionals: true,
-        options: { out: str, workspace: str, batch: str, run: str, family: str } });
+        options: { out: str, workspace: str, batch: str, run: str, family: str, vendor: str } });
       let data: unknown;
       if (command === 'export') {
         if (positionals.length || Boolean(v.batch) === Boolean(v.run)) throw new Error('Select exactly one of --batch or --run');
         const root = workdir(v.workspace);
-        data = v.batch ? await exportBatch(root, v.batch) : { schema_version: 1, results: [await exportRun(root, v.run!)] };
+        data = v.batch ? await exportBatch(root, v.batch) : resultBundle([await exportRun(root, v.run!)]);
       } else if (command === 'merge') {
         if (!positionals.length) throw new Error('Provide one or more result bundles');
         data = mergeResults(await Promise.all(positionals.map(readJson)));
-      } else data = rankResults(mergeResults([await readJson(position(positionals)!)]), v.family);
+      } else data = rankResults(mergeResults([await readJson(position(positionals)!)]), v.family, v.vendor);
       if (v.out) await writeFile(v.out, JSON.stringify(data, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
       else print(data);
       return 0;
@@ -118,8 +159,9 @@ async function main(args: string[]) {
         const { contest } = await loadContest(file);
         print({ contest_id: contest.contest_id, data_version: contest.data_version });
       } else {
-        const { agent, profile } = await loadAgent(file);
-        print({ agent_id: agent.agent_id, harness: agent.harness, model: profile.model });
+        const { agent, profile, vendor, connection, agentDigest, profileDigest, nativeDigest, effectiveDigest } = await loadAgent(file);
+        print({ agent_id: agent.agent_id, harness: agent.harness, model: profile.model, vendor, connection,
+          source_sha256: agentDigest, profile_sha256: profileDigest, native_sha256: nativeDigest, effective_sha256: effectiveDigest });
       }
       return 0;
     }

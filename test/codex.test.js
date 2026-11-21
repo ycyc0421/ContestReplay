@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createServer } from 'node:http';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadInputs } from '../dist/config.js';
+import { loadInputs, modelKey } from '../dist/config.js';
+import { Connections } from '../dist/connections.js';
 import { inspectImage, codexImage } from '../dist/docker.js';
 import { runBench } from '../dist/run.js';
+import { exportRun } from '../dist/results.js';
 
 const enabled = process.env.CR_TEST_CODEX === '1';
 test('actual Codex reads full PDF page images and submits over MCP in a no-network container', { skip: !enabled, timeout: 60_000 }, async () => {
@@ -30,7 +32,7 @@ test('actual Codex reads full PDF page images and submits over MCP in a no-netwo
       arguments: JSON.stringify(turn === 1 ? { problem_id: '1', answer: '3' } : {}), status: 'completed' };
     const response = { id: 'resp_'+turn, object: 'response', model, created_at: 1, status: 'completed', output: [item],
       usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } } };
-    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'x-request-id': req.headers.authorization });
     const events = [{ type: 'response.created', response: { ...response, status: 'in_progress', output: [] } },
       { type: 'response.output_item.added', output_index: 0, item: { ...item, arguments: '', status: 'in_progress' } },
       { type: 'response.function_call_arguments.delta', item_id: item.id, output_index: 0, delta: item.arguments },
@@ -40,9 +42,16 @@ test('actual Codex reads full PDF page images and submits over MCP in a no-netwo
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   try {
-    const inputs = await loadInputs('examples/demo/contest.json', 'examples/demo/codex.toml');
-    inputs.profile.base_url = 'http://127.0.0.1:'+server.address().port+'/v1';
-    const result = await runBench(inputs, { out, image: await inspectImage(codexImage), key: 'local-test-key', signal: AbortSignal.timeout(45_000) });
+    const store = new Connections(join(out, 'connection-store'));
+    const connection = await store.create({ label: 'Mock upstream', protocol: 'responses',
+      base_url: 'http://127.0.0.1:'+server.address().port+'/v1', secret: 'local-test-key' });
+    const effort = 'max';
+    const path = join(out, 'agent.json');
+    await writeFile(path, JSON.stringify({ kind: 'contestreplay.dev/agent', schema_version: 1, id: 'codex-max',
+      model, connection: connection.id, harness: { kind: 'codex', version: '0.170.0', options: { reasoning_effort: effort },
+        env: { LANG: 'C.UTF-8' }, native_config: { format: 'toml', content: 'model_verbosity = "high"' } } }));
+    const inputs = await loadInputs('examples/demo/contest.json', path, store);
+    const result = await runBench(inputs, { out, image: await inspectImage(codexImage), key: await modelKey(inputs, store), signal: AbortSignal.timeout(45_000) });
     const log = await readFile(join(result.directory, 'events.jsonl'), 'utf8');
     const diagnostics = await readFile(join(result.directory, 'agent.stderr.log'), 'utf8') + await readFile(join(result.directory, 'agent.stdout.log'), 'utf8');
     assert.equal(result.status, 'completed', log + '\n' + diagnostics);
@@ -50,7 +59,13 @@ test('actual Codex reads full PDF page images and submits over MCP in a no-netwo
     assert.equal(observed.length, 2);
     assert.match(JSON.stringify(observed[0].input), /data:image\/png;base64,/);
     assert.equal(observed[0].store, false);
+    assert.equal(observed[0].reasoning.effort, effort);
+    assert.equal(observed[0].text.verbosity, 'high');
+    assert.ok(!log.includes('local-test-key'));
+    assert.ok(!diagnostics.includes('local-test-key'));
+    assert.ok(!JSON.stringify(await exportRun(out, result.runId)).includes('local-test-key'));
     const events = log.trim().split('\n').map(JSON.parse);
+    assert.equal(events.find(event => event.type === 'model_response').request_id, 'Bearer [REDACTED]');
     assert.equal(events.at(-1).score, 3);
   } finally {
     server.closeAllConnections();

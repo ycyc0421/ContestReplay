@@ -2,7 +2,10 @@ import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
-import { parse, stringify } from 'smol-toml';
+import { agentKind, manifestProvider, resolveManifest } from './agent-manifest.js';
+import { Connections, endpoint } from './connections.js';
+import { builtinModel, codexModel, effectiveFor, efforts, harness, type HarnessEnv, type NativeOverride } from './harnesses.js';
+import { canonical, documentFormat, parseDocumentText, serializeDocument } from './serialization.js';
 import { z } from 'zod';
 
 export const id = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/);
@@ -36,24 +39,17 @@ export const judgeSchema = z.strictObject({ schema_version: z.literal(1),
 const legacyAgent = z.strictObject({ schema_version: z.literal(1), agent_id: id,
   harness: z.strictObject({ kind: z.literal('builtin-responses'), version: z.literal('0.1.0') }), config: path });
 const apiFields = { api: z.literal('responses').default('responses'),
-  base_url: z.url({ protocol: /^https?$/ }).default('https://api.openai.com/v1').superRefine((value, ctx) => {
-    const url = new URL(value);
-    if (url.username || url.password || url.search || url.hash ||
-        (url.protocol !== 'https:' && !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname))) {
-      ctx.addIssue({ code: 'custom', message: 'Use an HTTPS origin without credentials/query, or loopback HTTP' });
-    }
-  }),
+  base_url: endpoint.default('https://api.openai.com/v1'),
   api_key_env: z.string().regex(/^[A-Z_][A-Z0-9_]*$/).default('OPENAI_API_KEY'),
   model_family_id: id.optional(),
 };
 const builtin = z.strictObject({ id, harness: z.literal('builtin-responses'), ...apiFields,
-  model: z.literal('gpt-4.1-2025-04-14'), temperature: z.number().min(0).max(2).default(0) });
+  model: builtinModel, temperature: z.number().min(0).max(2).default(0) });
 const codex = z.strictObject({ id, harness: z.literal('codex'), ...apiFields,
-  model: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,127}$/),
-  reasoning_effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']).optional() });
+  model: codexModel, reasoning_effort: z.enum(efforts).optional() });
 export const agentSchema = z.discriminatedUnion('harness', [builtin, codex]);
 export type AgentProfile = z.infer<typeof agentSchema>;
-export const harnessVersion = (kind: AgentProfile['harness']) => kind === 'codex' ? '0.170.0' : '0.1.0';
+export const harnessVersion = (kind: AgentProfile['harness']) => harness(kind).version;
 export const sha256 = (value: Buffer | string) => createHash('sha256').update(value).digest('hex');
 
 export async function file(path: string, limit: number) {
@@ -142,34 +138,59 @@ export async function loadContest(contestFile: string) {
   const contestPath = resolve(contestFile);
   return resolveContest(json(await file(contestPath, 1_000_000), contestPath), contestPath);
 }
-export function agentToml(raw: unknown) { return stringify(validated(agentSchema, raw, 'Agent')); }
-export async function loadAgent(agentFile: string) {
+export function agentToml(raw: unknown) { return serializeDocument(validated(agentSchema, raw, 'Agent'), 'toml'); }
+export async function resolveAgentManifest(raw: unknown, agentPath: string, store: Connections) {
+  return resolveManifest(raw, store, async (ref, digest) => {
+    const data = await readArtifact(dirname(agentPath), { path: ref, sha256: digest, redistribution: 'unknown' }, 64_000);
+    return data.bytes.toString('utf8');
+  });
+}
+export function agentDigests(profile: AgentProfile, native?: NativeOverride, nativeText?: string, env?: HarnessEnv) {
+  const { model_family_id: _family, api_key_env: _key, id: _id, ...normalized } = profile;
+  const effective = effectiveFor(profile, native);
+  return { profileDigest: sha256(canonical({ ...normalized, native: native?.model_verbosity ? native : undefined, env: env ?? {} })),
+    nativeDigest: nativeText === undefined ? undefined : sha256(nativeText), effectiveDigest: sha256(canonical({ config: effective.config, env: env ?? {} })) };
+}
+export async function loadAgent(agentFile: string, store = new Connections()) {
   const agentPath = resolve(agentFile);
   const bytes = await file(agentPath, 1_000_000);
-  let native = bytes;
-  let raw: unknown;
-  const isLegacy = agentPath.endsWith('.json');
-  if (isLegacy) {
-    const agent = validated(legacyAgent, json(bytes, agentPath), agentPath);
-    native = await file(resolve(dirname(agentPath), agent.config), 64_000);
-    try { raw = { ...parse(native.toString('utf8')), id: agent.agent_id, harness: agent.harness.kind }; }
-    catch { throw new Error(`Invalid native TOML for ${agentPath}`); }
+  let raw = parseDocumentText(bytes.toString('utf8'), documentFormat(agentPath));
+  let native: NativeOverride | undefined;
+  let nativeText: string | undefined;
+  let env: HarnessEnv | undefined;
+  let vendor: string | undefined;
+  let connection: string | undefined;
+  let profile: AgentProfile;
+  if (raw && typeof raw === 'object' && 'kind' in raw) {
+    if (raw.kind !== agentKind) throw new Error('Unsupported Agent manifest kind');
+    const resolved = await resolveAgentManifest(raw, agentPath, store);
+    ({ profile, native, nativeText, env } = resolved);
+    vendor = resolved.manifest.vendor;
+    connection = manifestProvider(resolved.manifest);
   } else {
-    try { raw = parse(bytes.toString('utf8')); }
-    catch { throw new Error(`Invalid TOML: ${agentPath}`); }
+    if (raw && typeof raw === 'object' && ('schema_version' in raw || 'agent_id' in raw)) {
+      const legacy = validated(legacyAgent, raw, agentPath);
+      const contents = await file(resolve(dirname(agentPath), legacy.config), 64_000);
+      nativeText = contents.toString('utf8');
+      raw = { ...Object(parseDocumentText(nativeText, 'toml')), id: legacy.agent_id, harness: legacy.harness.kind };
+    }
+    profile = validated(agentSchema, raw, agentPath);
   }
-  const profile = validated(agentSchema, raw, agentPath);
   const agent = { agent_id: profile.id, harness: { kind: profile.harness, version: harnessVersion(profile.harness) } };
-  return { agent, agentPath, agentDigest: sha256(bytes), profileDigest: sha256(native), profile };
+  return { agent, agentPath, agentDigest: sha256(bytes), ...agentDigests(profile, native, nativeText, env), profile, native, env, vendor, connection };
 }
-export async function loadInputs(contestFile: string, agentFile: string) {
-  return { ...await loadContest(contestFile), ...await loadAgent(agentFile) };
+export async function loadInputs(contestFile: string, agentFile: string, store?: Connections) {
+  return { ...await loadContest(contestFile), ...await loadAgent(agentFile, store) };
 }
-export function agentRevision(inputs: Awaited<ReturnType<typeof loadAgent>>, image: string) {
-  const { model_family_id: _family, id: _id, api_key_env: _key, ...profile } = inputs.profile;
-  return sha256(JSON.stringify({ harness: inputs.agent.harness, profile, adapter: '0.2.0', image }));
+export function revisionFor(profile: AgentProfile, effectiveDigest: string, image: string, protocol: string) {
+  return sha256(canonical({ harness: profile.harness, version: harnessVersion(profile.harness), model: profile.model,
+    endpoint: profile.base_url, api: profile.api, effective_sha256: effectiveDigest, adapter: '0.3.0', image, protocol }));
 }
-export function modelKey(profile: AgentProfile) {
+export function agentRevision(inputs: Pick<Awaited<ReturnType<typeof loadAgent>>, 'profile' | 'effectiveDigest'>, image: string, protocol: string) {
+  return revisionFor(inputs.profile, inputs.effectiveDigest, image, protocol);
+}
+export async function modelKey({profile, connection}: { profile: AgentProfile; connection?: string }, store = new Connections()) {
+  if (connection) return store.key(connection, profile);
   // Bind custom endpoints to explicitly authorized credentials; never silently
   // forward a default provider key to a URL from a portable config.
   const base = profile.base_url.replace(/\/+$/, '');

@@ -2,11 +2,12 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { frames } from './wire.js';
 import { type AgentProfile } from './config.js';
+import { harness, type HarnessEnv } from './harnesses.js';
 
 const docker = promisify(execFile);
 const image = 'cr-bench:0.1.0';
-export const codexImage = 'cr-codex:0.170.0';
-export const imageFor = (kind: AgentProfile['harness']) => kind === 'codex' ? codexImage : image;
+export const codexImage = harness('codex').image;
+export const imageFor = (kind: AgentProfile['harness']) => harness(kind).image;
 export async function inspectImage(ref = image) {
   try {
     const { stdout } = await docker('docker', ['image', 'inspect', '--format', '{{.Id}}', ref], { timeout: 10_000 });
@@ -38,7 +39,7 @@ export async function removeContainer(id: string) {
 }
 
 export async function launch(id: string, imageId: string, pdfPath: string, signal: AbortSignal, onStderr?: (chunk: Buffer) => void,
-  codex?: { input: string; channels: string; onStdout: (chunk: Buffer) => void }) {
+  codex?: { input: string; channels: string; env?: HarnessEnv; onStdout: (chunk: Buffer) => void }) {
   if ([pdfPath, codex?.input, codex?.channels].some(path => path?.includes(','))) throw new Error('Docker PDF staging path cannot contain a comma');
   const name = `cr-${id}`;
   const args = [
@@ -48,7 +49,8 @@ export async function launch(id: string, imageId: string, pdfPath: string, signa
     '--memory', codex ? '2g' : resources.memory, '--cpus', resources.cpus, '--log-driver=none',
     '--tmpfs', codex ? '/workspace:rw,nosuid,nodev,exec,size=256m,uid=1000,gid=1000,mode=0700' : `/workspace:rw,nosuid,nodev,noexec,size=${resources.workspace},uid=1000,gid=1000,mode=0700`,
     '--tmpfs', `/tmp:rw,nosuid,nodev,noexec,size=${codex ? 64 : 8}m`, '--workdir', '/workspace', '--env', 'HOME=/workspace',
-    ...(codex ? ['--env', 'CODEX_HOME=/workspace/.codex', '--mount', `type=bind,source=${codex.input},target=/inputs,readonly`,
+    ...(codex ? ['--env', 'CODEX_HOME=/workspace/.codex',
+      ...Object.entries(harness('codex').env.parse(codex.env ?? {})).flatMap(([key, value]) => value ? ['--env', `${key}=${value}`] : []), '--mount', `type=bind,source=${codex.input},target=/inputs,readonly`,
       '--mount', `type=bind,source=${codex.channels},target=/channels,readonly`] : ['--mount', `type=bind,source=${pdfPath},target=/inputs/problems.pdf,readonly`]),
     '--entrypoint', 'node', imageId, codex ? '/app/bridge.js' : '/app/worker.js',
   ];

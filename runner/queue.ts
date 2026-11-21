@@ -5,6 +5,7 @@ import { access, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs
 import { join, resolve } from 'node:path';
 import { checkRuntime, executeJob, planSchema, readJson, verifyPlan, type Plan } from './plan.js';
 import { removeContainer } from './docker.js';
+import type { Connections } from './connections.js';
 import { z } from 'zod';
 
 const idSchema = z.uuid();
@@ -19,6 +20,7 @@ const batchSchema = z.strictObject({
 export type Batch = z.infer<typeof batchSchema>;
 export type Execute = typeof executeJob;
 export type QueueOptions = {
+  store?: Connections;
   execute?: Execute;
   preflight?: (plan: Plan) => Promise<unknown>;
   recover?: (id: string) => Promise<void>;
@@ -133,7 +135,7 @@ export async function dispatch(root: string, batchId: string, signal: AbortSigna
     const batch = await getBatch(root, batchId);
     const preflight = options.preflight ?? (async (plan: Plan) => {
       await checkRuntime(plan);
-      await verifyPlan(plan, true);
+      await verifyPlan(plan, true, options.store);
     });
     const cancelPending = async () => {
       if (!await exists(batchStop(root, batchId))) return false;
@@ -166,7 +168,7 @@ export async function dispatch(root: string, batchId: string, signal: AbortSigna
       })();
       let cleanupFailed = false;
       try {
-        const result = await (options.execute ?? executeJob)(batch.plan, batch.plan.jobs[i]!, { out: root, runId, signal: subscribed });
+        const result = await (options.execute ?? executeJob)(batch.plan, batch.plan.jobs[i]!, { out: root, runId, signal: subscribed, store: options.store });
         cleanupFailed = result.reason === 'sandbox_cleanup_failed';
         job.status = result.status;
         job.reason = result.reason;

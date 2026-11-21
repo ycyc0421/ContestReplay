@@ -2,6 +2,7 @@ import { createInference } from './model.js';
 import { agentRevision, file as readBoundedFile, loadAgent, loadContest, loadInputs, modelKey, type Inputs } from './config.js';
 import { imageFor, inspectImage } from './docker.js';
 import { checkCodeforces } from './codeforces.js';
+import type { Connections } from './connections.js';
 import { protocolDigest } from './protocol.js';
 import { runBench } from './run.js';
 import { dirname, isAbsolute, resolve } from 'node:path';
@@ -11,14 +12,18 @@ const path = z.string().trim().min(1).max(4096);
 const absPath = path.refine(isAbsolute, 'expected an absolute path');
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
 const imageRef = z.string().regex(/^sha256:[a-f0-9]{64}$/);
-export const specSchema = z.strictObject({ schema_version: z.literal(1),
+const axisSpecSchema = z.strictObject({ schema_version: z.literal(1),
   agents: z.array(path).min(1).max(100), contests: z.array(path).min(1).max(100),
 }).refine(s => s.agents.length * s.contests.length <= 1000, 'maximum 1000 jobs');
+const cellsSpecSchema = z.strictObject({ schema_version: z.literal(2),
+  cells: z.array(z.strictObject({ agent: path, contest: path })).min(1).max(1000),
+}).refine(s => new Set(s.cells.map(cell => JSON.stringify(cell))).size === s.cells.length, 'duplicate matrix cell');
+export const specSchema = z.union([axisSpecSchema, cellsSpecSchema]);
 export const planSchema = z.strictObject({ schema_version: z.literal(2), protocol_sha256: digest,
   jobs: z.array(z.strictObject({
     image: imageRef, harness: z.enum(['builtin-responses', 'codex']), model_family_id: z.string().optional(),
     agent_path: absPath, agent_id: z.string().min(1), agent_revision: digest,
-    agent_sha256: digest, profile_sha256: digest,
+    agent_sha256: digest, profile_sha256: digest, native_sha256: digest.optional(), effective_sha256: digest.optional(),
     contest_path: absPath, contest_id: z.string().min(1), data_version: z.number().int().positive(), contest_sha256: digest,
   })).min(1).max(1000),
 });
@@ -28,27 +33,31 @@ export async function readJson(path: string) {
   return JSON.parse((await readBoundedFile(path, 16 * 1024 * 1024)).toString('utf8')) as unknown;
 }
 
-export async function makePlan(raw: unknown, base: string, getImage = inspectImage): Promise<Plan> {
+export async function makePlan(raw: unknown, base: string, getImage = inspectImage, store?: Connections): Promise<Plan> {
   const spec = specSchema.parse(raw);
+  const axes = 'cells' in spec ? { agents: [...new Set(spec.cells.map(cell => cell.agent))],
+    contests: [...new Set(spec.cells.map(cell => cell.contest))] } : spec;
   const images = new Map<string, string>();
   const paths = (entries: string[]) => {
     const result = entries.map(entry => resolve(base, entry));
     if (new Set(result).size !== result.length) throw new Error('Duplicate input paths in a matrix axis');
     return result;
   };
-  const agents = [] as (Pick<PlanJob, 'agent_path' | 'agent_id' | 'agent_revision' | 'agent_sha256' | 'profile_sha256' | 'image' | 'harness' | 'model_family_id'>)[];
-  for (const file of paths(spec.agents)) {
-    const input = await loadAgent(file);
+  const agents = [] as (Pick<PlanJob, 'agent_path' | 'agent_id' | 'agent_revision' | 'agent_sha256' | 'profile_sha256' | 'native_sha256' | 'effective_sha256' | 'image' | 'harness' | 'model_family_id'>)[];
+  for (const file of paths(axes.agents)) {
+    const input = await loadAgent(file, store);
     const { harness, model_family_id } = input.profile;
     let image: string | undefined = images.get(harness);
     if (!image) { image = await getImage(imageFor(harness)); images.set(harness, image); }
-    agents.push({ agent_path: file, agent_id: input.agent.agent_id, agent_revision: agentRevision(input, image), image, harness, ...(model_family_id ? { model_family_id } : {}),
-      agent_sha256: input.agentDigest, profile_sha256: input.profileDigest });
+    agents.push({ agent_path: file, agent_id: input.agent.agent_id, agent_revision: agentRevision(input, image, protocolDigest), image, harness, ...(model_family_id ? { model_family_id } : {}),
+      agent_sha256: input.agentDigest, profile_sha256: input.profileDigest, effective_sha256: input.effectiveDigest,
+      ...(input.nativeDigest ? { native_sha256: input.nativeDigest } : {}) });
   }
   const contests: Pick<PlanJob, 'contest_path' | 'contest_id' | 'data_version' | 'contest_sha256'>[] = [];
-  for (const file of paths(spec.contests)) {
+  const compatibility = new Map<string, Inputs['contest']>();
+  for (const file of paths(axes.contests)) {
     const input = await loadContest(file);
-    for (const agent of agents) assertCompatible(agent.harness, input.contest, agent.agent_id);
+    compatibility.set(file, input.contest);
     contests.push({ contest_path: file, contest_id: input.contest.contest_id, data_version: input.contest.data_version,
       contest_sha256: input.contestDigest });
   }
@@ -56,8 +65,17 @@ export async function makePlan(raw: unknown, base: string, getImage = inspectIma
       new Set(contests.map(c => JSON.stringify([c.contest_id, c.data_version, c.contest_sha256]))).size !== contests.length) {
     throw new Error('Duplicate Agent or Contest revision in a matrix axis');
   }
-  return planSchema.parse({ schema_version: 2, protocol_sha256: protocolDigest,
-    jobs: agents.flatMap(agent => contests.map(contest => ({ ...agent, ...contest }))) });
+  const jobs = 'cells' in spec ? spec.cells.map(cell => {
+    const agent = agents.find(item => item.agent_path === resolve(base, cell.agent));
+    const contest = contests.find(item => item.contest_path === resolve(base, cell.contest));
+    if (!agent || !contest) throw new Error('Matrix cell references an unknown input');
+    assertCompatible(agent.harness, compatibility.get(contest.contest_path)!, agent.agent_id);
+    return { ...agent, ...contest };
+  }) : agents.flatMap(agent => contests.map(contest => {
+    assertCompatible(agent.harness, compatibility.get(contest.contest_path)!, agent.agent_id);
+    return { ...agent, ...contest };
+  }));
+  return planSchema.parse({ schema_version: 2, protocol_sha256: protocolDigest, jobs });
 }
 export async function planFromFile(file: string) {
   return makePlan(await readJson(file), dirname(resolve(file)));
@@ -72,7 +90,8 @@ export function assertCompatible(harness: Inputs['profile']['harness'], contest:
 function verifyAgent(job: PlanJob, input: AgentInput) {
   if (input.agent.agent_id !== job.agent_id || input.agentDigest !== job.agent_sha256 ||
       input.profile.harness !== job.harness || input.profile.model_family_id !== job.model_family_id ||
-      input.profileDigest !== job.profile_sha256 || agentRevision(input, job.image) !== job.agent_revision) {
+      input.profileDigest !== job.profile_sha256 || input.nativeDigest !== job.native_sha256 || input.effectiveDigest !== job.effective_sha256 ||
+      agentRevision(input, job.image, protocolDigest) !== job.agent_revision) {
     throw new Error('Agent inputs changed; regenerate the plan');
   }
 }
@@ -80,27 +99,27 @@ function verifyContest(job: PlanJob, input: ContestInput) {
   if (input.contestDigest !== job.contest_sha256 || input.contest.contest_id !== job.contest_id ||
       input.contest.data_version !== job.data_version) throw new Error('Contest inputs changed; regenerate the plan');
 }
-export async function verifyJob(plan: Plan, job: PlanJob) {
+export async function verifyJob(plan: Plan, job: PlanJob, store?: Connections) {
   if (plan.protocol_sha256 !== protocolDigest) throw new Error('Evaluation protocol changed; regenerate the plan');
-  const inputs = await loadInputs(job.contest_path, job.agent_path);
+  const inputs = await loadInputs(job.contest_path, job.agent_path, store);
   verifyAgent(job, inputs);
   verifyContest(job, inputs);
   assertCompatible(job.harness, inputs.contest, job.agent_id);
   return inputs;
 }
-export async function verifyPlan(plan: Plan, runtime = false) {
+export async function verifyPlan(plan: Plan, runtime = false, store?: Connections) {
   const agents = new Map<string, AgentInput>();
   const contests = new Map<string, ContestInput>();
   for (const job of plan.jobs) {
     let agent = agents.get(job.agent_path);
-    if (!agent) { agent = await loadAgent(job.agent_path); agents.set(job.agent_path, agent); }
+    if (!agent) { agent = await loadAgent(job.agent_path, store); agents.set(job.agent_path, agent); }
     let contest = contests.get(job.contest_path);
     if (!contest) {
       const { pdf: _pdf, judge: _judge, attachments: _attachments, ...meta } = await loadContest(job.contest_path);
       contest = meta;
       contests.set(job.contest_path, contest);
     }
-    if (runtime) modelKey(agent.profile);
+    if (runtime) await modelKey(agent, store);
     verifyAgent(job, agent);
     verifyContest(job, contest);
     assertCompatible(job.harness, contest.contest, job.agent_id);
@@ -111,9 +130,9 @@ export async function checkRuntime(plan: Plan) {
   if (plan.protocol_sha256 !== protocolDigest) throw new Error('Evaluation protocol changed; regenerate the plan');
   for (const image of new Set(plan.jobs.map(job => job.image))) await inspectImage(image);
 }
-export async function executeJob(plan: Plan, job: PlanJob, opts: { out: string; runId: string; signal: AbortSignal }) {
-  const inputs = await verifyJob(plan, job);
-  const key = modelKey(inputs.profile);
+export async function executeJob(plan: Plan, job: PlanJob, opts: { out: string; runId: string; signal: AbortSignal; store?: Connections }) {
+  const inputs = await verifyJob(plan, job, opts.store);
+  const key = await modelKey(inputs, opts.store);
   opts.signal.throwIfAborted();
   const infer = inputs.profile.harness === 'builtin-responses' ? createInference(key, inputs.profile) : undefined;
   return runBench(inputs, { ...opts, image: job.image, infer, key });
