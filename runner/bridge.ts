@@ -14,28 +14,31 @@ export async function streamSessions(
   sessionsRoot = '/workspace/.codex/sessions',
   socketPath = '/channels/session.sock',
   timeoutMs = 1200,
-  limits: { maxFiles?: number; maxEntries?: number; maxBytes?: number } = {},
+  limits: { maxFiles?: number; maxEntries?: number; maxBytes?: number; now?: () => number } = {},
 ) {
   if (!existsSync(sessionsRoot) || !existsSync(socketPath)) return;
   const maxFiles = limits.maxFiles ?? MAX_SESSION_FILES;
   const maxEntries = limits.maxEntries ?? MAX_SESSION_ENTRIES;
   const maxBytes = limits.maxBytes ?? MAX_SESSION_BYTES;
-  const deadline = Date.now() + timeoutMs;
+  const now = limits.now ?? (() => Date.now());
+  const deadline = now() + timeoutMs;
   let sock: Socket | undefined;
   try {
     sock = await new Promise<Socket>((resolveSocket, rejectSocket) => {
       const s = connect(socketPath);
-      const timer = setTimeout(() => { s.destroy(); rejectSocket(new Error('timeout')); }, Math.max(100, deadline - Date.now()));
+      const timer = setTimeout(() => { s.destroy(); rejectSocket(new Error('timeout')); }, Math.max(100, deadline - now()));
       s.once('connect', () => { clearTimeout(timer); resolveSocket(s); });
       s.once('error', err => { clearTimeout(timer); rejectSocket(err); });
     });
   } catch { return; }
 
+  class StreamTimeoutError extends Error {}
+
   const writeLine = (line: string, writeDeadline = deadline) => new Promise<void>((resolveWrite, rejectWrite) => {
     if (!sock || sock.destroyed) return rejectWrite(new Error('closed'));
-    if (Date.now() > writeDeadline) return rejectWrite(new Error('timeout'));
+    if (now() > writeDeadline) return rejectWrite(new StreamTimeoutError('timeout'));
     if (sock.write(line)) { resolveWrite(); return; }
-    const timer = setTimeout(() => rejectWrite(new Error('timeout')), Math.max(50, writeDeadline - Date.now()));
+    const timer = setTimeout(() => rejectWrite(new StreamTimeoutError('timeout')), Math.max(50, writeDeadline - now()));
     const onDrain = () => { clearTimeout(timer); sock?.off('error', onErr); sock?.off('close', onClose); resolveWrite(); };
     const onErr = (err: Error) => { clearTimeout(timer); sock?.off('drain', onDrain); sock?.off('close', onClose); rejectWrite(err); };
     const onClose = () => { clearTimeout(timer); sock?.off('drain', onDrain); sock?.off('error', onErr); rejectWrite(new Error('closed')); };
@@ -53,7 +56,7 @@ export async function streamSessions(
     let names: string[];
     try { names = (await readdir(dir)).sort(); } catch { return; }
     for (const name of names) {
-      if (Date.now() > deadline || bytesSent >= maxBytes) { truncated = true; break; }
+      if (now() > deadline || bytesSent >= maxBytes) { truncated = true; break; }
       if (++entriesVisited > maxEntries) { truncated = true; break; }
       if (!name || name === '.' || name === '..' || !/^[A-Za-z0-9._-]+$/.test(name)) continue;
       const full = join(dir, name);
@@ -79,9 +82,10 @@ export async function streamSessions(
           let pos = 0;
           let sentAny = false;
           while (true) {
-            if (Date.now() > deadline) { truncated = true; break; }
+            if (now() > deadline) { truncated = true; break; }
             const { bytesRead } = await handle.read(buf, 0, buf.length, pos);
             if (!bytesRead) break;
+            if (now() > deadline) { truncated = true; break; }
             pos += bytesRead;
             const remaining = maxBytes - bytesSent;
             if (remaining <= 0) { truncated = true; break; }
@@ -101,13 +105,18 @@ export async function streamSessions(
   };
 
   try {
-    await walk(sessionsRoot, '');
+    try {
+      await walk(sessionsRoot, '');
+    } catch (err) {
+      if (err instanceof StreamTimeoutError) truncated = true;
+      else throw err;
+    }
     // Always reserve a short dedicated flush budget for the terminal done/truncated frame
-    // even when the walk itself timed out, so the receiver cleanly records 'truncated' instead of 'failed'.
-    const finishDeadline = Math.max(deadline, Date.now() + 250);
+    // even when the walk or data write timed out, so the receiver cleanly records 'truncated' instead of 'failed'.
+    const finishDeadline = Math.max(deadline, now() + 250);
     await writeLine(JSON.stringify(truncated ? { done: true, truncated: true } : { done: true }) + '\n', finishDeadline);
     await new Promise<void>(resolveClose => {
-      const timer = setTimeout(() => { sock?.destroy(); resolveClose(); }, Math.max(250, finishDeadline - Date.now()));
+      const timer = setTimeout(() => { sock?.destroy(); resolveClose(); }, Math.max(250, finishDeadline - now()));
       sock?.once('close', () => { clearTimeout(timer); resolveClose(); });
       sock?.resume();
       sock?.end();

@@ -607,6 +607,51 @@ test('turn_limit immediately closes submissions, host strips unconfigured servic
   await streamSessions(timeoutSrc, join(root, 'c8', 'session.sock'), -1);
   await ch8();
   assert.equal(timeoutRes.status, 'truncated');
+
+  // 9. Deadline expiring mid-file-read/write STILL flushes { done: true, truncated: true } -> receiver records 'truncated' (NOT 'failed')
+  let midClock = 1_000;
+  let midCalls = 0;
+  const midNow = () => {
+    midCalls++;
+    // Initial deadline = 1_000 + 50 = 1_050; ticks past deadline right when handle.read() returns / writeLine runs!
+    if (midCalls >= 5) midClock = 2_000;
+    return midClock;
+  };
+  let midTimeoutRes;
+  const ch9 = await serveContestChannels({
+    dir: join(root, 'c9'),
+    profile: { id: 'p', harness: 'codex', api: 'responses', model: 'gpt-5.3-codex',
+      base_url: `http://127.0.0.1:${upstream.address().port}/v1`, api_key_env: 'OPENAI_API_KEY' },
+    key: 'secret-key', signal: new AbortController().signal,
+    sessionArchive: { dir: join(root, 's9'), onResult: r => { midTimeoutRes = r; } },
+    contest: { submit: () => ({ verdict: 'ok' }), status: () => ({}), close: () => {} },
+    event: () => {}, finish: () => {}, fault: () => {},
+  });
+  await streamSessions(timeoutSrc, join(root, 'c9', 'session.sock'), 50, { now: midNow });
+  await ch9();
+  assert.equal(midTimeoutRes.status, 'truncated');
+
+  // 10. Deadline expiring inside writeLine() itself throws StreamTimeoutError -> caught cleanly and still flushes { done: true, truncated: true }
+  let writeClock = 1_000;
+  let writeCalls = 0;
+  const writeNow = () => {
+    writeCalls++;
+    if (writeCalls >= 6) writeClock = 2_000;
+    return writeClock;
+  };
+  let writeTimeoutRes;
+  const ch10 = await serveContestChannels({
+    dir: join(root, 'c10'),
+    profile: { id: 'p', harness: 'codex', api: 'responses', model: 'gpt-5.3-codex',
+      base_url: `http://127.0.0.1:${upstream.address().port}/v1`, api_key_env: 'OPENAI_API_KEY' },
+    key: 'secret-key', signal: new AbortController().signal,
+    sessionArchive: { dir: join(root, 's10'), onResult: r => { writeTimeoutRes = r; } },
+    contest: { submit: () => ({ verdict: 'ok' }), status: () => ({}), close: () => {} },
+    event: () => {}, finish: () => {}, fault: () => {},
+  });
+  await streamSessions(timeoutSrc, join(root, 'c10', 'session.sock'), 50, { now: writeNow });
+  await ch10();
+  assert.equal(writeTimeoutRes.status, 'truncated');
 });
 
 test('result export omits raw answers/logs, merges by run and ranks Agent revisions', async t => {
