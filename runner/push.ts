@@ -3,10 +3,13 @@ import { spawn } from 'node:child_process';
 import { lookup as dnsLookup } from 'node:dns/promises';
 import { constants } from 'node:fs';
 import { link, lstat, mkdir, open, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { request as httpRequest, type RequestOptions as HttpRequestOptions } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import { isIP } from 'node:net';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { z } from 'zod';
+import { id as contestProblemId } from './config.js';
 import { credentialJson } from './credential-redaction.js';
 
 export const pushTargetId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
@@ -78,6 +81,7 @@ const maxRetriesSchema = z.number().int().min(0).max(5);
 
 const storedTargetSchema = z.strictObject({
   id: pushTargetId,
+  instance_id: z.uuid().optional(),
   label: z.string().trim().min(1).max(120),
   url: pushUrlSchema,
   approved_origin: z.string().min(1),
@@ -104,6 +108,7 @@ const storedTargetSchema = z.strictObject({
 
 export const pushTargetResponseSchema = z.strictObject({
   id: pushTargetId,
+  instance_id: z.uuid().optional(),
   label: z.string().trim().min(1).max(120),
   url: z.string().min(1),
   approved_origin: z.string().min(1),
@@ -174,13 +179,47 @@ export type PushDelivery = z.infer<typeof pushDeliverySchema>;
 // stdout, stderr, local_inputs, session transcripts, host paths) are removed.
 const nonNegInt = z.number().int().nonnegative();
 const nonNegNum = z.number().nonnegative();
-const SAFE_REASON_CODE = /^[a-z][a-z0-9_]{0,63}$/;
-const SAFE_PROBLEM_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
-// Never transmit arbitrary free-form error text in `reason`; allow only canonical snake_case codes.
+export const ALLOWED_PUSH_REASONS = new Set([
+  'finish',
+  'agent_ended',
+  'turn_limit',
+  'output_limit',
+  'time_limit',
+  'interrupted',
+  'cancelled',
+  'batch_stopped',
+  'executor_stopped',
+  'executor_lost',
+  'sandbox_exited',
+  'sandbox_start_failed',
+  'sandbox_protocol_error',
+  'sandbox_cleanup_failed',
+  'relay_cleanup_failed',
+  'mcp_cleanup_failed',
+  'staging_cleanup_failed',
+  'model_timeout',
+  'model_request_failed',
+  'model_response_failed',
+  'model_tool_limit',
+  'unexpected_model',
+  'unexpected_model_output',
+  'invalid_model_request',
+  'mcp_tool_failed',
+  'missing_model_key',
+  'missing_model_adapter',
+  'unsupported_contest',
+  'judge_error',
+  'judge_unsettled',
+  'queue_monitor_error',
+  'runner_error',
+  'other',
+]);
+
+// Finite runner reason-code whitelist: unknown or free-form strings normalize to 'other'.
 const safeReason = z.string().transform(value => {
   const trimmed = value.trim();
-  return SAFE_REASON_CODE.test(trimmed) ? trimmed : 'other';
+  return ALLOWED_PUSH_REASONS.has(trimmed) ? trimmed : 'other';
 });
 
 const publicSubmissionSchema = z.object({
@@ -194,7 +233,7 @@ const publicSubmissionSchema = z.object({
 });
 
 const publicProblemProgressSchema = z.object({
-  id: z.string().regex(SAFE_PROBLEM_ID),
+  id: z.string().max(256),
   max_points: nonNegNum,
   attempts: nonNegInt,
   status: z.enum(['unattempted', 'pending', 'accepted', 'partial', 'wrong']),
@@ -202,6 +241,18 @@ const publicProblemProgressSchema = z.object({
   first_ac_ms: nonNegInt.optional(),
   last_verdict: z.string().max(64).optional(),
   last_elapsed_ms: nonNegInt.optional(),
+});
+
+const publicActivitySchema = z.object({
+  seq: nonNegInt,
+  elapsed_ms: nonNegInt,
+  type: z.string().min(1).max(64),
+  problem_id: z.string().max(256).optional(),
+  submission_id: z.string().max(128).optional(),
+  language: z.string().max(64).optional(),
+  verdict: z.string().max(64).optional(),
+  score: nonNegNum.optional(),
+  turn: nonNegInt.optional(),
 });
 
 const publicTelemetrySchema = z.object({
@@ -233,6 +284,7 @@ export const runCompletedPayloadSchema = z.object({
   elapsed_ms: nonNegInt.optional(),
   duration_ms: nonNegInt.optional(),
   submissions_used: nonNegInt.optional(),
+  problem_breakdown_unavailable: z.boolean().optional(),
   submissions: z.array(publicSubmissionSchema).max(1000).optional(),
   timestamp: z.iso.datetime().optional(),
 });
@@ -260,7 +312,9 @@ export const runProgressPayloadSchema = z.object({
   max_score: nonNegNum.optional(),
   solved_count: nonNegInt.optional(),
   problem_count: nonNegInt.optional(),
+  problem_breakdown_unavailable: z.boolean().optional(),
   problems: z.array(publicProblemProgressSchema).max(200).optional(),
+  recent_activity: z.array(publicActivitySchema).max(50).optional(),
   telemetry: publicTelemetrySchema.optional(),
   timestamp: z.iso.datetime().optional(),
 });
@@ -291,28 +345,67 @@ export const batchCompletedPayloadSchema = z.object({
   timestamp: z.iso.datetime().optional(),
 });
 
+function buildTrustedProblemSet(validProblemIds?: ReadonlySet<string> | readonly string[]): Set<string> | undefined {
+  if (!validProblemIds) return undefined;
+  const set = new Set<string>();
+  for (const item of validProblemIds) {
+    if (contestProblemId.safeParse(item).success) set.add(item);
+  }
+  return set;
+}
+
+function isTrustedProblemId(problemId: string, trustedSet: Set<string>): boolean {
+  return contestProblemId.safeParse(problemId).success && trustedSet.has(problemId);
+}
+
 export function sanitizePushPayload(
   eventType: PushDeliveryEvent,
   payload: unknown,
   opts: { validProblemIds?: ReadonlySet<string> | readonly string[] } = {},
 ): Record<string, unknown> {
   if (eventType === 'ping') return pingPayloadSchema.parse(payload);
-  if (eventType === 'run.progress') return runProgressPayloadSchema.parse(payload);
   if (eventType === 'batch.completed') return batchCompletedPayloadSchema.parse(payload);
 
-  const parsed = runCompletedPayloadSchema.parse(payload);
-  if (parsed.submissions) {
-    const validSet = opts.validProblemIds
-      ? (opts.validProblemIds instanceof Set ? opts.validProblemIds : new Set(opts.validProblemIds))
-      : undefined;
-    parsed.submissions = parsed.submissions.map(sub => {
-      const isInvalid = sub.verdict.trim().toLowerCase() === 'invalid_submission';
-      const allowedId = !isInvalid && SAFE_PROBLEM_ID.test(sub.problem_id) && (!validSet || validSet.has(sub.problem_id));
-      return {
-        ...sub,
-        problem_id: allowedId ? sub.problem_id : '[invalid]',
-      };
-    });
+  const trustedSet = buildTrustedProblemSet(opts.validProblemIds);
+
+  if (eventType === 'run.completed') {
+    const parsed = runCompletedPayloadSchema.parse(payload);
+    if (parsed.submissions !== undefined) {
+      if (!trustedSet) {
+        // Fail closed by default: never forward unverified per-submission problem IDs without a trusted set.
+        delete parsed.submissions;
+        parsed.problem_breakdown_unavailable = true;
+      } else {
+        parsed.submissions = parsed.submissions.map(sub => {
+          const isInvalid = sub.verdict.trim().toLowerCase() === 'invalid_submission';
+          const allowed = !isInvalid && isTrustedProblemId(sub.problem_id, trustedSet);
+          return { ...sub, problem_id: allowed ? sub.problem_id : '[invalid]' };
+        });
+      }
+    }
+    return parsed;
+  }
+
+  // run.progress
+  const parsed = runProgressPayloadSchema.parse(payload);
+  if (!trustedSet) {
+    if (parsed.problems !== undefined || parsed.recent_activity !== undefined) {
+      delete parsed.problems;
+      delete parsed.recent_activity;
+      parsed.problem_breakdown_unavailable = true;
+    }
+  } else {
+    if (parsed.problems !== undefined) {
+      parsed.problems = parsed.problems.filter(p => isTrustedProblemId(p.id, trustedSet));
+    }
+    if (parsed.recent_activity !== undefined) {
+      parsed.recent_activity = parsed.recent_activity.map(act => {
+        if (act.problem_id === undefined) return act;
+        const isInvalid = act.verdict?.trim().toLowerCase() === 'invalid_submission';
+        const allowed = !isInvalid && isTrustedProblemId(act.problem_id, trustedSet);
+        return { ...act, problem_id: allowed ? act.problem_id : '[invalid]' };
+      });
+    }
   }
   return parsed;
 }
@@ -402,6 +495,7 @@ const secretChannel = (op: 'store' | 'lookup' | 'clear', ref: string, input?: st
 function toPublicTarget(stored: StoredPushTarget, credentialAvailable?: boolean): PushTarget {
   return pushTargetResponseSchema.parse({
     id: stored.id,
+    ...(stored.instance_id !== undefined ? { instance_id: stored.instance_id } : {}),
     label: stored.label,
     url: stored.url,
     approved_origin: stored.approved_origin,
@@ -577,6 +671,7 @@ export class PushTargets {
 
       const storedRecord: StoredPushTarget = storedTargetSchema.parse({
         id,
+        instance_id: randomUUID(),
         label: data.label,
         url: data.url,
         approved_origin: new URL(data.url).origin,
@@ -613,7 +708,6 @@ export class PushTargets {
         updated_at: new Date().toISOString(),
       });
       if (old.auth_mode !== 'none') {
-        // Fail closed when the stored credential cannot be verified against updated public metadata.
         let currentSecret: string | undefined;
         try {
           currentSecret = await this.readSecret(old);
@@ -738,8 +832,25 @@ export function sanitizeDeliveryError(message: string, secret?: string): string 
   return clean.slice(0, 500) || 'delivery_failed';
 }
 
+class BlockedDestinationError extends Error {
+  readonly code = 'CR_BLOCKED_DESTINATION';
+  constructor() { super('blocked_destination'); }
+}
+
+class RedirectRejectedError extends Error {
+  readonly code = 'CR_REDIRECT_REJECTED';
+  constructor() { super('redirect_rejected'); }
+}
+
+function isBlockedDestinationError(error: unknown): boolean {
+  return error instanceof BlockedDestinationError ||
+    (error instanceof Error && (error as NodeJS.ErrnoException).code === 'CR_BLOCKED_DESTINATION');
+}
+
 function isRedirectError(error: unknown): boolean {
+  if (error instanceof RedirectRejectedError) return true;
   if (!(error instanceof Error)) return false;
+  if ((error as NodeJS.ErrnoException).code === 'CR_REDIRECT_REJECTED') return true;
   const causeMsg = error.cause instanceof Error ? error.cause.message : '';
   return /redirect/i.test(`${error.message} ${causeMsg}`);
 }
@@ -751,17 +862,108 @@ function isTimeoutError(error: unknown): boolean {
 
 function classifyTransportError(error: unknown, callerAborted: boolean): string {
   if (callerAborted) return 'delivery_aborted';
+  if (isBlockedDestinationError(error)) return 'blocked_destination';
   if (isRedirectError(error)) return 'redirect_rejected';
   if (isTimeoutError(error)) return 'request_timeout';
   return 'network_error';
 }
 
-export type LookupAddressFn = (hostname: string) => Promise<Array<{ address: string }>>;
+export type LookupAddressFn = (hostname: string) => Promise<Array<{ address: string; family?: number }>>;
 
 const defaultLookupAddresses: LookupAddressFn = async hostname => {
   const entries = await dnsLookup(hostname, { all: true });
-  return entries.map(entry => ({ address: entry.address }));
+  return entries.map(entry => ({ address: entry.address, family: entry.family }));
 };
+
+// Connection-layer pinned HTTP/HTTPS transport: resolves and validates destination IPs inside
+// Node's socket `lookup` hook (eliminating DNS rebinding TOCTOU while preserving TLS SNI/cert validation).
+function sendPinnedHttpRequest(
+  urlStr: string,
+  headers: Record<string, string>,
+  body: string,
+  signal: AbortSignal,
+  resolver: LookupAddressFn,
+): Promise<{ status: number }> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const u = new URL(urlStr);
+    const bareHost = u.hostname.replace(/^\[|\]$/g, '');
+    if (isBlockedHost(u.hostname)) {
+      rejectPromise(new BlockedDestinationError());
+      return;
+    }
+
+    const pinnedLookup: NonNullable<HttpRequestOptions['lookup']> = (hostname, options, callback) => {
+      void (async () => {
+        try {
+          if (isBlockedHost(hostname)) throw new BlockedDestinationError();
+          const bare = hostname.replace(/^\[|\]$/g, '');
+          const ipVer = isIP(bare);
+          let entries: Array<{ address: string; family: number }>;
+          if (ipVer !== 0) {
+            if (isBlockedIpAddress(bare)) throw new BlockedDestinationError();
+            entries = [{ address: bare, family: ipVer }];
+          } else {
+            const resolved = await resolver(bare);
+            entries = resolved.map(item => ({
+              address: item.address,
+              family: item.family ?? (isIP(item.address) || 4),
+            }));
+            if (!entries.length || entries.some(item => isBlockedIpAddress(item.address))) {
+              throw new BlockedDestinationError();
+            }
+          }
+          const wantsAll = typeof options === 'object' && options !== null && options.all === true;
+          if (wantsAll) {
+            (callback as (err: null, addresses: Array<{ address: string; family: number }>) => void)(null, entries);
+          } else {
+            (callback as (err: null, address: string, family: number) => void)(null, entries[0]!.address, entries[0]!.family);
+          }
+        } catch (err) {
+          (callback as (err: NodeJS.ErrnoException) => void)(err as NodeJS.ErrnoException);
+        }
+      })();
+    };
+
+    const bodyBuf = Buffer.from(body, 'utf8');
+    const reqHeaders = { ...headers, 'Content-Length': String(bodyBuf.length) };
+    const reqFn = u.protocol === 'https:' ? httpsRequest : httpRequest;
+    const reqOpts: HttpRequestOptions & { servername?: string } = {
+      protocol: u.protocol,
+      hostname: bareHost,
+      port: u.port ? Number(u.port) : (u.protocol === 'https:' ? 443 : 80),
+      path: `${u.pathname}${u.search}`,
+      method: 'POST',
+      headers: reqHeaders,
+      lookup: pinnedLookup,
+      signal,
+      ...(u.protocol === 'https:' && isIP(bareHost) === 0 ? { servername: bareHost } : {}),
+    };
+
+    let settled = false;
+    const finish = (err: unknown, result?: { status: number }) => {
+      if (settled) return;
+      settled = true;
+      if (err) rejectPromise(err);
+      else resolvePromise(result!);
+    };
+
+    const req = reqFn(reqOpts, res => {
+      const status = res.statusCode ?? 0;
+      // Never follow redirects (maxRedirects = 0): reject any 3xx cleanly.
+      if (status >= 300 && status < 400) {
+        res.destroy();
+        finish(new RedirectRejectedError());
+        return;
+      }
+      res.resume();
+      res.once('end', () => finish(null, { status }));
+      res.once('error', err => finish(err));
+    });
+
+    req.once('error', err => finish(err));
+    req.end(bodyBuf);
+  });
+}
 
 export interface PushDispatcherOptions {
   deliveriesFile?: string;
@@ -783,7 +985,7 @@ export interface DeliverOptions {
 
 export class PushDispatcher {
   readonly deliveriesFile: string;
-  private readonly defaultFetch: typeof fetch;
+  private readonly defaultFetch?: typeof fetch;
   private readonly defaultLookup?: LookupAddressFn;
   private readonly defaultSleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly now: () => number;
@@ -791,23 +993,22 @@ export class PushDispatcher {
 
   constructor(private readonly targets: PushTargets, opts: PushDispatcherOptions = {}) {
     this.deliveriesFile = resolve(opts.deliveriesFile ?? join(targets.root, 'deliveries.jsonl'));
-    this.defaultFetch = opts.fetchImpl ?? globalThis.fetch;
+    this.defaultFetch = opts.fetchImpl;
     this.defaultLookup = opts.lookupImpl;
     this.defaultSleep = opts.sleep ?? defaultSleep;
     this.now = opts.now ?? (() => Date.now());
     this.concurrency = Math.max(1, Math.min(16, Math.floor(opts.concurrency ?? 4)));
   }
 
-  private async verifyDestinationDns(urlStr: string, fetchFn: typeof fetch, lookupImpl?: LookupAddressFn): Promise<boolean> {
+  private async verifyDestinationDnsForFetch(urlStr: string, lookupImpl?: LookupAddressFn): Promise<boolean> {
     const u = new URL(urlStr);
     const bare = u.hostname.replace(/^\[|\]$/g, '');
     if (isBlockedHost(u.hostname)) return false;
-    if (isLoopbackHost(u.hostname) || isIP(bare) !== 0) return true;
+    if (isLoopbackHost(u.hostname) && !lookupImpl && !this.defaultLookup) return true;
+    if (isIP(bare) !== 0) return !isBlockedIpAddress(bare);
 
-    // When using a mocked fetchImpl without an explicit lookupImpl, skip real network DNS.
-    const resolver = lookupImpl ?? this.defaultLookup ?? (fetchFn === globalThis.fetch ? defaultLookupAddresses : undefined);
-    if (!resolver) return true;
-
+    // Always resolve via lookupImpl or real DNS (never skip for custom fetchImpl).
+    const resolver = lookupImpl ?? this.defaultLookup ?? defaultLookupAddresses;
     const resolved = await resolver(bare);
     if (!resolved.length) return false;
     return resolved.every(item => !isBlockedIpAddress(item.address));
@@ -844,7 +1045,8 @@ export class PushDispatcher {
   ): Promise<PushDelivery | undefined> {
     if (opts.signal?.aborted) return undefined;
 
-    const fetchFn = opts.fetchImpl ?? this.defaultFetch;
+    const customFetch = opts.fetchImpl ?? this.defaultFetch;
+    const resolver = opts.lookupImpl ?? this.defaultLookup ?? defaultLookupAddresses;
     const sleepFn = opts.sleep ?? this.defaultSleep;
     const deliveryId = randomUUID();
     const startMs = this.now();
@@ -881,6 +1083,11 @@ export class PushDispatcher {
       return undefined;
     }
 
+    // Pin initial target identity so delete-and-recreate under the same ID aborts retries.
+    const initialOrigin = target.approved_origin;
+    const initialCreatedAt = target.created_at;
+    const initialInstanceId = target.instance_id;
+
     const body = JSON.stringify(sanitizedPayload);
     const maxAttempts = 1 + target.max_retries;
     let attempts = 0;
@@ -894,7 +1101,7 @@ export class PushDispatcher {
         break;
       }
 
-      // Before every retry attempt, re-verify target enabled/events/credentials under lock.
+      // Before every retry attempt, re-verify target identity, enabled state, events, and credentials under lock.
       if (attempt > 1) {
         try {
           const refreshed = await loadTarget();
@@ -904,24 +1111,18 @@ export class PushDispatcher {
           lastError = 'target_unavailable';
           break;
         }
+        if (
+          target.approved_origin !== initialOrigin ||
+          target.created_at !== initialCreatedAt ||
+          target.instance_id !== initialInstanceId
+        ) {
+          lastError = 'target_replaced';
+          break;
+        }
         if (eventType !== 'ping' && (!target.enabled || !target.events.includes(eventType))) {
           lastError = 'target_disabled';
           break;
         }
-      }
-
-      // Check DNS resolution against link-local / IMDS / unspecified IP ranges before sending.
-      let dnsAllowed: boolean;
-      try {
-        dnsAllowed = await this.verifyDestinationDns(target.url, fetchFn, opts.lookupImpl);
-      } catch {
-        dnsAllowed = false;
-      }
-      if (!dnsAllowed) {
-        attempts = attempt;
-        lastStatus = undefined;
-        lastError = 'blocked_destination';
-        break;
       }
 
       attempts = attempt;
@@ -943,29 +1144,52 @@ export class PushDispatcher {
         : AbortSignal.timeout(target.timeout_ms);
 
       try {
-        const response = await fetchFn(target.url, {
-          method: 'POST',
-          headers,
-          body,
-          redirect: 'error',
-          signal: attemptSignal,
-        });
-        lastStatus = response.status;
-        await response.body?.cancel().catch(() => {});
+        let status: number;
+        if (customFetch) {
+          let dnsAllowed: boolean;
+          try {
+            dnsAllowed = await this.verifyDestinationDnsForFetch(target.url, opts.lookupImpl);
+          } catch {
+            dnsAllowed = false;
+          }
+          if (!dnsAllowed) throw new BlockedDestinationError();
 
-        if (response.status >= 200 && response.status < 300) {
+          const response = await customFetch(target.url, {
+            method: 'POST',
+            headers,
+            body,
+            redirect: 'error',
+            signal: attemptSignal,
+          });
+          status = response.status;
+          await response.body?.cancel().catch(() => {});
+          if (status >= 300 && status < 400) throw new RedirectRejectedError();
+        } else {
+          const res = await sendPinnedHttpRequest(target.url, headers, body, attemptSignal, resolver);
+          status = res.status;
+        }
+
+        lastStatus = status;
+        if (status >= 200 && status < 300) {
           delivered = true;
           lastError = undefined;
           break;
         }
 
-        lastError = `HTTP ${response.status}`;
-        const retryable = response.status === 429 || response.status >= 500;
+        lastError = `HTTP ${status}`;
+        const retryable = status === 429 || status >= 500;
         if (!retryable || attempt >= maxAttempts) break;
       } catch (error) {
         lastStatus = undefined;
         lastError = classifyTransportError(error, Boolean(opts.signal?.aborted));
-        if (opts.signal?.aborted || isRedirectError(error) || attempt >= maxAttempts) break;
+        if (
+          opts.signal?.aborted ||
+          isBlockedDestinationError(error) ||
+          isRedirectError(error) ||
+          attempt >= maxAttempts
+        ) {
+          break;
+        }
       }
 
       const backoffMs = Math.min(10_000, 250 * 2 ** (attempt - 1));

@@ -322,14 +322,11 @@ export function extractPdfTextFallbackDetailed(
         const inflated = inflateSync(rawSlice, { maxOutputLength: streamLimit });
         totalInflated += inflated.length;
         contentText = inflated.toString('latin1');
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException)?.code;
-        if (code === 'ERR_BUFFER_TOO_LARGE' || /output length/i.test(String((error as Error)?.message ?? ''))) {
-          // Stop immediately on the first decompression-bomb stream to bound CPU/memory work.
-          truncated = true;
-          break;
-        }
-        contentText = undefined;
+      } catch {
+        // Any FlateDecode failure (decompression bomb or corrupt stream) halts further inflation
+        // so corrupt streams cannot bypass the document work budget while preserving earlier text.
+        truncated = true;
+        break;
       }
     } else {
       if (rawSlice.length > maxStreamInflate || totalInflated + rawSlice.length > maxTotalInflate) {

@@ -106,6 +106,22 @@ test('parsePdfPageCountFallback handles out-of-order PDF dictionary keys and ext
   assert.ok(!detailed.text.includes('SHOULD_BE_SKIPPED_IMAGE'), 'Image stream must be skipped before inflating');
   assert.ok(detailed.text.includes('Problem A: Safe Text'));
   assert.ok(!detailed.text.includes('After Bomb Should Stop'), 'Must halt immediately on first oversized FlateDecode stream');
+
+  // Corrupted FlateDecode stream also immediately sets truncated=true and halts further inflation while keeping prior text
+  const corruptBytes = Buffer.from([0x78, 0x9c, 0xff, 0xff, 0xff, 0x00, 0x01]);
+  const corruptPdf = Buffer.concat([
+    Buffer.from('%PDF-1.4\n1 0 obj\n<< /Filter /FlateDecode /Length ' + textPayload.length + ' >>\nstream\n', 'latin1'),
+    textPayload,
+    Buffer.from('\nendstream\nendobj\n2 0 obj\n<< /Filter /FlateDecode /Length ' + corruptBytes.length + ' >>\nstream\n', 'latin1'),
+    corruptBytes,
+    Buffer.from('\nendstream\nendobj\n3 0 obj\n<< /Filter /FlateDecode /Length ' + afterBombPayload.length + ' >>\nstream\n', 'latin1'),
+    afterBombPayload,
+    Buffer.from('\nendstream\nendobj\n%%EOF\n', 'latin1'),
+  ]);
+  const corruptDetailed = extractPdfTextFallbackDetailed(corruptPdf);
+  assert.equal(corruptDetailed.truncated, true);
+  assert.ok(corruptDetailed.text.includes('Problem A: Safe Text'));
+  assert.ok(!corruptDetailed.text.includes('After Bomb Should Stop'), 'Must halt immediately on corrupt FlateDecode stream');
 });
 
 test('synthesizeTextContestPdf generates exact xref byte offsets, enforces Unicode/overwrite safety, and inspects identically across poppler and fallback', async t => {
