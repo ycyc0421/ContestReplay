@@ -442,10 +442,13 @@ async function previewGymPageHtml(
   const currentGymLinkRe = new RegExp(`^${escapedBase}/gym/${numericId}(?:/|$)`);
   const anyContestLinkRe = new RegExp(`^${escapedBase}/(contest|gym)/(\\d+)(?:/|$)`);
 
-  const candidateBoxes = nodes.filter(n => {
-    const cls = (htmlAttr(n, 'class') ?? '').toLowerCase();
-    return cls.includes('sidebox') || cls.includes('rtable');
-  });
+  const hasClass = (node: (typeof nodes)[number], token: string) =>
+    (htmlAttr(node, 'class') ?? '')
+      .toLowerCase()
+      .split(/\s+/)
+      .includes(token);
+
+  const candidateBoxes = nodes.filter(n => hasClass(n, 'sidebox') || hasClass(n, 'rtable'));
   // Exclude only nested duplicate boxes (e.g. an .rtable inside a .sidebox),
   // preserving standalone .rtable status tables alongside unrelated .sidebox panels.
   const nestedNodes = new Set<(typeof candidateBoxes)[number]>();
@@ -488,13 +491,10 @@ async function previewGymPageHtml(
   if (currentGymBoxes.length > 0) {
     const boxNodes = currentGymBoxes.flatMap(walkHtml);
     const phaseValues = boxNodes
-      .filter(n => {
-        const cls = (htmlAttr(n, 'class') ?? '').toLowerCase();
-        return cls.includes('contest-state-phase');
-      })
+      .filter(n => hasClass(n, 'contest-state-phase'))
       .map(n => htmlText(n).replace(/\s+/g, ' ').trim().toLowerCase())
       .filter(Boolean);
-    const hasCountdown = boxNodes.some(n => (htmlAttr(n, 'class') ?? '').toLowerCase().includes('countdown'));
+    const hasCountdown = boxNodes.some(n => hasClass(n, 'countdown'));
 
     const FINISHED_PHASES = new Set(['finished', 'contest is over', 'final standings']);
     const ACTIVE_PHASES = new Set([
