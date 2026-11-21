@@ -988,4 +988,90 @@ test('WorkspaceIndex confines custom root & transitive deps, enforces strict eff
   assert.ok(v1Cell);
   assert.equal(v1Cell.completed_count, 0);
   assert.equal(v1Cell.historical_completed_count, 5);
+
+  // Completed run executed via collapsed equivalent profile (dup-v1.zz-priority.json) MUST be credited
+  // to the collapsed planner-revision cell (dup-v1.zz-copy.json) with 1 completion and 0 gaps!
+  const loadedPriority = await loadAgent(join(base, 'agents', 'dup-v1.zz-priority.json'), store);
+  const priorityRunId = randomUUID();
+  await writeRunFixture(customRoot, {
+    runId: priorityRunId,
+    agentId: 'dup-id',
+    agentRevision: loadedPriority.profileDigest,
+    profileSha256: loadedPriority.profileDigest,
+    effectiveSha256: loadedPriority.effectiveDigest,
+    speedTier: 'fast',
+    contestId: 'strict-r1',
+    dataVersion: 1,
+    contestRevision: loadedContest.contestRevision,
+    protocolSha256: protocolDigest,
+    status: 'completed',
+    score: 200,
+    maxScore: 200,
+    createdAt: '2026-01-01T15:00:00.000Z',
+  });
+  await index.sync({ base, root: customRoot, store, credentialDirs: [credInBase] });
+  const covWithEquiv = index.queryCoverage({ agentIds: ['dup-id'], contestIds: ['strict-r1'] });
+  const equivCell = covWithEquiv.find(c => c.agent_path === 'agents/dup-v1.zz-copy.json');
+  assert.ok(equivCell);
+  assert.equal(equivCell.completed_count, 1);
+  // Check isolated fast+priority group yields batch_spec: null (0 gaps)
+  const fastOnlyBase = await makeTempDir(t, 'cr-idx-equiv-base-');
+  const fastOnlyRoot = join(fastOnlyBase, 'runs');
+  await mkdir(join(fastOnlyBase, 'agents'), { recursive: true });
+  await mkdir(fastOnlyRoot, { recursive: true, mode: 0o700 });
+  const fastContestPath = await writeContestFixture(fastOnlyBase, 'equiv-r1', 1);
+  const loadedFastContest = await loadContest(fastContestPath);
+  const fastPath = join(fastOnlyBase, 'agents', 'fast.json');
+  const prioPath = join(fastOnlyBase, 'agents', 'priority.json');
+  await writeFile(
+    fastPath,
+    JSON.stringify({
+      kind: 'contestreplay.dev/agent',
+      schema_version: 1,
+      id: 'same-tier-agent',
+      model: 'gpt-5.3-codex',
+      speed_tier: 'fast',
+      provider: 'p-strict',
+      harness: { kind: 'codex', version: '0.170.0', options: { reasoning_effort: 'medium', service_tier: 'fast' } },
+    }),
+  );
+  await writeFile(
+    prioPath,
+    JSON.stringify({
+      kind: 'contestreplay.dev/agent',
+      schema_version: 1,
+      id: 'same-tier-agent',
+      model: 'gpt-5.3-codex',
+      speed_tier: 'fast',
+      provider: 'p-strict',
+      harness: { kind: 'codex', version: '0.170.0', options: { reasoning_effort: 'medium', service_tier: 'priority' } },
+    }),
+  );
+  const loadedPrioOnly = await loadAgent(prioPath, store);
+  await writeRunFixture(fastOnlyRoot, {
+    runId: randomUUID(),
+    agentId: 'same-tier-agent',
+    agentRevision: loadedPrioOnly.profileDigest,
+    profileSha256: loadedPrioOnly.profileDigest,
+    effectiveSha256: loadedPrioOnly.effectiveDigest,
+    speedTier: 'fast',
+    contestId: 'equiv-r1',
+    dataVersion: 1,
+    contestRevision: loadedFastContest.contestRevision,
+    protocolSha256: protocolDigest,
+    status: 'completed',
+    score: 200,
+    maxScore: 200,
+    createdAt: '2026-01-01T16:00:00.000Z',
+  });
+  const equivIndex = new WorkspaceIndex(fastOnlyRoot);
+  t.after(() => equivIndex.close());
+  await equivIndex.sync({ base: fastOnlyBase, root: fastOnlyRoot, store });
+  const equivCov = equivIndex.queryCoverage();
+  assert.equal(equivCov.length, 1);
+  assert.equal(equivCov[0].agent_path, 'agents/fast.json');
+  assert.equal(equivCov[0].completed_count, 1);
+  const equivGaps = equivIndex.findUncoveredCells();
+  assert.equal(equivGaps.total_gaps, 0);
+  assert.equal(toBatchSpec(equivGaps), null);
 });

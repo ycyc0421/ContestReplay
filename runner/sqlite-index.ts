@@ -523,10 +523,19 @@ interface RunQueryRow {
 
 function runMatchesCurrentRevision(
   r: RunQueryRow,
-  agent: { agent_revision: string | null; effective_sha256: string | null; speed_tier: string | null },
+  agent: {
+    agent_revision: string | null;
+    equivalent_profile_hashes?: ReadonlySet<string>;
+    effective_sha256: string | null;
+    speed_tier: string | null;
+  },
   contest: { contest_revision: string | null; contest_sha256: string | null; protocol_sha256: string | null },
 ): boolean {
-  if (agent.agent_revision !== null) {
+  const validProfiles = agent.equivalent_profile_hashes;
+  if (validProfiles && validProfiles.size > 0) {
+    const runProfile = r.profile_sha256 ?? r.agent_revision;
+    if (!validProfiles.has(runProfile)) return false;
+  } else if (agent.agent_revision !== null) {
     if (r.profile_sha256 !== null) {
       if (r.profile_sha256 !== agent.agent_revision) return false;
     } else if (r.agent_revision !== agent.agent_revision) {
@@ -2077,17 +2086,27 @@ export class WorkspaceIndex {
     }
 
     // Collapse duplicate paths that resolve to the EXACT same planner revision identity (so toBatchSpec
-    // never emits duplicate revisions rejected by makePlan), while preserving distinct valid revisions sharing an ID!
-    const uniqueAgents: typeof agentRows = [];
-    const seenAgentRevs = new Set<string>();
+    // never emits duplicate revisions rejected by makePlan), while preserving distinct valid revisions sharing an ID
+    // AND crediting runs executed through ANY equivalent profile hash inside the collapsed group!
+    type GroupedAgent = (typeof agentRows)[number] & { equivalent_profile_hashes: Set<string> };
+    const uniqueAgents: GroupedAgent[] = [];
+    const groupedAgentsByRev = new Map<string, GroupedAgent>();
     for (const a of agentRows) {
       const revKey =
         a.valid === 1 && a.planner_revision !== null
           ? JSON.stringify([a.id, a.planner_revision, a.speed_tier ?? 'standard'])
           : `path:${a.path}`;
-      if (seenAgentRevs.has(revKey)) continue;
-      seenAgentRevs.add(revKey);
-      uniqueAgents.push(a);
+      const existing = groupedAgentsByRev.get(revKey);
+      if (existing) {
+        if (a.agent_revision !== null) existing.equivalent_profile_hashes.add(a.agent_revision);
+        continue;
+      }
+      const grouped: GroupedAgent = {
+        ...a,
+        equivalent_profile_hashes: new Set(a.agent_revision !== null ? [a.agent_revision] : []),
+      };
+      groupedAgentsByRev.set(revKey, grouped);
+      uniqueAgents.push(grouped);
     }
 
     const uniqueContests: typeof contestRows = [];
