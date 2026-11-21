@@ -1,6 +1,6 @@
-# 下一版设计：真实 Harness 与 OJ 判题
+# 下一版设计：真实 Harness 与 OJ 判题（历史参考）
 
-本文保留架构讨论背景。当前命令、实际实现和验证范围以 [README](../README.md) 为准。
+> **文档状态**：真实 Codex 适配、MCP 异步提交（`submit`/`status`/`finish`）与 Codeforces Practice 适配已落地，Agent Manifest v2 与 Provider 凭据库取代了文中的早期单文件 TOML 草案。当前实现以 [README](../README.md) 和 [Studio 配置契约](studio-contract-gaps.md) 为准；Codeforces 配置重构以及 QOJ / VJudge 适配计划见 [路线思考](roadmap.md)。
 
 ## 1. 当前 MVP 和目标架构的区别
 

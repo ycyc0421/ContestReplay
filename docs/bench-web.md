@@ -1,6 +1,6 @@
-# 统一 Web 与结果文件
+# 统一 Web 与结果文件（后续提案）
 
-当前已实现 `cr studio` 的最小本机控制台，提供配置路径输入、计划预览、批次启动、日志和停止。它和 CLI 使用同一套落盘队列与执行逻辑，并且只监听 `127.0.0.1`。下面的结果交换和公开榜单仍是后续提案；目标是公开模式只读、可静态部署到 Cloudflare Pages，不连接本机控制接口。
+> **文档状态**：本机工作台 `cr studio` 已完成 React SPA 重写，支持配置目录、三步稀疏矩阵编排、配置工具、同源 write-only Providers 管理、运行日志、停止与结果导出（只监听 `127.0.0.1`），详见 [README](../README.md) 与 [DESIGN.md](../DESIGN.md)。`cr results export/merge/rank` 已支持 `schema_version: 2`（兼容读取 v1）。下文的**静态公开榜单站点**（部署到静态托管、浏览 `results.json` 与浏览器本地导入/分享）仍在规划中，与 [路线思考](roadmap.md) 中的榜单口径讨论衔接。
 
 ## 用户流程
 

@@ -1,6 +1,6 @@
-# CLI 输入示例：`problems.pdf` + Codex
+# CLI 输入示例：`problems.pdf` + Codex（历史参考）
 
-下文是输入契约示例，不是已经实现的命令。`codex` 是候选适配器，不是当前草案已选的 `builtin-responses` 首发适配器。示例把 Codex CLI 版本写为 `0.170.0`；本机能确认该版本和 CLI 参数，但未验证模型中继、PDF 输入或整场运行。
+> **文档状态**：早期输入契约草案，保留作背景参考。Codex `0.170.0` 已完成禁网 Docker、逐页 PNG 题面、宿主 Responses 中继与比赛 MCP 的实测接入；实际可运行样例见 [`examples/demo/`](../examples/demo/)，新版 Agent Manifest（TOML/YAML/JSON + Provider 引用）与命令用法见 [README](../README.md) 和 [Studio 配置契约](studio-contract-gaps.md)。
 
 ## 准备场次和 Agent
 

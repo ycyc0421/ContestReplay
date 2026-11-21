@@ -13,14 +13,22 @@ docker build -t cr-bench:0.1.0 .
 docker build -f Dockerfile.codex -t cr-codex:0.170.0 .
 ```
 
-源码目录下用 `node dist/cli.js`；安装这个本地包后，命令名为 `cr`。下面示例用自制含图试卷和本地答案表。模型 API Key 由宿主环境提供，示例默认使用 `OPENAI_API_KEY`。按自己的 API 账号核对 [Codex 示例](examples/demo/codex.toml) 中的模型是否可用。
+源码目录下用 `node dist/cli.js`；安装这个本地包后，命令名为 `cr`。下面示例用自制含图试卷和本地答案表。模型 API Key 可通过 Studio 的 **Providers** 页面、`cr provider add` 或旧版宿主环境变量（示例默认 `OPENAI_API_KEY`）提供。按自己的 API 账号核对 [Codex 示例](examples/demo/codex.toml) 中的模型是否可用。
 
 ```sh
 node dist/cli.js bench run examples/demo/contest.json --agent examples/demo/codex.toml
 node dist/cli.js studio
 ```
 
-打开 Studio 打印的 `http://127.0.0.1:…`：新建或填写已有的 Contest、Agent 配置，生成矩阵计划，启动后监看 stdout/stderr，必要时停止当前格或整批，最后导出已完赛结果。关闭浏览器不会停赛；退出 `cr studio` 会中断当前运行，未启动的格子可显式续跑。Studio 只监听本机，不要把它反向代理到公网。
+打开 Studio 打印的 `http://127.0.0.1:…`：
+
+- **运行总览**：查看批次进度、展开任务格、导出已完赛结果、停止单格或整批。
+- **新建批次**：三步编排（选择配置目录 → 精修稀疏矩阵/任务列表 → 核对并启动锁定计划）。
+- **配置工具**：按后端能力创建 Agent Manifest（默认托管保存到 `agents/<id>.toml`）或上传完整 PDF 并制作本地题目表。
+- **Providers**：安全创建、编辑元数据、轮换 API Key 和删除可复用接入配置（秘密只写不读）。
+- **运行日志**：实时查看 `stdout` / `stderr` 并支持取消运行中任务。
+
+关闭浏览器不会停赛；退出 `cr studio` 会中断当前运行，未启动的格子可显式续跑。Studio 只监听本机，不要把它反向代理到公网。
 
 ## 定义场次和 Agent
 
@@ -30,12 +38,12 @@ node dist/cli.js studio
 cr contest init examples/demo/local.json --id demo-local --title 'Demo Final' \
   --pdf problems.pdf --answers judge.json
 cr contest validate examples/demo/local.json
-cr agent init codex-high.toml --id codex-high --harness codex \
-  --model gpt-5.3-codex --reasoning-effort high --family gpt-5-codex
-cr agent validate codex-high.toml
+cr agent init codex-high.yaml --id codex-high --harness codex \
+  --model gpt-5.3-codex --provider openai-production --vendor openai --reasoning-effort high
+cr agent validate codex-high.yaml
 ```
 
-**Agent 是确定的 harness 和配置。** 一份 TOML 描述 `id`、`harness`、`api`、`model`、`base_url`、`api_key_env`，按 harness 可选 `reasoning_effort` 或 `temperature`。`model_family_id` 是显式研究标签，不参与计分，也不改变 Agent 修订。只有 Responses 协议已实现；不支持的配置报错，不静默从一个 harness 或推理档切到另一个。自定义端点必须在宿主将 `<api_key_env>_BASE_URL` 设为同一 URL（去掉末尾 `/`），再提供对应密钥。
+**Agent 是确定的 harness 和配置。** 新版 Agent Manifest 支持 TOML、YAML 或 JSON，引用本机 Provider（`connection` 为兼容别名）；模型 `vendor` 与 API `provider` 分离，`vendor` 为可选研究元数据，不影响运行修订。旧版 CLI 模板仍可用：一份 TOML 描述 `id`、`harness`、`api`、`model`、`base_url`、`api_key_env`，按 harness 可选 `reasoning_effort` 或 `temperature`（`model_family_id` 保留旧版读取兼容）。只有 Responses 协议已实现；不支持的配置直接报错，不静默降级。使用旧版环境变量自定义端点时，必须在宿主将 `<api_key_env>_BASE_URL` 设为同一 URL（去掉末尾 `/`），再提供对应密钥。
 
 | Harness | 题面 | 判题 |
 | --- | --- | --- |
@@ -46,18 +54,30 @@ Codex 在每场新建的无外网容器中自己跑一个会话，可在临时�
 
 ### Codeforces
 
-只用于有权限的历史题 Practice 提交。先放好题面 PDF，再导入赛事和题号（程序题默认每题一分）：
+只用于有权限的历史题 Practice 提交。运行前需要准备四样东西：
+
+1. **完整题面 PDF**：自行放置或上传到场次目录（题号与平台题号不一致时在 `contest.json` 中配置 `problem_map`）。
+2. **已结束的赛事 ID**（`contest`）：用于从 `codeforces.com/api/contest.standings` 导入题号并校验提交归属。
+3. **专用账号名（`handle`）与语言映射（`languages`）**：`languages` 将 Agent 提交时使用的语言标识映射到 Codeforces 内部 `programTypeId`（例如 `{"cpp17":54}`；请按目标赛事实际可用语言 ID 核对）。运行期间不得在别处使用同一账号提交。
+4. **宿主提交通道（二选一，勿写入配置文件）**：
+   - `CR_CODEFORCES_COOKIE`：已登录专用账号的网页会话 Cookie；或
+   - `CR_CODEFORCES_SUBMITTER`：获准使用的提交程序绝对路径，接收 `contest_id problem_index language_id source_file handle` 五个参数，stdout 只返回 `{"submission_id":123}`。
 
 ```sh
 cr contest import-codeforces cf4.json --contest 4 --pdf cf4.pdf \
   --handle YOUR_DEDICATED_HANDLE --languages '{"cpp17":54}'
 ```
 
-请按目标赛事实际语言 ID 修改例子。在宿主用专用账号，运行期间不要在别处用同一账号提交。可配置 `CR_CODEFORCES_COOKIE` 使用网页提交，或设置 `CR_CODEFORCES_SUBMITTER` 为获准使用的提交程序绝对路径。后者接收 `contest_id problem_index language_id source_file handle` 五个参数，stdout 只返回 `{"submission_id":123}`；不要将会话或适配器凭据写入配置。`cr` 通过 `user.status` 按提交 ID 验证账号、比赛和题号、跟踪 verdict。提交时间以 `cr` 受理为准，不使用远端排队时间，也不复刻官方榜单公式。上传结果不明确时不会自动重交。
+`cr` 通过 `user.status` 按提交 ID 验证账号、比赛和题号并跟踪 verdict。提交时间以 `cr` 受理为准，不使用远端排队时间，也不复刻官方榜单公式。上传结果不明确时不会自动重交。Codeforces 配置体验重构以及 QOJ / VJudge 适配计划见 [路线思考](docs/roadmap.md)。
 
 ## 批处理与结果
 
-`Batch Spec` 包含 `agents` 和 `contests` 两个列表，路径相对于该文件。`Plan` 展开笛卡尔积，锁定输入摘要、协议和每格镜像；不兼容格会阻止计划生成。执行计划会创建一个批次，格子开跑才分配 Run ID、容器和计时器。单格失败不影响后续格；同工作区一次只运行一格。输入变化时重新生成计划，不能用旧计划悄悄换版本。
+`Batch Spec` 支持两种格式：
+
+- **v1（全矩阵）**：`{ "schema_version": 1, "agents": [...], "contests": [...] }`，展开完整笛卡尔积；
+- **v2（稀疏矩阵）**：`{ "schema_version": 2, "cells": [{ "agent": "...", "contest": "..." }] }`，只展开显式选中的不重复单元格（最多 1,000 格）。
+
+路径相对于 Spec 文件。`Plan` 锁定输入摘要、协议和每格镜像；选中格若不兼容会阻止计划生成。执行计划会创建一个批次，格子开跑才分配 Run ID、容器和计时器。单格失败不影响后续格；同工作区一次只运行一格。输入变化时重新生成计划，不能用旧计划悄悄换版本。
 
 ```sh
 cr batch plan examples/demo/batch.json --out runs-plan.json
@@ -76,17 +96,55 @@ cr batch resume BATCH_ID
 ```sh
 cr results export --batch BATCH_ID --out results.json
 cr results merge results.json other-results.json --out combined.json
-cr results rank combined.json --family gpt-5-codex
+cr results rank combined.json --vendor openai
 ```
 
-只有有效完赛结果可以导出。榜单按场次修订和评测协议分组，每个 Agent 修订取最好一局，默认按分数降序、最后一次首解的时间升序。不同 harness 的题面呈现协议可能不同，不自动混榜；模型族可过滤，未跑场次不算零分。`runs/` 中的原始事件、stdout/stderr、提交源码和本机路径是私有记录，不随结果导出。历年题可能进入训练数据；成绩不代表未见题表现。
+只有有效完赛结果可以导出（当前导出为 `schema_version: 2`，兼容读取 v1）。榜单按场次修订和评测协议分组，每个 Agent 修订取最好一局，默认按分数降序、最后一次首解的时间升序。不同 harness 的题面呈现协议可能不同，不自动混榜；结果可按模型厂商（`--vendor`）或旧模型族（`--family`）过滤，未跑场次不算零分。`runs/` 中的原始事件、stdout/stderr、提交源码和本机路径是私有记录，不随结果导出。历年题可能进入训练数据；成绩不代表未见题表现。
+
+## Studio 配置契约与 Provider 凭据库
+
+Studio 的能力接口声明支持的 harness 版本、选项和原生格式。Agent Manifest 和 harness 原生覆盖格式彼此独立；Codex 当前只允许 TOML 覆盖 `model_verbosity`，预览与实际运行共用同一套生成逻辑。Codex 0.170.0 的 `max` 已用真实 CLI 对模拟 Responses 服务验证；上游是否接受仍取决于模型和服务。
+
+本机 Provider 凭据库位于 `${XDG_CONFIG_HOME:-$HOME/.config}/contestreplay`。Linux 有可用的 Secret Service 时优先使用；否则秘密存于该目录下的 `credentials/`，权限为 0600，**不加密**。可用 `CR_CONNECTIONS_DIR` 指定私有目录。Studio 的 Providers 页面可创建、编辑、轮换和删除接入配置；同源 Provider API 支持录入和轮换密钥，但不会返回密钥，CLI 也可以操作同一凭据库。切换 origin 必须新建 Provider；同 origin 更改 API 路径后需重新生成受影响的运行计划。旧环境变量配置继续可用，不会自动迁移。
+
+在 Bash 中，也可以隐藏输入并将凭据通过 stdin 传给 CLI，不把密钥写入命令参数：
+
+```sh
+read -rs api_key
+printf '%s' "$api_key" | cr provider add openai-production --base-url https://api.openai.com/v1 --secret-stdin
+unset api_key
+```
+
+轮换时将同样的输入交给 `cr provider rotate openai-production --secret-stdin`（旧别名 `cr connection` 继续可用）。上传的比赛材料保留在工作区的 `.materials/`，不能通过静态路由访问。完整接口见 [Studio 配置契约](docs/studio-contract-gaps.md)。
+
+## Studio 前端开发
+
+Studio 使用 React、Vite、Tailwind CSS、TanStack Query/Router、shadcn/ui（Radix primitives）和 Motion；生产构建由现有 Node 回环服务直接托管，不需要额外后端。视觉与动效约定见 [DESIGN.md](DESIGN.md)。先构建 runner 并在 3000 端口启动本地 API，再启动 Vite 开发服务器：
+
+```sh
+pnpm build
+node dist/cli.js studio --port 3000
+# 在另一终端
+pnpm dev:studio
+```
+
+打开 Vite 输出的地址即可热更新界面；写请求通过同源代理发送到 Studio。使用 `STUDIO_ORIGIN` 可指定其他本地 Studio 地址。`pnpm build` 会同时完成 Node 与前端类型检查，并把页面拆包构建到 `dist/studio/`。
 
 ## 测试
 
 ```sh
 pnpm test
+pnpm exec playwright install chromium && pnpm test:e2e  # 浏览器 E2E 测试
 pnpm test:docker  # 先构建 cr-bench 镜像
 pnpm test:codex   # 先构建 cr-codex 镜像
 ```
 
 Codex 集成测试运行真实 CLI，用模拟 Responses 上游验证逐页题面、MCP 提交与交卷。Codeforces 判题测试不向真实账号写入；真实付费模型和 Codeforces 写入仍需用你的账号做首次验收。
+
+## 文档导航
+
+- [AGENTS.md](AGENTS.md)：仓库开发约定与架构安全边界。
+- [DESIGN.md](DESIGN.md)：Studio 炭黑档案视觉与动效规范。
+- [docs/studio-contract-gaps.md](docs/studio-contract-gaps.md)：Studio 后端配置、Provider、目录与矩阵接口契约。
+- [docs/roadmap.md](docs/roadmap.md)：后续路线思考（Agent 展示名、`fast`/`ultrafast` 口径、实时进度、CF 重构、QOJ/VJudge、大规模自动化接口）。
+- 历史架构与早期提案：[Bench v1 草案](docs/bench-v1.md)、[真实 Harness 与 OJ 判题设计](docs/bench-next.md)、[统一 Web 与结果文件提案](docs/bench-web.md)、[Codex 输入示例](docs/bench-codex-example.md)、[配置界面早期草案](docs/bench-config-ui.md)。
