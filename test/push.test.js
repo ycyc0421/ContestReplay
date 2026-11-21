@@ -574,9 +574,9 @@ test('PushDispatcher enforces public payload whitelist, redacts short/symbol sec
   let midRetryFetches = 0;
   const midRetryRes = await dispatcher.deliver('run.completed', canaryPayload, {
     targetIds: [disableRetryTarget.id],
-    fetchImpl: async () => {
+    transportImpl: async () => {
       midRetryFetches++;
-      return new Response('unavailable', { status: 503 });
+      return { status: 503 };
     },
     sleep: async () => {
       await store.patch(disableRetryTarget.id, { enabled: false });
@@ -617,7 +617,7 @@ test('PushDispatcher enforces public payload whitelist, redacts short/symbol sec
   assert.equal(recreateRes[0].error, 'target_replaced');
   assert.equal(newReceiver.requests.length, 0, 'Recreated target must receive ZERO old retried events');
 
-  // 5d. Connection-layer DNS pinning blocks IMDS/link-local IPs in default node:https transport AND custom fetchImpl
+  // 5d. Connection-layer DNS pinning blocks IMDS/link-local IPs in default node:https transport AND pinned transportImpl
   const dnsTarget = await store.create({
     id: 't-dns-imds',
     label: 'DNS Rebind IMDS',
@@ -626,7 +626,7 @@ test('PushDispatcher enforces public payload whitelist, redacts short/symbol sec
     auth_mode: 'none',
     max_retries: 2,
   });
-  // Default pinned node:https transport (NO fetchImpl): lookup hook blocks 169.254.169.254 before TCP connect
+  // Default pinned node:https transport (NO transportImpl): lookup hook blocks 169.254.169.254 before TCP connect
   const pinnedBlocked = await dispatcher.deliver('run.completed', canaryPayload, {
     targetIds: [dnsTarget.id],
     lookupImpl: async () => [{ address: '169.254.169.254', family: 4 }],
@@ -635,18 +635,30 @@ test('PushDispatcher enforces public payload whitelist, redacts short/symbol sec
   assert.equal(pinnedBlocked[0].error, 'blocked_destination');
   assert.equal(pinnedBlocked[0].attempts, 1);
 
-  // Custom fetchImpl WITH lookupImpl returning link-local IPv6 is blocked before fetch
+  // Pinned transportImpl receives ONLY the verified resolved IP after lookupImpl validation
   let dnsFetchCalls = 0;
   const dnsBlocked = await dispatcher.deliver('run.completed', canaryPayload, {
     targetIds: [dnsTarget.id],
     lookupImpl: async () => [{ address: 'fe80::1', family: 6 }],
-    fetchImpl: async () => { dnsFetchCalls++; return new Response('ok', { status: 200 }); },
+    transportImpl: async () => { dnsFetchCalls++; return { status: 200 }; },
   });
   assert.equal(dnsFetchCalls, 0);
   assert.equal(dnsBlocked[0].status, 'failed');
   assert.equal(dnsBlocked[0].error, 'blocked_destination');
 
-  // Custom fetchImpl WITHOUT lookupImpl on non-loopback domain STILL runs default dns.lookup and fails closed
+  // Verify transportImpl receives the exact validated IP address + family resolved by lookupImpl
+  let capturedReq;
+  const pinnedOk = await dispatcher.deliver('run.completed', canaryPayload, {
+    targetIds: [dnsTarget.id],
+    lookupImpl: async () => [{ address: '93.184.216.34', family: 4 }],
+    transportImpl: async req => { capturedReq = req; return { status: 202 }; },
+  });
+  assert.equal(pinnedOk[0].status, 'delivered');
+  assert.equal(capturedReq.address, '93.184.216.34');
+  assert.equal(capturedReq.family, 4);
+  assert.equal(capturedReq.hostname, 'rebind.example.test');
+
+  // transportImpl WITHOUT lookupImpl on non-loopback domain STILL runs default dns.lookup and fails closed
   const dnsNoLookupTarget = await store.create({
     id: 't-dns-invalid',
     label: 'Unresolvable Domain',
@@ -657,20 +669,88 @@ test('PushDispatcher enforces public payload whitelist, redacts short/symbol sec
   });
   const dnsNoLookupRes = await dispatcher.deliver('run.completed', canaryPayload, {
     targetIds: [dnsNoLookupTarget.id],
-    fetchImpl: async () => { dnsFetchCalls++; return new Response('ok', { status: 200 }); },
+    transportImpl: async () => { dnsFetchCalls++; return { status: 200 }; },
   });
   assert.equal(dnsFetchCalls, 0);
   assert.equal(dnsNoLookupRes[0].status, 'failed');
   assert.equal(dnsNoLookupRes[0].error, 'blocked_destination');
 
+  // 5e. 202 response with open/unended response body MUST settle immediately as 'delivered' on attempt 1 (zero duplicate retries)
+  const openBodyResponses = [];
+  const openBodyServer = await startMockReceiver(t, (_req, res) => {
+    res.writeHead(202, { 'Content-Type': 'text/plain' });
+    res.flushHeaders();
+    openBodyResponses.push(res);
+    // Intentionally keep the response stream open!
+  });
+  t.after(() => {
+    for (const r of openBodyResponses) {
+      if (!r.destroyed) r.destroy();
+    }
+  });
+  const openBodyTarget = await store.create({
+    id: 't-open-202',
+    label: 'Open Body 202',
+    url: `${openBodyServer.baseUrl}/accepted`,
+    events: ['run.completed'],
+    auth_mode: 'none',
+    timeout_ms: 1000,
+    max_retries: 2,
+  });
+  const openBodyRes = await dispatcher.deliver('run.completed', canaryPayload, {
+    targetIds: [openBodyTarget.id],
+    sleep: fastSleep,
+  });
+  assert.equal(openBodyRes[0].status, 'delivered');
+  assert.equal(openBodyRes[0].http_status, 202);
+  assert.equal(openBodyRes[0].attempts, 1);
+  assert.equal(openBodyServer.requests.length, 1, 'Receiver must see the 202 event exactly once');
+
+  // 5f. run.progress accepts up to 200 recent_activity entries (matching readRunProgress) and caps/omits per policy
+  const makeActivities = count => Array.from({ length: count }, (_, idx) => ({
+    seq: idx + 1,
+    elapsed_ms: idx * 1000,
+    type: 'submission_judged',
+    summary: `Activity ${idx + 1}`,
+    problem_id: 'A',
+    verdict: 'accepted',
+  }));
+  const progress51WithTrusted = sanitizePushPayload('run.progress', {
+    run_id: '11111111-1111-4111-8111-111111111111',
+    status: 'running',
+    agent_id: 'agent-1',
+    contest_id: 'cf-1',
+    recent_activity: makeActivities(51),
+  }, { validProblemIds: ['A'] });
+  assert.equal(progress51WithTrusted.recent_activity.length, 50, 'Trusted progress activity is capped at 50 entries');
+
+  const progress200WithTrusted = sanitizePushPayload('run.progress', {
+    run_id: '22222222-2222-4222-8222-222222222222',
+    status: 'running',
+    agent_id: 'agent-1',
+    contest_id: 'cf-1',
+    recent_activity: makeActivities(200),
+  }, { validProblemIds: ['A'] });
+  assert.equal(progress200WithTrusted.recent_activity.length, 50);
+
+  const progress200Untrusted = sanitizePushPayload('run.progress', {
+    run_id: '33333333-3333-4333-8333-333333333333',
+    status: 'running',
+    agent_id: 'agent-1',
+    contest_id: 'cf-1',
+    recent_activity: makeActivities(200),
+  });
+  assert.equal(progress200Untrusted.recent_activity, undefined);
+  assert.equal(progress200Untrusted.problem_breakdown_unavailable, true);
+
   // 6. Short secret & symbol Bearer redaction + safe fixed error codes on transport failure
   assert.equal(sanitizeDeliveryError('failed with key abc12', 'abc12'), 'failed with key [REDACTED]');
   assert.equal(sanitizeDeliveryError('header Authorization: Bearer tok!@#$%xyz failed'), 'header Authorization: Bearer [REDACTED] failed');
 
-  const leakedFetch = async () => {
+  const leakedTransport = async () => {
     throw new Error(`upstream rejected Authorization: Bearer ${bearerSecret} at https://secret.host/?k=1`);
   };
-  const failedLeak = await dispatcher.testTarget('t-bearer', { fetchImpl: leakedFetch, sleep: fastSleep });
+  const failedLeak = await dispatcher.testTarget('t-bearer', { transportImpl: leakedTransport, sleep: fastSleep });
   assert.equal(failedLeak.status, 'failed');
   assert.equal(failedLeak.error, 'network_error');
 

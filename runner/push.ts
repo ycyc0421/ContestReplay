@@ -314,7 +314,7 @@ export const runProgressPayloadSchema = z.object({
   problem_count: nonNegInt.optional(),
   problem_breakdown_unavailable: z.boolean().optional(),
   problems: z.array(publicProblemProgressSchema).max(200).optional(),
-  recent_activity: z.array(publicActivitySchema).max(50).optional(),
+  recent_activity: z.array(publicActivitySchema).max(200).optional(),
   telemetry: publicTelemetrySchema.optional(),
   timestamp: z.iso.datetime().optional(),
 });
@@ -399,7 +399,7 @@ export function sanitizePushPayload(
       parsed.problems = parsed.problems.filter(p => isTrustedProblemId(p.id, trustedSet));
     }
     if (parsed.recent_activity !== undefined) {
-      parsed.recent_activity = parsed.recent_activity.map(act => {
+      parsed.recent_activity = parsed.recent_activity.slice(0, 50).map(act => {
         if (act.problem_id === undefined) return act;
         const isInvalid = act.verdict?.trim().toLowerCase() === 'invalid_submission';
         const allowed = !isInvalid && isTrustedProblemId(act.problem_id, trustedSet);
@@ -875,6 +875,40 @@ const defaultLookupAddresses: LookupAddressFn = async hostname => {
   return entries.map(entry => ({ address: entry.address, family: entry.family }));
 };
 
+export interface PinnedTransportRequest {
+  url: string;
+  hostname: string;
+  address: string;
+  family: 4 | 6;
+  headers: Record<string, string>;
+  body: string;
+  signal: AbortSignal;
+}
+
+export type PinnedTransportFn = (req: PinnedTransportRequest) => Promise<{ status: number }>;
+
+async function resolveVerifiedAddresses(
+  hostname: string,
+  resolver: LookupAddressFn,
+): Promise<Array<{ address: string; family: 4 | 6 }>> {
+  if (isBlockedHost(hostname)) throw new BlockedDestinationError();
+  const bare = hostname.replace(/^\[|\]$/g, '');
+  const ipVer = isIP(bare);
+  if (ipVer !== 0) {
+    if (isBlockedIpAddress(bare)) throw new BlockedDestinationError();
+    return [{ address: bare, family: ipVer === 6 ? 6 : 4 }];
+  }
+  const resolved = await resolver(bare);
+  const entries = resolved.map(item => ({
+    address: item.address,
+    family: (item.family === 6 || isIP(item.address) === 6 ? 6 : 4) as 4 | 6,
+  }));
+  if (!entries.length || entries.some(item => isBlockedIpAddress(item.address))) {
+    throw new BlockedDestinationError();
+  }
+  return entries;
+}
+
 // Connection-layer pinned HTTP/HTTPS transport: resolves and validates destination IPs inside
 // Node's socket `lookup` hook (eliminating DNS rebinding TOCTOU while preserving TLS SNI/cert validation).
 function sendPinnedHttpRequest(
@@ -895,23 +929,7 @@ function sendPinnedHttpRequest(
     const pinnedLookup: NonNullable<HttpRequestOptions['lookup']> = (hostname, options, callback) => {
       void (async () => {
         try {
-          if (isBlockedHost(hostname)) throw new BlockedDestinationError();
-          const bare = hostname.replace(/^\[|\]$/g, '');
-          const ipVer = isIP(bare);
-          let entries: Array<{ address: string; family: number }>;
-          if (ipVer !== 0) {
-            if (isBlockedIpAddress(bare)) throw new BlockedDestinationError();
-            entries = [{ address: bare, family: ipVer }];
-          } else {
-            const resolved = await resolver(bare);
-            entries = resolved.map(item => ({
-              address: item.address,
-              family: item.family ?? (isIP(item.address) || 4),
-            }));
-            if (!entries.length || entries.some(item => isBlockedIpAddress(item.address))) {
-              throw new BlockedDestinationError();
-            }
-          }
+          const entries = await resolveVerifiedAddresses(hostname, resolver);
           const wantsAll = typeof options === 'object' && options !== null && options.all === true;
           if (wantsAll) {
             (callback as (err: null, addresses: Array<{ address: string; family: number }>) => void)(null, entries);
@@ -949,15 +967,14 @@ function sendPinnedHttpRequest(
 
     const req = reqFn(reqOpts, res => {
       const status = res.statusCode ?? 0;
-      // Never follow redirects (maxRedirects = 0): reject any 3xx cleanly.
+      res.on('error', () => {});
+      // Settle immediately upon receiving response headers (never hang waiting for an open body stream).
       if (status >= 300 && status < 400) {
-        res.destroy();
         finish(new RedirectRejectedError());
-        return;
+      } else {
+        finish(null, { status });
       }
-      res.resume();
-      res.once('end', () => finish(null, { status }));
-      res.once('error', err => finish(err));
+      res.destroy();
     });
 
     req.once('error', err => finish(err));
@@ -967,7 +984,7 @@ function sendPinnedHttpRequest(
 
 export interface PushDispatcherOptions {
   deliveriesFile?: string;
-  fetchImpl?: typeof fetch;
+  transportImpl?: PinnedTransportFn;
   lookupImpl?: LookupAddressFn;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   now?: () => number;
@@ -977,7 +994,7 @@ export interface PushDispatcherOptions {
 export interface DeliverOptions {
   targetIds?: string[];
   validProblemIds?: readonly string[];
-  fetchImpl?: typeof fetch;
+  transportImpl?: PinnedTransportFn;
   lookupImpl?: LookupAddressFn;
   signal?: AbortSignal;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -985,7 +1002,7 @@ export interface DeliverOptions {
 
 export class PushDispatcher {
   readonly deliveriesFile: string;
-  private readonly defaultFetch?: typeof fetch;
+  private readonly defaultTransport?: PinnedTransportFn;
   private readonly defaultLookup?: LookupAddressFn;
   private readonly defaultSleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly now: () => number;
@@ -993,25 +1010,11 @@ export class PushDispatcher {
 
   constructor(private readonly targets: PushTargets, opts: PushDispatcherOptions = {}) {
     this.deliveriesFile = resolve(opts.deliveriesFile ?? join(targets.root, 'deliveries.jsonl'));
-    this.defaultFetch = opts.fetchImpl;
+    this.defaultTransport = opts.transportImpl;
     this.defaultLookup = opts.lookupImpl;
     this.defaultSleep = opts.sleep ?? defaultSleep;
     this.now = opts.now ?? (() => Date.now());
     this.concurrency = Math.max(1, Math.min(16, Math.floor(opts.concurrency ?? 4)));
-  }
-
-  private async verifyDestinationDnsForFetch(urlStr: string, lookupImpl?: LookupAddressFn): Promise<boolean> {
-    const u = new URL(urlStr);
-    const bare = u.hostname.replace(/^\[|\]$/g, '');
-    if (isBlockedHost(u.hostname)) return false;
-    if (isLoopbackHost(u.hostname) && !lookupImpl && !this.defaultLookup) return true;
-    if (isIP(bare) !== 0) return !isBlockedIpAddress(bare);
-
-    // Always resolve via lookupImpl or real DNS (never skip for custom fetchImpl).
-    const resolver = lookupImpl ?? this.defaultLookup ?? defaultLookupAddresses;
-    const resolved = await resolver(bare);
-    if (!resolved.length) return false;
-    return resolved.every(item => !isBlockedIpAddress(item.address));
   }
 
   private async appendDelivery(record: PushDelivery, secret?: string) {
@@ -1045,7 +1048,7 @@ export class PushDispatcher {
   ): Promise<PushDelivery | undefined> {
     if (opts.signal?.aborted) return undefined;
 
-    const customFetch = opts.fetchImpl ?? this.defaultFetch;
+    const customTransport = opts.transportImpl ?? this.defaultTransport;
     const resolver = opts.lookupImpl ?? this.defaultLookup ?? defaultLookupAddresses;
     const sleepFn = opts.sleep ?? this.defaultSleep;
     const deliveryId = randomUUID();
@@ -1145,24 +1148,26 @@ export class PushDispatcher {
 
       try {
         let status: number;
-        if (customFetch) {
-          let dnsAllowed: boolean;
+        if (customTransport) {
+          const u = new URL(target.url);
+          let entries: Array<{ address: string; family: 4 | 6 }>;
           try {
-            dnsAllowed = await this.verifyDestinationDnsForFetch(target.url, opts.lookupImpl);
-          } catch {
-            dnsAllowed = false;
+            entries = await resolveVerifiedAddresses(u.hostname, resolver);
+          } catch (error) {
+            if (isBlockedDestinationError(error)) throw error;
+            throw new BlockedDestinationError();
           }
-          if (!dnsAllowed) throw new BlockedDestinationError();
-
-          const response = await customFetch(target.url, {
-            method: 'POST',
+          const verified = entries[0]!;
+          const res = await customTransport({
+            url: target.url,
+            hostname: u.hostname.replace(/^\[|\]$/g, ''),
+            address: verified.address,
+            family: verified.family,
             headers,
             body,
-            redirect: 'error',
             signal: attemptSignal,
           });
-          status = response.status;
-          await response.body?.cancel().catch(() => {});
+          status = res.status;
           if (status >= 300 && status < 400) throw new RedirectRejectedError();
         } else {
           const res = await sendPinnedHttpRequest(target.url, headers, body, attemptSignal, resolver);
