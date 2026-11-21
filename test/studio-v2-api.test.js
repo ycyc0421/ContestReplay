@@ -2,14 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
-import { appendFile, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Connections } from '../dist/connections.js';
 import { OjAccounts } from '../dist/judges/index.js';
 import { synthesizeTextContestPdf } from '../dist/pdf-synth.js';
 import { PushDispatcher, PushTargets } from '../dist/push.js';
-import { startStudio } from '../dist/studio.js';
+import { createSseWriter, startStudio } from '../dist/studio.js';
 import {
   agentItemResponseSchema,
   contestItemResponseSchema,
@@ -1123,8 +1124,9 @@ test('Studio v2 security & CRUD regressions: document identity, root exclusion, 
     body: { platform: 'qoj', contest_id: 999, account_id: 'qoj-p1' },
   });
   assert.equal(prevErr.status, 400);
-  assert.ok(!prevErr.text.includes('super-secret-token-xyz-77777'), 'Preview error must redact cookie secret');
-  assert.ok(prevErr.text.includes('[REDACTED]'));
+  assert.ok(!prevErr.text.includes('super-secret-token-xyz-77777'), 'Preview error must never leak cookie secret');
+  assert.ok(!prevErr.text.includes('another-secret-88888'), 'Preview error must never leak cookie components');
+  assert.equal(prevErr.value.error, 'Contest preview failed; verify the contest reference and OJ account credentials');
 
   // Contest referencing pool: 'shared' -> deleting 1st succeeds (2nd remains), deleting 2nd (last) returns 409!
   const poolContest = await req('/api/contests', {
@@ -1448,5 +1450,695 @@ test('Studio v2 runtime regressions: SSE closes on terminal queue jobs, /api/cov
   assert.equal(rankedRes.value.groups[0][0].result.run_id, r1);
   assert.equal(rankedRes.value.omitted_runs.length, 1);
   assert.equal(rankedRes.value.omitted_runs[0].run_id, rCorrupt);
+  assert.equal(rankedRes.value.omitted_runs[0].reason, 'invalid_run_metadata');
   assert.ok(!rankedRes.value.omitted_runs[0].reason.includes(root), 'omitted_runs reason must not leak host path');
+});
+
+test('Studio v2 final polish regressions: preflight safety & protocol/path sanitization, reserved names, non-extension answer attachments, archive/runs, serialization, concurrent immutable answers, short cookie redaction, platform-default OJ & run.json guards, SSE backpressure/missing batch, fixed omission codes, locked agent delete', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-studio-v2-polish-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const base = join(dir, 'workspace');
+  const root = join(dir, 'runs');
+  await mkdir(join(base, 'agents'), { recursive: true });
+  await mkdir(join(base, 'contests'), { recursive: true });
+  await mkdir(join(base, 'archive', 'runs'), { recursive: true });
+  await mkdir(join(root, '.batches'), { recursive: true, mode: 0o700 });
+
+  const store = new Connections(join(dir, 'connections'));
+  const ojAccounts = new OjAccounts(join(dir, 'oj-accounts'));
+
+  const pdfPath = join(base, 'paper.pdf');
+  await synthesizeTextContestPdf([{ id: '1', title: 'P1', body: 'Solve 1' }], pdfPath);
+  const pdfBytes = await readFile(pdfPath);
+
+  // Create valid responses provider + incompatible chat-completions provider
+  await store.create({
+    id: 'resp-prov',
+    label: 'Responses Provider',
+    protocol: 'responses',
+    base_url: 'http://127.0.0.1:19991/v1',
+    secret: 'sk-resp-secret-123456',
+  });
+  await store.create({
+    id: 'chat-prov',
+    label: 'Chat Provider',
+    protocol: 'chat-completions',
+    base_url: 'http://127.0.0.1:19992/v1',
+    secret: 'sk-chat-secret-123456',
+  });
+
+  let previewErrorMode = false;
+  const mockPreview = async (platform, contestId, opts) => {
+    if (previewErrorMode) {
+      throw new Error(`Upstream failed echoing cookie=${opts?.cookie ?? ''} internal-detail`);
+    }
+    return {
+      platform,
+      contest_ref: String(contestId),
+      title: `Echo ${opts?.cookie ?? ''} short abc and x`,
+      status: 'finished',
+      problems: [{ remote_id: 'A', title: 'Problem abc x' }],
+      suggested_languages: [],
+    };
+  };
+
+  const studio = await startStudio(root, 0, {
+    base,
+    store,
+    ojAccounts,
+    getImage,
+    previewContest: mockPreview,
+    ssePollMs: 40,
+    sseDrainTimeoutMs: 250,
+  });
+  t.after(() => studio.close());
+  const req = makeRequester(studio.url);
+
+  const uploadMat = async (contestId, filename, bytes, kind = 'entrypoint') => {
+    const form = new FormData();
+    form.set('contest_id', contestId);
+    form.set('kind', kind);
+    form.set('file', new Blob([bytes]), filename);
+    const res = await fetch(`${studio.url}/api/contests/materials`, {
+      method: 'POST',
+      headers: { Origin: studio.url, 'X-CR-Studio': '1' },
+      body: form,
+    });
+    return { status: res.status, value: await res.json() };
+  };
+
+  const validAgentDoc = {
+    kind: 'contestreplay.dev/agent',
+    schema_version: 1,
+    id: 'polish-agent',
+    vendor: 'openai',
+    model: 'gpt-5.4',
+    provider: 'resp-prov',
+    harness: { kind: 'codex', version: '0.170.0', options: {} },
+  };
+  assert.equal((await req('/api/agents', { body: { document: validAgentDoc } })).status, 201);
+
+  // 1. Central reserved filename rejection on POST /api/agents, POST /api/agents/clone, POST /api/contests
+  for (const reserved of ['package.json', 'run.json', 'judge.json', 'foo.judge.json', 'foo.judge.v1.2.json']) {
+    const agentRes = await req('/api/agents', {
+      body: { file: reserved, format: 'json', document: { ...validAgentDoc, id: 'res-agent' } },
+    });
+    assert.equal(agentRes.status, 400, `POST /api/agents must reject reserved filename ${reserved}`);
+
+    const cloneRes = await req('/api/agents/clone', {
+      body: { source_path: 'agents/polish-agent.toml', id: 'cloned-res', file: reserved, format: 'json' },
+    });
+    assert.equal(cloneRes.status, 400, `POST /api/agents/clone must reject reserved filename ${reserved}`);
+
+    const contestRes = await req('/api/contests', {
+      body: {
+        file: reserved,
+        document: {
+          schema_version: 2,
+          contest_id: 'res-contest',
+          data_version: 1,
+          title: 'Reserved',
+          source: { name: 'Local' },
+          materials: { entrypoint: { kind: 'pdf', path: 'paper.pdf' } },
+          judge: { kind: 'local', problems: [{ id: '1', max_points: 1, accepted_answers: ['42'] }] },
+        },
+      },
+    });
+    assert.equal(contestRes.status, 400, `POST /api/contests must reject reserved filename ${reserved}`);
+  }
+
+  // 2. Shared forbidden directory policy rejects nested archive/runs/ everywhere
+  assert.equal(
+    (await req('/api/contests', {
+      body: {
+        file: 'archive/runs/hidden-contest.json',
+        document: {
+          schema_version: 2,
+          contest_id: 'hidden-c',
+          data_version: 1,
+          title: 'Hidden',
+          source: { name: 'Local' },
+          materials: { entrypoint: { kind: 'pdf', path: '../../paper.pdf' } },
+          judge: { kind: 'local', problems: [{ id: '1', max_points: 1, accepted_answers: ['1'] }] },
+        },
+      },
+    })).status,
+    400,
+    'POST /api/contests must reject archive/runs/',
+  );
+  assert.equal(
+    (await req('/api/agents', {
+      body: { file: 'archive/runs/hidden-agent.toml', format: 'toml', document: { ...validAgentDoc, id: 'hidden-a' } },
+    })).status,
+    400,
+    'POST /api/agents must reject archive/runs/',
+  );
+  assert.equal(
+    (await req('/api/agents/variants', {
+      body: { base_document: validAgentDoc, reasoning_efforts: ['low'], directory: 'archive/runs', dry_run: true },
+    })).status,
+    400,
+    'POST /api/agents/variants must reject archive/runs/',
+  );
+
+  // 3. POST /api/preflight: rejects package.json/run.json/foo.judge.v1.2.json, checks harness protocol compatibility, sanitizes host paths
+  await writeFile(join(base, 'package.json'), JSON.stringify({ name: 'demo' }));
+  await writeFile(join(base, 'run.json'), JSON.stringify({ run_id: randomUUID() }));
+  await writeFile(join(base, 'foo.judge.v1.2.json'), JSON.stringify({
+    schema_version: 1,
+    problems: [{ id: '1', max_points: 1, accepted_answers: ['42'] }],
+  }));
+  // Incompatible codex agent bound to chat-completions provider
+  await writeFile(
+    join(base, 'agents', 'bad-proto.json'),
+    JSON.stringify({
+      kind: 'contestreplay.dev/agent',
+      schema_version: 1,
+      id: 'bad-proto',
+      vendor: 'openai',
+      model: 'gpt-5.4',
+      provider: 'chat-prov',
+      harness: { kind: 'codex', version: '0.170.0', options: {} },
+    }),
+  );
+  const preRes = await req('/api/preflight', {
+    body: {
+      agents: ['package.json', 'run.json', 'foo.judge.v1.2.json', 'agents/bad-proto.json'],
+      contests: ['package.json', 'run.json', 'foo.judge.v1.2.json'],
+    },
+  });
+  assert.equal(preRes.status, 200, preRes.text);
+  assert.equal(preRes.value.ok, false);
+  for (const check of [...preRes.value.agents, ...preRes.value.contests]) {
+    assert.equal(check.ok, false, `Preflight must reject ${check.path}`);
+    assert.ok(check.issues.length > 0);
+    for (const iss of check.issues) {
+      assert.ok(!iss.includes(base), `Preflight issue must not leak base path: ${iss}`);
+      assert.ok(!iss.includes(root), `Preflight issue must not leak root path: ${iss}`);
+    }
+  }
+  const protoCheck = preRes.value.agents.find(a => a.path === 'agents/bad-proto.json');
+  assert.ok(protoCheck.issues.some(i => /requires a responses or passthrough provider/i.test(i)));
+
+  // 4. GET /api/contests/item?include_judge=1 refuses external symlinked answer table & non-extension answer attachments
+  const externalAnswerFile = join(dir, 'outside-secret.judge.json');
+  const externalAnswerJson = JSON.stringify({
+    schema_version: 1,
+    problems: [{ id: '1', max_points: 10, accepted_answers: ['TOP_SECRET_EXTERNAL_ANSWER'] }],
+  });
+  await writeFile(externalAnswerFile, externalAnswerJson);
+  await symlink(externalAnswerFile, join(base, 'contests', 'symlink-ans.json'));
+  await writeFile(
+    join(base, 'contests', 'symlink-contest.json'),
+    JSON.stringify({
+      schema_version: 2,
+      contest_id: 'symlink-c',
+      data_version: 1,
+      title: 'Symlink Contest',
+      source: { name: 'Local' },
+      materials: { entrypoint: { kind: 'pdf', path: '../paper.pdf' } },
+      problems: [{ id: '1', max_points: 10 }],
+      judge: { kind: 'local', answers: { path: 'symlink-ans.json' } },
+    }),
+  );
+  const symGet = await req('/api/contests/item?path=contests/symlink-contest.json&include_judge=1');
+  assert.equal(symGet.status, 200, symGet.text);
+  assert.equal(symGet.value.valid, false, 'Symlinked external answer table must fail Studio contest loading');
+  assert.equal(symGet.value.judge, undefined, 'include_judge=1 must NEVER return external symlinked answers');
+  assert.ok(!symGet.text.includes('TOP_SECRET_EXTERNAL_ANSWER'));
+  assert.ok(!symGet.value.issues.join(' ').includes(base));
+
+  const symPre = await req('/api/preflight', { body: { contests: ['contests/symlink-contest.json'] } });
+  assert.equal(symPre.status, 200);
+  assert.equal(symPre.value.ok, false);
+  assert.equal(symPre.value.contests[0].ok, false);
+
+  // 5. Non-.json extension attachment containing answer table rejected on save AND on load; cross-contest .materials round-trip rejected
+  await writeFile(join(base, 'disguised-answers.txt'), externalAnswerJson);
+  const attachAnsSave = await req('/api/contests', {
+    body: {
+      file: 'contests/att-ans.json',
+      document: {
+        schema_version: 2,
+        contest_id: 'att-ans',
+        data_version: 1,
+        title: 'Att Ans',
+        source: { name: 'Local' },
+        materials: {
+          entrypoint: { kind: 'pdf', path: '../paper.pdf' },
+          attachments: [{ path: '../disguised-answers.txt', name: 'hints.txt' }],
+        },
+        judge: { kind: 'local', problems: [{ id: '1', max_points: 10, accepted_answers: ['42'] }] },
+      },
+    },
+  });
+  assert.equal(attachAnsSave.status, 400, 'Non-.json attachment containing answer table must be rejected on save');
+
+  // Hand-crafted contest attaching disguised-answers.txt must also fail on GET /api/contests/item & POST /api/preflight
+  await writeFile(join(base, 'contests', 'legit-ans.json'), externalAnswerJson);
+  await writeFile(
+    join(base, 'contests', 'hand-att-ans.json'),
+    JSON.stringify({
+      schema_version: 2,
+      contest_id: 'hand-att-ans',
+      data_version: 1,
+      title: 'Hand Att Ans',
+      source: { name: 'Local' },
+      materials: {
+        entrypoint: { kind: 'pdf', path: '../paper.pdf' },
+        attachments: [{ path: '../disguised-answers.txt', name: 'hints.txt' }],
+      },
+      problems: [{ id: '1', max_points: 10 }],
+      judge: { kind: 'local', answers: { path: 'legit-ans.json' } },
+    }),
+  );
+  const handGet = await req('/api/contests/item?path=contests/hand-att-ans.json&include_judge=1');
+  assert.equal(handGet.status, 200);
+  assert.equal(handGet.value.valid, false);
+  assert.equal(handGet.value.judge, undefined);
+  const handPre = await req('/api/preflight', { body: { contests: ['contests/hand-att-ans.json'] } });
+  assert.equal(handPre.value.ok, false);
+
+  // Cross-contest .materials relative path round-trip rejected
+  const matOther = await uploadMat('other-contest', 'other.pdf', pdfBytes, 'entrypoint');
+  assert.equal(matOther.status, 201);
+  const otherRelFromContests = `../../runs/.materials/other-contest/entrypoint/${matOther.value.path.split('/').at(-1)}`;
+  const crossMatSave = await req('/api/contests', {
+    body: {
+      file: 'contests/steal-mat.json',
+      document: {
+        schema_version: 2,
+        contest_id: 'steal-contest',
+        data_version: 1,
+        title: 'Steal',
+        source: { name: 'Local' },
+        materials: { entrypoint: { kind: 'pdf', path: otherRelFromContests } },
+        judge: { kind: 'local', problems: [{ id: '1', max_points: 1, accepted_answers: ['1'] }] },
+      },
+    },
+  });
+  assert.equal(crossMatSave.status, 400, 'Relative round-trip into another contest managed upload must be rejected');
+
+  // 6. Concurrent local contest creates sharing content-addressed answers: loser rollback MUST NOT delete live answer table
+  const raceDoc = {
+    file: 'contests/race-local.json',
+    document: {
+      schema_version: 2,
+      contest_id: 'race-local',
+      data_version: 1,
+      title: 'Race Local',
+      source: { name: 'Local' },
+      materials: { entrypoint: { kind: 'pdf', path: '../paper.pdf' } },
+      judge: { kind: 'local', problems: [{ id: '1', max_points: 5, accepted_answers: ['race-ok'] }] },
+    },
+  };
+  const [race1, race2] = await Promise.all([
+    req('/api/contests', { body: raceDoc }),
+    req('/api/contests', { body: raceDoc }),
+  ]);
+  assert.deepEqual([race1.status, race2.status].sort((a, b) => a - b), [201, 409]);
+  const afterRace = await req('/api/contests/item?path=contests/race-local.json&include_judge=1');
+  assert.equal(afterRace.status, 200);
+  assert.equal(afterRace.value.valid, true, 'Live answer table must survive concurrent loser rollback');
+  assert.equal(afterRace.value.judge.problems[0].accepted_answers[0], 'race-ok');
+
+  // PUT with existing judge.answers.path publishes immutable content-addressed copy
+  const sharedSourceAns = join(base, 'shared-src-answers.json');
+  await writeFile(sharedSourceAns, JSON.stringify({
+    schema_version: 1,
+    problems: [{ id: '1', max_points: 5, accepted_answers: ['from-existing-file'] }],
+  }));
+  const putExisting = await req('/api/contests/item', {
+    method: 'PUT',
+    body: {
+      path: 'contests/race-local.json',
+      document: {
+        schema_version: 2,
+        contest_id: 'race-local',
+        data_version: 2,
+        title: 'Race Local Existing Answers',
+        source: { name: 'Local' },
+        materials: { entrypoint: { kind: 'pdf', path: '../paper.pdf' } },
+        judge: { kind: 'local', answers: { path: '../shared-src-answers.json' } },
+      },
+    },
+  });
+  assert.equal(putExisting.status, 200, putExisting.text);
+  assert.match(putExisting.value.judge_path, /^contests\/race-local\.judge\.[a-f0-9]{12}\.json$/);
+  const afterPutExisting = await req('/api/contests/item?path=contests/race-local.json&include_judge=1');
+  assert.equal(afterPutExisting.value.valid, true);
+  assert.equal(afterPutExisting.value.judge.problems[0].accepted_answers[0], 'from-existing-file');
+
+  // 6b. Concurrent POST /api/contests vs DELETE /api/contests/materials (orphan cleanup) never leaves a dangling manifest
+  const matRace = await uploadMat('mat-race', 'race.pdf', pdfBytes, 'entrypoint');
+  assert.equal(matRace.status, 201);
+  const [matSaveRes, matCleanRes] = await Promise.all([
+    req('/api/contests', {
+      body: {
+        file: 'contests/mat-race.json',
+        document: {
+          schema_version: 2,
+          contest_id: 'mat-race',
+          data_version: 1,
+          title: 'Mat Race',
+          source: { name: 'Local' },
+          materials: { entrypoint: { kind: 'pdf', path: matRace.value.path } },
+          judge: { kind: 'local', problems: [{ id: '1', max_points: 1, accepted_answers: ['1'] }] },
+        },
+      },
+    }),
+    req('/api/contests/materials', { method: 'DELETE', body: { cleanup_orphans: true } }),
+  ]);
+  assert.equal(matCleanRes.status, 200);
+  if (matSaveRes.status === 201) {
+    assert.ok(!matCleanRes.value.deleted.includes(matRace.value.path), 'Serialized save + cleanup must never delete referenced material');
+    const loadedMatRace = await req('/api/contests/item?path=contests/mat-race.json');
+    assert.equal(loadedMatRace.value.valid, true);
+  } else {
+    assert.equal(matSaveRes.status, 404);
+    assert.ok(matCleanRes.value.deleted.includes(matRace.value.path));
+  }
+
+  // 7. Queued batch referencing managed material blocks material deletion (even if contest is outside workspace)
+  const matQueued = await uploadMat('queued-mat', 'q.pdf', pdfBytes, 'entrypoint');
+  assert.equal(matQueued.status, 201);
+  const extQueuedContest = join(dir, 'ext-queued-contest.json');
+  await writeFile(extQueuedContest, JSON.stringify({
+    schema_version: 2,
+    contest_id: 'queued-mat',
+    data_version: 1,
+    title: 'Queued Mat',
+    source: { name: 'Local' },
+    materials: { entrypoint: { kind: 'pdf', path: matQueued.value.path } },
+    problems: [{ id: '1', max_points: 1 }],
+    judge: { kind: 'local', answers: { path: externalAnswerFile } },
+  }));
+  const queuedBatchId = randomUUID();
+  const h = 'a'.repeat(64);
+  await writeFile(
+    join(root, '.batches', `${queuedBatchId}.json`),
+    JSON.stringify({
+      schema_version: 1,
+      id: queuedBatchId,
+      created_at: new Date().toISOString(),
+      plan: {
+        schema_version: 2,
+        protocol_sha256: h,
+        jobs: [{
+          image: FAKE_IMAGE,
+          harness: 'codex',
+          agent_path: join(base, 'agents', 'polish-agent.toml'),
+          agent_id: 'polish-agent',
+          credential_source: 'provider:resp-prov',
+          agent_revision: h,
+          agent_sha256: h,
+          profile_sha256: h,
+          effective_sha256: h,
+          contest_path: extQueuedContest,
+          contest_id: 'queued-mat',
+          data_version: 1,
+          contest_sha256: h,
+        }],
+      },
+      jobs: [{ status: 'queued' }],
+    }),
+  );
+  const delQueuedMat = await req('/api/contests/materials', { method: 'DELETE', body: { path: matQueued.value.path } });
+  assert.equal(delQueuedMat.status, 409, 'Material referenced by queued batch job must not be deleted');
+  // Corrupt queued contest -> fail closed with 409
+  await writeFile(extQueuedContest, '{corrupt');
+  assert.equal(
+    (await req('/api/contests/materials', { method: 'DELETE', body: { cleanup_orphans: true } })).status,
+    409,
+    'Unparseable queued batch contest must fail closed with 409',
+  );
+  await rm(join(root, '.batches', `${queuedBatchId}.json`));
+
+  // 8. Short cookie redaction ("abc", "x"), fixed public error on authenticated preview failure, and non-absolute pdf_info.path
+  const matShortPrev = await uploadMat('short-prev', 'short.pdf', pdfBytes, 'entrypoint');
+  assert.equal(matShortPrev.status, 201);
+  await ojAccounts.create({
+    id: 'short-ck',
+    label: 'Short Cookie',
+    platform: 'qoj',
+    handle: 'short_h',
+    pool: 'default',
+    transport: 'cookie',
+    secret: 'SID=abc; f=x',
+  });
+  previewErrorMode = false;
+  const shortPrev = await req('/api/contests/preview', {
+    body: { platform: 'qoj', contest_id: 77, account_id: 'short-ck', pdf_path: matShortPrev.value.path },
+  });
+  assert.equal(shortPrev.status, 200, shortPrev.text);
+  assert.ok(!shortPrev.value.preview.title.includes('abc'), 'Short cookie value "abc" must be redacted');
+  assert.ok(!/\bx\b/.test(shortPrev.value.preview.title), '1-char standalone cookie value "x" must be redacted');
+  assert.equal(shortPrev.value.pdf_info.path, matShortPrev.value.path, 'pdf_info.path must echo input ref, not host path');
+  assert.ok(!shortPrev.value.pdf_info.path.startsWith('/'));
+
+  previewErrorMode = true;
+  const shortErr = await req('/api/contests/preview', {
+    body: { platform: 'qoj', contest_id: 77, account_id: 'short-ck' },
+  });
+  assert.equal(shortErr.status, 400);
+  assert.equal(shortErr.value.error, 'Contest preview failed; verify the contest reference and OJ account credentials');
+  assert.ok(!shortErr.text.includes('internal-detail'));
+  assert.ok(!shortErr.text.includes('SID=abc'));
+
+  // 9. Platform-default OJ account delete guard (blocks last ready account) & active run.json mid-run edit protection
+  await ojAccounts.create({
+    id: 'qoj-def-2',
+    label: 'QOJ Second',
+    platform: 'qoj',
+    handle: 'qoj_h2',
+    pool: 'default',
+    transport: 'cookie',
+    secret: 'SID=second-secret-token',
+  });
+  const qojDefaultSave = await req('/api/contests', {
+    body: {
+      file: 'contests/qoj-default.json',
+      document: {
+        schema_version: 2,
+        contest_id: 'qoj-default',
+        data_version: 1,
+        title: 'QOJ Default',
+        source: { name: 'QOJ' },
+        materials: { entrypoint: { kind: 'pdf', path: '../paper.pdf' } },
+        problems: [{ id: 'A', max_points: 100 }],
+        judge: { kind: 'qoj', contest_id: 10, languages: { cpp20: 'C++20' } },
+      },
+    },
+  });
+  assert.equal(qojDefaultSave.status, 201, qojDefaultSave.text);
+  // Deleting 1st of 2 ready QOJ accounts succeeds; deleting the last ready QOJ account returns 409!
+  assert.equal((await req('/api/oj-accounts/short-ck', { method: 'DELETE' })).status, 200);
+  assert.equal(
+    (await req('/api/oj-accounts/qoj-def-2', { method: 'DELETE' })).status,
+    409,
+    'Platform-default QOJ contest must block deleting the last ready QOJ account',
+  );
+  // Delete the contest manifest, then simulate an already-running job whose run.json pins oj_account_id='qoj-def-2'
+  // even though its contest_path on disk was edited to local!
+  assert.equal((await req('/api/contests/item?path=contests/qoj-default.json', { method: 'DELETE' })).status, 200);
+  const runningId = randomUUID();
+  const runningBatchId = randomUUID();
+  await mkdir(join(root, runningId), { recursive: true });
+  await writeFile(join(root, runningId, 'run.json'), JSON.stringify({
+    schema_version: 1,
+    run_id: runningId,
+    contest_id: 'qoj-default',
+    data_version: 1,
+    judge_kind: 'qoj',
+    oj_account_id: 'qoj-def-2',
+    judge_selector: { kind: 'qoj' },
+    agent_id: 'polish-agent',
+  }));
+  await writeFile(join(root, runningId, 'events.jsonl'), JSON.stringify({
+    schema_version: 1,
+    seq: 1,
+    elapsed_ms: 0,
+    type: 'run_started',
+    started_at: new Date().toISOString(),
+  }) + '\n');
+  await writeFile(
+    join(root, '.batches', `${runningBatchId}.json`),
+    JSON.stringify({
+      schema_version: 1,
+      id: runningBatchId,
+      created_at: new Date().toISOString(),
+      plan: {
+        schema_version: 2,
+        protocol_sha256: h,
+        jobs: [{
+          image: FAKE_IMAGE,
+          harness: 'codex',
+          agent_path: join(base, 'agents', 'polish-agent.toml'),
+          agent_id: 'polish-agent',
+          credential_source: 'provider:resp-prov',
+          agent_revision: h,
+          agent_sha256: h,
+          profile_sha256: h,
+          effective_sha256: h,
+          contest_path: join(base, 'contests', 'race-local.json'), // edited/local contest on disk!
+          contest_id: 'qoj-default',
+          data_version: 1,
+          contest_sha256: h,
+        }],
+      },
+      jobs: [{ status: 'running', run_id: runningId }],
+    }),
+  );
+  assert.equal(
+    (await req('/api/oj-accounts/qoj-def-2', { method: 'DELETE' })).status,
+    409,
+    'Active run.json must block deleting its OJ account even if contest file on disk was edited',
+  );
+
+  // 10. SSE missing batch termination (deleting batch while SSE is open emits terminal status and closes)
+  const sseMissRes = await fetch(`${studio.url}/api/runs/${runningId}/events`);
+  assert.equal(sseMissRes.status, 200);
+  const missReader = sseMissRes.body.getReader();
+  const missDecoder = new TextDecoder();
+  let missBuf = '';
+  // Wait for first progress frame, then remove the batch file!
+  while (!missBuf.includes('event: progress')) {
+    const { done, value } = await missReader.read();
+    if (done) break;
+    missBuf += missDecoder.decode(value, { stream: true });
+  }
+  await rm(join(root, '.batches', `${runningBatchId}.json`));
+  while (true) {
+    const { done, value } = await missReader.read();
+    if (done) break;
+    missBuf += missDecoder.decode(value, { stream: true });
+  }
+  assert.match(missBuf, /event: status/, 'Missing batch must emit terminal status event and close SSE stream');
+
+  // 11. SSE backpressure coalescing, terminal flush on drain, and bounded stall timeout
+  {
+    const fakeRes = new EventEmitter();
+    fakeRes.destroyed = false;
+    fakeRes.writableEnded = false;
+    const written = [];
+    let allowWrite = false;
+    fakeRes.write = chunk => {
+      written.push(chunk);
+      return allowWrite;
+    };
+    let closedCount = 0;
+    fakeRes.end = () => { fakeRes.writableEnded = true; };
+
+    const writer = createSseWriter(fakeRes, {
+      drainTimeoutMs: 500,
+      onClose: () => { closedCount++; fakeRes.end(); },
+    });
+    // First write returns false -> enters waitingForDrain
+    assert.equal(writer.write('event: progress\ndata: {"seq":1}\n\n'), true);
+    assert.equal(writer.isWaitingForDrain(), true);
+    // Subsequent writes while backpressured coalesce to ONLY the latest real payload; ping does not overwrite real payload
+    writer.write('event: progress\ndata: {"seq":2}\n\n');
+    writer.write('event: progress\ndata: {"seq":3}\n\n', true);
+    writer.write(': ping\n\n');
+    assert.equal(written.length, 1, 'Backpressured writes must wait for drain without unbounded buffering');
+    assert.equal(closedCount, 0);
+
+    // Emit drain -> flushes ONLY the coalesced latest terminal payload and closes cleanly
+    allowWrite = true;
+    fakeRes.emit('drain');
+    assert.deepEqual(written, [
+      'event: progress\ndata: {"seq":1}\n\n',
+      'event: progress\ndata: {"seq":3}\n\n',
+    ]);
+    assert.equal(closedCount, 1, 'Terminal backpressured payload must close stream after drain');
+
+    // Stalled client that never drains closes cleanly after bounded drainTimeoutMs
+    const stalledRes = new EventEmitter();
+    stalledRes.destroyed = false;
+    stalledRes.writableEnded = false;
+    stalledRes.write = () => false;
+    let stalledClosed = false;
+    stalledRes.end = () => { stalledRes.writableEnded = true; };
+    const stalledWriter = createSseWriter(stalledRes, {
+      drainTimeoutMs: 60,
+      onClose: () => { stalledClosed = true; stalledRes.end(); },
+    });
+    stalledWriter.write('event: progress\ndata: {"seq":1}\n\n');
+    assert.equal(stalledClosed, false);
+    await new Promise(r => setTimeout(r, 120));
+    assert.equal(stalledClosed, true, 'Stalled SSE stream must close after bounded drain timeout');
+  }
+
+  // 12. Ranked results fixed omission enum reasons (no malformed JSON text leaked!)
+  const omitBatchId = randomUUID();
+  const rMissing = randomUUID();
+  const rBadMeta = randomUUID();
+  const rBadLog = randomUUID();
+  await mkdir(join(root, rBadMeta), { recursive: true });
+  await writeFile(join(root, rBadMeta, 'run.json'), '{"CANARY_SECRET_META": bad');
+  await mkdir(join(root, rBadLog), { recursive: true });
+  await writeFile(join(root, rBadLog, 'run.json'), JSON.stringify({
+    schema_version: 1,
+    run_id: rBadLog,
+    contest_id: 'omit-c',
+    data_version: 1,
+    contest_revision: h,
+    input_sha256: { contest: h },
+    protocol_id: 'codex-pdf-pages-mcp',
+    protocol_version: 2,
+    protocol_sha256: h,
+    agent_id: 'polish-agent',
+    agent_revision: h,
+    harness: { kind: 'codex', version: '0.170.0' },
+    model: { model: 'gpt-5.4' },
+  }));
+  await writeFile(join(root, rBadLog, 'events.jsonl'), '{"CANARY_SECRET_LOG": broken\n');
+  await writeFile(
+    join(root, '.batches', `${omitBatchId}.json`),
+    JSON.stringify({
+      schema_version: 1,
+      id: omitBatchId,
+      created_at: new Date().toISOString(),
+      plan: {
+        schema_version: 2,
+        protocol_sha256: h,
+        jobs: [rMissing, rBadMeta, rBadLog].map((_id, idx) => ({
+          image: FAKE_IMAGE,
+          harness: 'codex',
+          agent_path: join(base, 'agents', `omit-a-${idx}.toml`),
+          agent_id: `omit-a-${idx}`,
+          credential_source: 'provider:resp-prov',
+          agent_revision: h,
+          agent_sha256: h,
+          profile_sha256: h,
+          effective_sha256: h,
+          contest_path: join(base, 'contests', 'race-local.json'),
+          contest_id: 'omit-c',
+          data_version: 1,
+          contest_sha256: h,
+        })),
+      },
+      jobs: [
+        { status: 'completed', run_id: rMissing, reason: 'finish' },
+        { status: 'completed', run_id: rBadMeta, reason: 'finish' },
+        { status: 'completed', run_id: rBadLog, reason: 'finish' },
+      ],
+    }),
+  );
+  const omitRes = await req(`/api/results/ranked?batch_id=${omitBatchId}`);
+  assert.equal(omitRes.status, 200, omitRes.text);
+  rankedResultsResponseSchema.parse(omitRes.value);
+  assert.ok(!omitRes.text.includes('CANARY_SECRET_META'));
+  assert.ok(!omitRes.text.includes('CANARY_SECRET_LOG'));
+  const reasonsByRun = new Map(omitRes.value.omitted_runs.map(r => [r.run_id, r.reason]));
+  assert.equal(reasonsByRun.get(rMissing), 'missing_run_file');
+  assert.equal(reasonsByRun.get(rBadMeta), 'invalid_run_metadata');
+  assert.equal(reasonsByRun.get(rBadLog), 'invalid_event_log');
+
+  // 13. Locked Agent DELETE + provider ref retirement (atomic unregisterAndDelete)
+  assert.equal((await req('/api/providers/resp-prov', { method: 'DELETE' })).status, 409, 'Referenced provider blocked');
+  assert.equal((await req('/api/agents/item?path=agents/polish-agent.toml', { method: 'DELETE' })).status, 200);
+  const remainingRefs = await readdir(join(dir, 'connections', 'references')).catch(() => []);
+  assert.equal(remainingRefs.filter(n => n.startsWith('resp-prov~')).length, 0, 'Agent DELETE must retire provider refs');
+  assert.equal((await req('/api/providers/resp-prov', { method: 'DELETE' })).status, 200, 'Provider delete succeeds once agent deleted');
 });

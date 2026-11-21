@@ -574,9 +574,15 @@ export const ghostRaceRequestSchema = z.strictObject({
 });
 
 // --- Ranked Results ---
+export const rankedOmittedReasonSchema = z.enum([
+  'missing_run_file',
+  'invalid_run_metadata',
+  'invalid_event_log',
+  'export_failed',
+]);
 export const rankedOmittedRunSchema = z.strictObject({
   run_id: z.uuid(),
-  reason: z.string(),
+  reason: rankedOmittedReasonSchema,
 });
 export const rankedProblemScoreSchema = z.strictObject({
   solved: z.boolean(),

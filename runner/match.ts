@@ -88,7 +88,7 @@ export function match(
           fault(new Error(`Judge infrastructure verdict: ${rawVerdict || 'judge_error'}`));
           return;
         }
-        row.verdict = rawVerdict;
+        row.verdict = normalized;
         const isAc = normalized === 'accepted';
         const subScore = isAc ? maxPts : 0;
         row.score = subScore;
@@ -100,7 +100,8 @@ export function match(
           type: 'submission_judged',
           submission_id,
           problem_id: row.problem,
-          verdict: rawVerdict,
+          verdict: normalized,
+          raw_verdict: rawVerdict,
           remote_submission_id: id,
           score: subScore,
           max_points: maxPts,

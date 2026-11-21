@@ -123,8 +123,8 @@ export const planSchema = z.strictObject({
 });
 export type Plan = z.infer<typeof planSchema>;
 export type PlanJob = Plan['jobs'][number];
-export async function readJson(path: string) {
-  return JSON.parse((await readBoundedFile(path, 16 * 1024 * 1024)).toString('utf8')) as unknown;
+export async function readJson(path: string, limit = 16 * 1024 * 1024) {
+  return JSON.parse((await readBoundedFile(path, limit)).toString('utf8')) as unknown;
 }
 
 export async function makePlan(raw: unknown, base: string, getImage = inspectImage, store?: Connections): Promise<Plan> {
@@ -213,7 +213,7 @@ export function assertCompatible(harness: Inputs['profile']['harness'], contest:
 function credentialSourceFor(input: Pick<AgentInput, 'connection' | 'profile'>) {
   return input.connection ? `provider:${input.connection}` : `env:${input.profile.api_key_env}`;
 }
-function assertHarnessProtocolCompatible(profile: Inputs['profile']) {
+export function assertHarnessProtocolCompatible(profile: Inputs['profile']) {
   if (profile.api !== 'responses' && profile.api !== 'passthrough') {
     throw new Error(`Harness ${profile.harness} requires a responses or passthrough provider (got ${profile.api})`);
   }

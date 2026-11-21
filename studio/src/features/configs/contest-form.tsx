@@ -58,7 +58,7 @@ function ProblemEditor({ problems, setProblems }: { problems: ProblemDraft[]; se
       <Button type="button" variant="ghost" size="icon" aria-label={`删除题目 ${index + 1}`} disabled={problems.length === 1} onClick={() => setProblems(problems.filter((_, i) => i !== index))}><Trash2 className="size-4" /></Button>
     </motion.div>)}</AnimatePresence>
     <Button type="button" variant="secondary" size="sm" onClick={() => setProblems([...problems, { id: String(problems.length + 1), maxPoints: 1, answers: '' }])}><Plus className="size-3.5" />添加题目</Button>
-    <p className="text-[11px] leading-5 text-muted-foreground">去除提交答案首尾空白后精确匹配，命中任一可接受答案即得分。保存时同步生成 Contest 题目表与 judge.json。</p></div>;
+    <p className="text-[11px] leading-5 text-muted-foreground">去除提交答案首尾空白后精确匹配，命中任一可接受答案即得分。保存时同步生成 Contest 题目表与私有答案文件。</p></div>;
 }
 
 function ContestManifestForm({ capabilities }: { capabilities: StudioCapabilities }) {

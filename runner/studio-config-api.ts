@@ -5,19 +5,35 @@ import { z } from 'zod';
 import { agentKind, FieldError, manifestProvider, nativeConfigSchema } from './agent-manifest.js';
 import { persistAgentManifest } from './author.js';
 import { agentCatalog, contestCatalog, evaluateMatrix } from './catalog.js';
-import { agentDigests, file, id as identifierSchema, loadAgent, loadContest, modelKey, resolveAgentManifest, revisionFor, sha256 } from './config.js';
+import {
+  agentDigests,
+  file,
+  id as identifierSchema,
+  modelKey,
+  resolveAgentManifest,
+  resolveLoadedAgent,
+  revisionFor,
+  sha256,
+  type AgentExternalFileReader,
+} from './config.js';
 import { connectionId, ConnectionError, createConnectionSchema, endpoint, patchConnectionSchema, rotateConnectionSchema, type Connections } from './connections.js';
 import {
   assertAgentDocument,
   assertContestDocument,
   createContestDocument,
   existingWorkspaceFile,
+  FORBIDDEN_WORKSPACE_DIRS,
+  isForbiddenWorkspaceRelPath,
+  isReservedNonManifestFilename,
+  loadStudioContest,
   outputPath,
   readWorkspaceFileNoFollow,
   resolveRealPathOrAncestor,
+  resolveStudioContestFromParsed,
   updateContestDocument,
   verifyManagedMaterialFile,
   verifyManagedMaterialsRoot,
+  withWorkspaceLock,
 } from './contest-author.js';
 import { imageFor, inspectImage } from './docker.js';
 import { efforts, harnessCapabilities, serviceTierSchema, speedTierSchema } from './harnesses.js';
@@ -42,7 +58,7 @@ import {
 } from './judges/index.js';
 import { uploadMaterial } from './materials.js';
 import { checkPdfLimits, inspectPdf } from './pdf-synth.js';
-import { assertCompatible, checkOjReadiness } from './plan.js';
+import { assertCompatible, assertHarnessProtocolCompatible, checkOjReadiness } from './plan.js';
 import { protocolDigest, protocolPresetNames, protocolPresets, resolveProtocolPreset, resolveScoringMode } from './protocol.js';
 import { listBatches } from './queue.js';
 import { documentFormat, formatSchema, parseDocumentText, serializeDocument } from './serialization.js';
@@ -191,13 +207,77 @@ export function configError(error: unknown) {
 const ZodError = z.ZodError;
 const safeIssue = (code: string) => code === 'unrecognized_keys' ? 'Contains unsupported fields' : 'Invalid or missing value';
 
-const FORBIDDEN_WORKSPACE_DIRS = new Set(['node_modules', 'dist', 'coverage', 'runs']);
 const MANAGED_ASSET_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const MANAGED_ASSET_EXT = /^\.[A-Za-z0-9]{1,12}$/;
 
 function isWithinOrEqual(candidate: string, boundary: string): boolean {
   const rel = relative(boundary, candidate);
   return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+function sanitizeStudioIssue(
+  error: unknown,
+  sensitivePaths: readonly (string | undefined)[],
+  fallback = 'Invalid configuration',
+): string {
+  const raw = error instanceof Error ? error.message : fallback;
+  let cleaned = raw;
+  const uniquePaths = [...new Set(sensitivePaths.filter((p): p is string => Boolean(p)))].sort((a, b) => b.length - a.length);
+  for (const p of uniquePaths) {
+    if (cleaned.includes(p)) {
+      cleaned = cleaned.replaceAll(p, '<workspace>');
+    }
+  }
+  // Redact any remaining absolute Unix/Windows host paths while preserving http(s):// URLs.
+  cleaned = cleaned.replace(/(^|[\s'"(=])(?:\/[^\s'"(),;]+|[A-Za-z]:\\[^\s'"(),;]+)/g, '$1<path>');
+  return cleaned;
+}
+
+function makeStudioExternalReader(
+  base: string,
+  root: string,
+  target: string,
+  fieldName: string,
+): AgentExternalFileReader {
+  return async (refPath, expectedSha256, limit) => {
+    if (!refPath || refPath.includes('\0')) {
+      throw new FieldError([fieldName], 'Referenced file path is invalid');
+    }
+    const realBase = await realpath(base);
+    const candidate = isAbsolute(refPath) ? resolve(refPath) : resolve(dirname(target), refPath);
+    const relFromBase = relative(realBase, candidate);
+    if (!relFromBase || relFromBase === '..' || relFromBase.startsWith(`..${sep}`) || isAbsolute(relFromBase)) {
+      throw new FieldError([fieldName], 'Referenced file must be inside the Studio workspace');
+    }
+    const verified = await existingWorkspaceFile(base, relFromBase, fieldName, root);
+    const bytes = await readWorkspaceFileNoFollow(verified, limit, fieldName);
+    if (expectedSha256 && sha256(bytes) !== expectedSha256) {
+      throw new FieldError([fieldName], 'Referenced file SHA-256 mismatch');
+    }
+    return bytes;
+  };
+}
+
+async function readStudioAgentFile(base: string, root: string, relPath: string, fieldName = 'path') {
+  const target = await existingWorkspaceFile(base, relPath, fieldName, root);
+  let format;
+  try { format = documentFormat(target); } catch { throw new FieldError([fieldName], 'Unsupported Agent manifest extension'); }
+  const bytes = await readWorkspaceFileNoFollow(target, 1_000_000, fieldName);
+  const parsed = parseDocumentText(bytes.toString('utf8'), format);
+  assertAgentDocument(target, parsed, fieldName);
+  return { target, format, bytes, parsed };
+}
+
+async function loadStudioAgent(base: string, root: string, relPath: string, store: Connections, fieldName = 'path') {
+  const { target, format, bytes, parsed } = await readStudioAgentFile(base, root, relPath, fieldName);
+  const loaded = await resolveLoadedAgent(
+    parsed,
+    bytes,
+    target,
+    store,
+    makeStudioExternalReader(base, root, target, fieldName),
+  );
+  return { target, format, parsed, loaded };
 }
 
 async function scanWorkspaceConfigFiles(base: string, root: string, extensions: RegExp, limitError: () => Error) {
@@ -213,6 +293,7 @@ async function scanWorkspaceConfigFiles(base: string, root: string, extensions: 
       if (entry.name.startsWith('.') || FORBIDDEN_WORKSPACE_DIRS.has(entry.name)) continue;
       if (entry.isSymbolicLink()) continue;
       const fullPath = join(entry.parentPath, entry.name);
+      if (isForbiddenWorkspaceRelPath(relative(realBase, fullPath))) continue;
       if (isWithinOrEqual(fullPath, realExcludedRoot)) continue;
       if (entry.isDirectory()) { dirs.push(fullPath); continue; }
       if (!entry.isFile() || !extensions.test(entry.name)) continue;
@@ -291,9 +372,18 @@ function contestJudgeReferencesAccount(
     return target.handle.toLowerCase() === judge.handle.trim().toLowerCase();
   }
 
-  // Active/queued jobs using platform-default selection (no account_id/pool/handle) may lease this account.
-  if (isActiveJob && !judge.account_id && !judge.pool && !judge.handle) {
-    return true;
+  // Platform-default selection (no account_id/pool/handle):
+  // - Active/queued jobs may lease any matching account.
+  // - Saved workspace contests (QOJ/VJudge/Hydro) block deleting the last ready account matching (platform, contestOrigin).
+  if (!judge.account_id && !judge.pool && !judge.handle) {
+    if (isActiveJob) return true;
+    const hasReplacement = allAccounts.some(acc =>
+      acc.id !== target.id &&
+      acc.platform === platform &&
+      acc.ready &&
+      (!contestOrigin || effectiveOriginFor(acc) === contestOrigin),
+    );
+    return !hasReplacement;
   }
   return false;
 }
@@ -319,13 +409,46 @@ async function workspaceOjAccountReferences(base: string, root: string, ojAccoun
     if (contestJudgeReferencesAccount(obj.judge, target, allAccounts, false)) return true;
   }
 
-  // 2. Check all active (running) and queued batch jobs
+  // 2. Check all active (running) and queued batch jobs (both active run.json AND contest_path)
   const batches = await listBatches(root);
   const checkedContestPaths = new Map<string, boolean>();
   for (const batch of batches) {
     for (let i = 0; i < batch.jobs.length; i++) {
-      const status = batch.jobs[i]?.status;
+      const job = batch.jobs[i];
+      const status = job?.status;
       if (status !== 'running' && status !== 'queued') continue;
+
+      // Inspect active run.json so editing contest.json on disk mid-run cannot hide an in-use account.
+      if (status === 'running' && job?.run_id) {
+        const runJsonPath = join(root, job.run_id, 'run.json');
+        let runMetaRaw: unknown;
+        let runJsonExists = true;
+        try {
+          const bytes = await readWorkspaceFileNoFollow(runJsonPath, 1_000_000);
+          runMetaRaw = JSON.parse(bytes.toString('utf8')) as unknown;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+            runJsonExists = false;
+          } else {
+            // Fail closed if an active run.json exists but cannot be read/parsed.
+            return true;
+          }
+        }
+        if (runJsonExists) {
+          if (!runMetaRaw || typeof runMetaRaw !== 'object' || Array.isArray(runMetaRaw)) {
+            return true;
+          }
+          const runMeta = runMetaRaw as Record<string, unknown>;
+          if (runMeta.oj_account_id === target.id) return true;
+          if (runMeta.judge_selector && contestJudgeReferencesAccount(runMeta.judge_selector, target, allAccounts, true)) {
+            return true;
+          }
+          if (!runMeta.judge_selector && runMeta.judge_kind === target.platform) {
+            return true;
+          }
+        }
+      }
+
       const contestPath = batch.plan.jobs[i]?.contest_path;
       if (!contestPath) continue;
       let referenced = checkedContestPaths.get(contestPath);
@@ -368,28 +491,11 @@ async function collectReferencedManagedMaterials(
   fieldName: string,
 ): Promise<Set<string>> {
   const referenced = new Set<string>();
-  const files = await scanWorkspaceConfigFiles(
-    base,
-    root,
-    /\.json$/i,
-    () => new FieldError([fieldName], 'Workspace too large to scan material references', 409),
-  );
-  for (const contestFile of files) {
-    let bytes: Buffer;
-    try {
-      bytes = await readWorkspaceFileNoFollow(contestFile, 1_000_000, fieldName);
-    } catch {
-      throw new FieldError([fieldName], 'Could not read workspace JSON while scanning material references', 409);
-    }
-    let raw: unknown;
-    try {
-      raw = JSON.parse(bytes.toString('utf8')) as unknown;
-    } catch {
-      throw new FieldError([fieldName], 'Could not parse workspace JSON while scanning material references', 409);
-    }
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+
+  const collectFromRawContest = async (contestFile: string, raw: unknown) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
     const obj = raw as Record<string, unknown>;
-    if (!('contest_id' in obj) || 'run_id' in obj) continue;
+    if (!('contest_id' in obj) || 'run_id' in obj) return;
 
     const candidates: string[] = [];
     // v1 contest manifest: statement.path
@@ -424,6 +530,60 @@ async function collectReferencedManagedMaterials(
       if (real && isWithinOrEqual(real, realMaterialsRoot) && real !== realMaterialsRoot) {
         referenced.add(real);
       }
+    }
+  };
+
+  // 1. Scan all workspace JSON files
+  const files = await scanWorkspaceConfigFiles(
+    base,
+    root,
+    /\.json$/i,
+    () => new FieldError([fieldName], 'Workspace too large to scan material references', 409),
+  );
+  for (const contestFile of files) {
+    let bytes: Buffer;
+    try {
+      bytes = await readWorkspaceFileNoFollow(contestFile, 1_000_000, fieldName);
+    } catch {
+      throw new FieldError([fieldName], 'Could not read workspace JSON while scanning material references', 409);
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(bytes.toString('utf8')) as unknown;
+    } catch {
+      throw new FieldError([fieldName], 'Could not parse workspace JSON while scanning material references', 409);
+    }
+    await collectFromRawContest(contestFile, raw);
+  }
+
+  // 2. Also inspect contest_path for all running and queued batch jobs (fail closed with 409 on read/parse error)
+  let batches;
+  try {
+    batches = await listBatches(root);
+  } catch {
+    throw new FieldError([fieldName], 'Could not inspect active batches while scanning material references', 409);
+  }
+  const checkedBatchContests = new Set<string>();
+  for (const batch of batches) {
+    for (let i = 0; i < batch.jobs.length; i++) {
+      const status = batch.jobs[i]?.status;
+      if (status !== 'running' && status !== 'queued') continue;
+      const contestPath = batch.plan.jobs[i]?.contest_path;
+      if (!contestPath || checkedBatchContests.has(contestPath)) continue;
+      checkedBatchContests.add(contestPath);
+      let bytes: Buffer;
+      try {
+        bytes = await readWorkspaceFileNoFollow(contestPath, 1_000_000, fieldName);
+      } catch {
+        throw new FieldError([fieldName], 'Could not read active batch contest while scanning material references', 409);
+      }
+      let raw: unknown;
+      try {
+        raw = JSON.parse(bytes.toString('utf8')) as unknown;
+      } catch {
+        throw new FieldError([fieldName], 'Could not parse active batch contest while scanning material references', 409);
+      }
+      await collectFromRawContest(contestPath, raw);
     }
   }
   return referenced;
@@ -489,38 +649,63 @@ async function cleanupOrphanMaterials(root: string, base: string): Promise<strin
   return deleted.sort();
 }
 
-function extractCookieSecrets(cookie: string | undefined): string[] {
-  if (!cookie) return [];
-  const secrets = new Set<string>();
-  const trimmed = cookie.trim();
-  if (trimmed) secrets.add(trimmed);
-  for (const part of trimmed.split(';')) {
-    const eq = part.indexOf('=');
-    const val = (eq >= 0 ? part.slice(eq + 1) : part).trim();
-    if (val.length >= 6) secrets.add(val);
-    if (part.trim().length >= 6) secrets.add(part.trim());
-  }
-  return [...secrets].sort((a, b) => b.length - a.length);
+interface CookieRedactionRules {
+  exact: string[];
+  wordBoundary: string[];
 }
 
-function redactSecretText(text: string, secrets: readonly string[]): string {
+function extractCookieSecrets(cookie: string | undefined): CookieRedactionRules {
+  const exact = new Set<string>();
+  const wordBoundary = new Set<string>();
+  if (!cookie) return { exact: [], wordBoundary: [] };
+  const trimmed = cookie.trim();
+  if (trimmed.length >= 2) exact.add(trimmed);
+  else if (trimmed.length === 1) wordBoundary.add(trimmed);
+  for (const rawPart of trimmed.split(';')) {
+    const part = rawPart.trim();
+    if (!part) continue;
+    if (part.length >= 2) exact.add(part);
+    else wordBoundary.add(part);
+    const eq = part.indexOf('=');
+    if (eq >= 0) {
+      const val = part.slice(eq + 1).trim();
+      if (val.length >= 2) exact.add(val);
+      else if (val.length === 1) wordBoundary.add(val);
+    }
+  }
+  return {
+    exact: [...exact].sort((a, b) => b.length - a.length),
+    wordBoundary: [...wordBoundary],
+  };
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function redactSecretText(text: string, rules: CookieRedactionRules): string {
   let out = text;
-  for (const secret of secrets) {
+  for (const secret of rules.exact) {
     if (secret && out.includes(secret)) {
       out = out.replaceAll(secret, '[REDACTED]');
     }
   }
+  for (const token of rules.wordBoundary) {
+    if (!token) continue;
+    const re = new RegExp(`(^|[^A-Za-z0-9_])${escapeRegExp(token)}(?=$|[^A-Za-z0-9_])`, 'g');
+    out = out.replace(re, '$1[REDACTED]');
+  }
   return out;
 }
 
-function redactSecretsDeep<T>(value: T, secrets: readonly string[]): T {
-  if (!secrets.length) return value;
-  if (typeof value === 'string') return redactSecretText(value, secrets) as T;
-  if (Array.isArray(value)) return value.map(item => redactSecretsDeep(item, secrets)) as T;
+function redactSecretsDeep<T>(value: T, rules: CookieRedactionRules): T {
+  if (!rules.exact.length && !rules.wordBoundary.length) return value;
+  if (typeof value === 'string') return redactSecretText(value, rules) as T;
+  if (Array.isArray(value)) return value.map(item => redactSecretsDeep(item, rules)) as T;
   if (value && typeof value === 'object') {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value)) {
-      out[k] = redactSecretsDeep(v, secrets);
+      out[k] = redactSecretsDeep(v, rules);
     }
     return out as T;
   }
@@ -535,16 +720,10 @@ async function validateVariantDirectory(base: string, root: string, dirRel: stri
   const realExcludedRoot = await resolveRealPathOrAncestor(root);
   const candidate = resolve(realBase, dirRel);
   const relDir = relative(realBase, candidate);
-  if (relDir === '..' || relDir.startsWith(`..${sep}`) || isAbsolute(relDir)) {
+  if (relDir === '..' || relDir.startsWith(`..${sep}`) || isAbsolute(relDir) || isForbiddenWorkspaceRelPath(relDir)) {
     throw new FieldError(['directory'], 'Variant directory must be inside the Studio workspace');
   }
   const parts = relDir ? relDir.split(sep) : [];
-  if (
-    parts.some(p => !p || p === '.' || p === '..' || p.startsWith('.')) ||
-    (parts[0] !== undefined && FORBIDDEN_WORKSPACE_DIRS.has(parts[0]))
-  ) {
-    throw new FieldError(['directory'], 'Variant directory must be inside the Studio workspace');
-  }
   if (isWithinOrEqual(candidate, realExcludedRoot)) {
     throw new FieldError(['directory'], 'Variant directory cannot be inside the configured run root');
   }
@@ -610,6 +789,8 @@ export function isConfigRoute(path: string) {
 async function resolveAgentForWrite(
   raw: Record<string, unknown>,
   target: string,
+  base: string,
+  root: string,
   format: z.infer<typeof formatSchema> | undefined,
   nativeConfig: z.infer<typeof nativeConfigSchema> | undefined,
   store: Connections,
@@ -627,7 +808,12 @@ async function resolveAgentForWrite(
   if (!hasFile && override && 'path' in override) {
     throw new FieldError(['file'], 'Manifest path is required to resolve an external override');
   }
-  const agent = await resolveAgentManifest(raw, target, store);
+  const agent = await resolveAgentManifest(
+    raw,
+    target,
+    store,
+    makeStudioExternalReader(base, root, target, 'harness.native_config.path'),
+  );
   const { profileDigest, nativeDigest, effectiveDigest } = agentDigests(agent.profile, agent.native, agent.nativeText, agent.env);
   const warnings: string[] = [];
   const image = validating ? undefined : await getImage(imageFor(agent.profile.harness)).catch(() => {
@@ -716,21 +902,23 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
     if (method === 'GET') {
       const relPath = url.searchParams.get('path');
       if (!relPath) throw new FieldError(['path'], 'Query parameter path is required');
-      const target = await existingWorkspaceFile(base, relPath, 'path', root);
-      let format;
-      try { format = documentFormat(target); } catch { throw new FieldError(['path'], 'Unsupported Agent manifest extension'); }
-      const bytes = await readWorkspaceFileNoFollow(target);
-      const parsed = parseDocumentText(bytes.toString('utf8'), format);
-      assertAgentDocument(target, parsed, 'path');
-      const loaded = await loadAgent(target, store).then(value => ({ value }), error => ({ error }));
+      const { target, format, bytes, parsed } = await readStudioAgentFile(base, root, relPath, 'path');
       const realBase = await realpath(base);
+      const realRoot = await resolveRealPathOrAncestor(root);
+      const loaded = await resolveLoadedAgent(
+        parsed,
+        bytes,
+        target,
+        store,
+        makeStudioExternalReader(base, root, target, 'path'),
+      ).then(value => ({ value }), error => ({ error }));
       return {
         data: {
           path: relative(realBase, target),
           format,
           document: parsed,
           valid: 'value' in loaded,
-          issues: 'error' in loaded ? [loaded.error instanceof Error ? loaded.error.message : 'Invalid Agent'] : [],
+          issues: 'error' in loaded ? [sanitizeStudioIssue(loaded.error, [target, realBase, base, realRoot, root], 'Invalid Agent')] : [],
           ...('value' in loaded ? {
             id: loaded.value.agent.agent_id,
             ...(loaded.value.agentName ? { name: loaded.value.agentName } : {}),
@@ -751,16 +939,11 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
     }
     if (method === 'PUT') {
       const input = agentUpdateRequest.parse(await body());
-      const target = await existingWorkspaceFile(base, input.path, 'path', root);
-      let detected;
-      try { detected = documentFormat(target); } catch { throw new FieldError(['path'], 'Unsupported manifest extension'); }
-      const existingBytes = await readWorkspaceFileNoFollow(target);
-      const existingParsed = parseDocumentText(existingBytes.toString('utf8'), detected);
-      assertAgentDocument(target, existingParsed, 'path');
+      const { target, format: detected } = await readStudioAgentFile(base, root, input.path, 'path');
       const format = input.format ?? detected;
       if (detected !== format) throw new FieldError(['format'], 'File extension does not match selected manifest format');
       const raw = z.record(z.string(), z.unknown()).parse(input.document);
-      const resolved = await resolveAgentForWrite(raw, target, format, input.native_config, store, getImage, false, true);
+      const resolved = await resolveAgentForWrite(raw, target, base, root, format, input.native_config, store, getImage, false, true);
       await persistAgentManifest(target, manifestProvider(resolved.manifest), resolved.serialized!, store, true);
       const realBase = await realpath(base);
       return {
@@ -777,15 +960,9 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
     if (method === 'DELETE') {
       const relPath = url.searchParams.get('path');
       if (!relPath) throw new FieldError(['path'], 'Query parameter path is required');
-      const target = await existingWorkspaceFile(base, relPath, 'path', root);
-      let format;
-      try { format = documentFormat(target); } catch { throw new FieldError(['path'], 'Target is not a supported Agent manifest'); }
-      const existingBytes = await readWorkspaceFileNoFollow(target);
-      const existingParsed = parseDocumentText(existingBytes.toString('utf8'), format);
-      assertAgentDocument(target, existingParsed, 'path');
+      const { target } = await readStudioAgentFile(base, root, relPath, 'path');
       const realBase = await realpath(base);
-      await rm(target);
-      await store.unregisterPath(target);
+      await store.unregisterAndDelete(target, () => rm(target));
       return { data: { deleted: true, path: relative(realBase, target) } };
     }
   }
@@ -793,12 +970,7 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
   // Clone Agent
   if (method === 'POST' && path === '/api/agents/clone') {
     const input = agentCloneRequest.parse(await body());
-    const sourceTarget = await existingWorkspaceFile(base, input.source_path, 'source_path', root);
-    let sourceFormat;
-    try { sourceFormat = documentFormat(sourceTarget); } catch { throw new FieldError(['source_path'], 'Unsupported Agent manifest extension'); }
-    const bytes = await readWorkspaceFileNoFollow(sourceTarget);
-    const parsed = parseDocumentText(bytes.toString('utf8'), sourceFormat);
-    assertAgentDocument(sourceTarget, parsed, 'source_path');
+    const { format: sourceFormat, parsed } = await readStudioAgentFile(base, root, input.source_path, 'source_path');
     const sourceDoc = z.record(z.string(), z.unknown()).parse(parsed);
     const clonedDoc = mergeCloneDocument(sourceDoc, input.id, input.name, input.overrides);
     const format = input.format ?? (input.file ? (() => {
@@ -810,7 +982,7 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
     let detected;
     try { detected = documentFormat(target); } catch { throw new FieldError(['file'], 'Unsupported manifest extension'); }
     if (detected !== format) throw new FieldError(['file'], 'File extension does not match selected manifest format');
-    const resolved = await resolveAgentForWrite(clonedDoc, target, format, undefined, store, getImage, false, true);
+    const resolved = await resolveAgentForWrite(clonedDoc, target, base, root, format, undefined, store, getImage, false, true);
     await persistAgentManifest(target, manifestProvider(resolved.manifest), resolved.serialized!, store, false);
     return {
       status: 201,
@@ -907,7 +1079,10 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
           const target = input.dry_run
             ? resolve(baseDirResolved, `${variantId}.${format}`)
             : await outputPath(base, join(dirRel, `${variantId}.${format}`), root);
-          const resolved = await resolveAgentForWrite(doc, target, format, undefined, store, getImage, false, true);
+          if (isReservedNonManifestFilename(target)) {
+            throw new FieldError(['base_document', 'id'], 'Output filename is reserved');
+          }
+          const resolved = await resolveAgentForWrite(doc, target, base, root, format, undefined, store, getImage, false, true);
           prepared.push({
             id: variantId,
             path: target,
@@ -939,8 +1114,7 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
       }
     } catch (error) {
       for (const p of writtenPaths) {
-        await rm(p, { force: true }).catch(() => {});
-        await store.unregisterPath(p).catch(() => {});
+        await store.unregisterAndDelete(p, () => rm(p, { force: true })).catch(() => {});
       }
       throw error;
     }
@@ -974,6 +1148,8 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
     const { agent, manifest, serialized, revision, digests, warnings } = await resolveAgentForWrite(
       raw,
       target,
+      base,
+      root,
       format,
       input.native_config,
       store,
@@ -1024,8 +1200,10 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
       try { parsed = JSON.parse(bytes.toString('utf8')); }
       catch { throw new FieldError(['path'], 'Invalid contest JSON'); }
       assertContestDocument(target, parsed, 'path');
-      const loaded = await loadContest(target).then(value => ({ value }), error => ({ error }));
       const realBase = await realpath(base);
+      const realRoot = await resolveRealPathOrAncestor(root);
+      const loaded = await resolveStudioContestFromParsed(root, base, target, parsed, 'path')
+        .then(value => ({ value }), error => ({ error }));
       const includeLocalJudge =
         'value' in loaded &&
         loaded.value.contest.judge.kind === 'local' &&
@@ -1035,7 +1213,7 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
           path: relative(realBase, target),
           document: parsed,
           valid: 'value' in loaded,
-          issues: 'error' in loaded ? [loaded.error instanceof Error ? loaded.error.message : 'Invalid Contest'] : [],
+          issues: 'error' in loaded ? [sanitizeStudioIssue(loaded.error, [target, realBase, base, realRoot, root], 'Invalid Contest')] : [],
           ...('value' in loaded ? {
             contest_id: loaded.value.contest.contest_id,
             contest_revision: loaded.value.contestRevision,
@@ -1053,16 +1231,18 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
     if (method === 'DELETE') {
       const relPath = url.searchParams.get('path');
       if (!relPath) throw new FieldError(['path'], 'Query parameter path is required');
-      const target = await existingWorkspaceFile(base, relPath, 'path', root);
-      if (extname(target) !== '.json') throw new FieldError(['path'], 'Contest manifest must end in .json');
-      const bytes = await readWorkspaceFileNoFollow(target);
-      let parsed: unknown;
-      try { parsed = JSON.parse(bytes.toString('utf8')); }
-      catch { throw new FieldError(['path'], 'Target file is not a valid Contest manifest'); }
-      assertContestDocument(target, parsed, 'path');
-      const realBase = await realpath(base);
-      await rm(target);
-      return { data: { deleted: true, path: relative(realBase, target) } };
+      return withWorkspaceLock(base, root, async () => {
+        const target = await existingWorkspaceFile(base, relPath, 'path', root);
+        if (extname(target) !== '.json') throw new FieldError(['path'], 'Contest manifest must end in .json');
+        const bytes = await readWorkspaceFileNoFollow(target);
+        let parsed: unknown;
+        try { parsed = JSON.parse(bytes.toString('utf8')); }
+        catch { throw new FieldError(['path'], 'Target file is not a valid Contest manifest'); }
+        assertContestDocument(target, parsed, 'path');
+        const realBase = await realpath(base);
+        await rm(target);
+        return { data: { deleted: true, path: relative(realBase, target) } };
+      });
     }
   }
 
@@ -1082,9 +1262,11 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
         };
       }
       const parsed = materialDeleteRequest.parse(rawInput);
-      const deleted = parsed.path
-        ? await deleteManagedMaterial(root, base, parsed.path)
-        : await cleanupOrphanMaterials(root, base);
+      const deleted = await withWorkspaceLock(base, root, () =>
+        parsed.path
+          ? deleteManagedMaterial(root, base, parsed.path)
+          : cleanupOrphanMaterials(root, base),
+      );
       return { data: { deleted, count: deleted.length } };
     }
   }
@@ -1112,8 +1294,12 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
         signal,
       });
     } catch (error) {
-      if (cookieSecrets.length && error instanceof Error) {
-        error.message = redactSecretText(error.message, cookieSecrets);
+      if (cookie !== undefined) {
+        throw new FieldError(
+          ['contest_id'],
+          'Contest preview failed; verify the contest reference and OJ account credentials',
+          400,
+        );
       }
       throw error;
     }
@@ -1138,7 +1324,7 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
         preview,
         language_presets: languagePresetsFor(input.platform),
         ...(problemMapSuggestion ? { problem_map_suggestion: problemMapSuggestion } : {}),
-        ...(pdfInfo ? { pdf_info: pdfInfo } : {}),
+        ...(pdfInfo ? { pdf_info: { ...pdfInfo, path: input.pdf_path! } } : {}),
       },
     };
   }
@@ -1153,6 +1339,9 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
     if (!input.agents?.length && !input.contests?.length && !input.cells?.length) {
       throw new FieldError(['agents'], 'Select at least one agent, contest, or cell to run preflight', 400);
     }
+    const realBase = await realpath(base);
+    const realRoot = await resolveRealPathOrAncestor(root);
+    const baseSensitive = [realBase, base, realRoot, root];
     const agentPaths = new Set<string>(input.agents ?? []);
     const contestPaths = new Set<string>(input.contests ?? []);
     const cellPairs: Array<{ agent: string; contest: string }> = [];
@@ -1169,7 +1358,7 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
       }
     }
 
-    const loadedAgents = new Map<string, Awaited<ReturnType<typeof loadAgent>>>();
+    const loadedAgents = new Map<string, Awaited<ReturnType<typeof resolveLoadedAgent>>>();
     const requiredHarnesses = new Set<'codex' | 'builtin-responses'>();
     const agentChecks: z.infer<typeof preflightReportSchema>['agents'] = [];
 
@@ -1178,21 +1367,28 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
       let agentId: string | undefined;
       let harnessKindVal: string | undefined;
       let credentialOk = false;
+      let resolvedPath: string | undefined;
       try {
-        const resolvedPath = await existingWorkspaceFile(base, relPath, 'agents', root);
-        const loaded = await loadAgent(resolvedPath, store);
+        const result = await loadStudioAgent(base, root, relPath, store, 'agents');
+        resolvedPath = result.target;
+        const loaded = result.loaded;
         loadedAgents.set(relPath, loaded);
         agentId = loaded.agent.agent_id;
         harnessKindVal = loaded.profile.harness;
         requiredHarnesses.add(loaded.profile.harness);
         try {
+          assertHarnessProtocolCompatible(loaded.profile);
+        } catch (err) {
+          issues.push(sanitizeStudioIssue(err, [...baseSensitive, resolvedPath], 'Incompatible harness protocol'));
+        }
+        try {
           await modelKey(loaded, store);
           credentialOk = true;
         } catch (err) {
-          issues.push(err instanceof Error ? err.message : 'Model credential unavailable');
+          issues.push(sanitizeStudioIssue(err, [...baseSensitive, resolvedPath], 'Model credential unavailable'));
         }
       } catch (err) {
-        issues.push(err instanceof Error ? err.message : 'Could not load Agent');
+        issues.push(sanitizeStudioIssue(err, [...baseSensitive, ...(resolvedPath ? [resolvedPath] : [])], 'Could not load Agent'));
       }
       agentChecks.push({
         path: relPath,
@@ -1215,12 +1411,12 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
           harness: h,
           image: img,
           ok: false,
-          error: err instanceof Error ? err.message : 'Docker image unavailable',
+          error: sanitizeStudioIssue(err, baseSensitive, 'Docker image unavailable'),
         });
       }
     }
 
-    const loadedContests = new Map<string, Awaited<ReturnType<typeof loadContest>>>();
+    const loadedContests = new Map<string, Awaited<ReturnType<typeof loadStudioContest>>>();
     const contestChecks: z.infer<typeof preflightReportSchema>['contests'] = [];
 
     for (const relPath of contestPaths) {
@@ -1230,9 +1426,10 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
       let presetName: z.infer<typeof preflightReportSchema>['contests'][number]['protocol_preset'];
       let ojReady = true;
       let pdfCheck: z.infer<typeof preflightReportSchema>['contests'][number]['pdf'];
+      let resolvedPath: string | undefined;
       try {
-        const resolvedPath = await existingWorkspaceFile(base, relPath, 'contests', root);
-        const loaded = await loadContest(resolvedPath);
+        const loaded = await loadStudioContest(root, base, relPath, 'contests');
+        resolvedPath = loaded.target;
         loadedContests.set(relPath, loaded);
         contestId = loaded.contest.contest_id;
         judgeKind = loaded.contest.judge.kind;
@@ -1242,15 +1439,18 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
         try {
           const pdfInfo = await inspectPdf(loaded.pdfPath);
           const limits = checkPdfLimits(pdfInfo, { maxPages: preset.pdfMaxPages, maxBytes: preset.pdfMaxBytes });
+          const cleanPdfIssues = limits.issues.map(msg =>
+            sanitizeStudioIssue(new Error(msg), [...baseSensitive, resolvedPath, loaded.pdfPath], 'PDF limit exceeded'),
+          );
           pdfCheck = {
             page_count: pdfInfo.page_count,
             size_bytes: pdfInfo.size_bytes,
             ok: limits.ok,
-            issues: limits.issues,
+            issues: cleanPdfIssues,
           };
-          if (!limits.ok) issues.push(...limits.issues);
+          if (!limits.ok) issues.push(...cleanPdfIssues);
         } catch (err) {
-          const msg = err instanceof Error ? err.message : 'PDF inspection failed';
+          const msg = sanitizeStudioIssue(err, [...baseSensitive, resolvedPath, loaded.pdfPath], 'PDF inspection failed');
           pdfCheck = { page_count: 0, size_bytes: 0, ok: false, issues: [msg] };
           issues.push(msg);
         }
@@ -1260,12 +1460,12 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
             await checkOjReadiness(loaded.contest.judge, ojAccounts);
           } catch (err) {
             ojReady = false;
-            issues.push(err instanceof Error ? err.message : 'OJ account not ready');
+            issues.push(sanitizeStudioIssue(err, [...baseSensitive, resolvedPath], 'OJ account not ready'));
           }
         }
       } catch (err) {
         ojReady = false;
-        issues.push(err instanceof Error ? err.message : 'Could not load Contest');
+        issues.push(sanitizeStudioIssue(err, [...baseSensitive, ...(resolvedPath ? [resolvedPath] : [])], 'Could not load Contest'));
       }
       contestChecks.push({
         path: relPath,
@@ -1300,7 +1500,7 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
           agent: pair.agent,
           contest: pair.contest,
           compatible: false,
-          reason: err instanceof Error ? err.message : 'Incompatible cell',
+          reason: sanitizeStudioIssue(err, baseSensitive, 'Incompatible cell'),
         });
       }
     }

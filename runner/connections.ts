@@ -248,26 +248,38 @@ export class Connections {
       return result;
     });
   }
+  private async retireRefsForPath(targetResolved: string, targetCanonical: string) {
+    try { await assertPrivateDir(this.refs); }
+    catch (e) { if (missing(e)) return; throw e; }
+    const records = await readdir(this.refs).catch(e => { if (missing(e)) return []; throw e; });
+    for (const record of records) {
+      if (!record.endsWith('.json')) continue;
+      try {
+        const parsed = JSON.parse(await readPrivate(join(this.refs, record))) as { path?: unknown };
+        if (typeof parsed.path !== 'string') continue;
+        const recordCanonical = await this.canonicalRefPath(parsed.path);
+        if (recordCanonical === targetCanonical || resolve(parsed.path) === targetResolved) {
+          await rm(join(this.refs, record), { force: true });
+        }
+      } catch {
+        // Ignore malformed or unreadable ref files.
+      }
+    }
+  }
   unregisterPath(path: string) {
     return this.locked(async () => {
-      try { await assertPrivateDir(this.refs); }
-      catch (e) { if (missing(e)) return; throw e; }
       const targetResolved = resolve(path);
       const targetCanonical = await this.canonicalRefPath(path);
-      const records = await readdir(this.refs).catch(e => { if (missing(e)) return []; throw e; });
-      for (const record of records) {
-        if (!record.endsWith('.json')) continue;
-        try {
-          const parsed = JSON.parse(await readPrivate(join(this.refs, record))) as { path?: unknown };
-          if (typeof parsed.path !== 'string') continue;
-          const recordCanonical = await this.canonicalRefPath(parsed.path);
-          if (recordCanonical === targetCanonical || resolve(parsed.path) === targetResolved) {
-            await rm(join(this.refs, record), { force: true });
-          }
-        } catch {
-          // Ignore malformed or unreadable ref files.
-        }
-      }
+      await this.retireRefsForPath(targetResolved, targetCanonical);
+    });
+  }
+  unregisterAndDelete<T>(path: string, removeFile: () => Promise<T>) {
+    return this.locked(async () => {
+      const targetResolved = resolve(path);
+      const targetCanonical = await this.canonicalRefPath(path);
+      const result = await removeFile();
+      await this.retireRefsForPath(targetResolved, targetCanonical);
+      return result;
     });
   }
   remove(id: string, referenced: (id: string) => Promise<boolean>) {

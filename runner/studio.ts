@@ -74,7 +74,100 @@ function reply(res: ServerResponse, status: number, content: string, type = 'app
 }
 
 const MAX_SSE_CONNECTIONS = 64;
+const DEFAULT_SSE_DRAIN_TIMEOUT_MS = 15_000;
 const TERMINAL_JOB_STATUSES = new Set(['completed', 'void', 'cancelled', 'interrupted']);
+type OmittedRunReason = 'missing_run_file' | 'invalid_run_metadata' | 'invalid_event_log' | 'export_failed';
+
+export interface SseWritable {
+  destroyed: boolean;
+  writableEnded: boolean;
+  write(chunk: string): boolean;
+  end(): void;
+  once(event: 'drain', listener: () => void): unknown;
+  off(event: 'drain', listener: () => void): unknown;
+}
+
+export function createSseWriter(
+  res: SseWritable,
+  opts: { drainTimeoutMs?: number; onClose: () => void },
+) {
+  const drainTimeoutMs = Math.max(20, Math.min(60_000, Math.floor(opts.drainTimeoutMs ?? DEFAULT_SSE_DRAIN_TIMEOUT_MS)));
+  let closed = false;
+  let drainTimer: ReturnType<typeof setTimeout> | undefined;
+  let waitingForDrain = false;
+  let pendingChunk: string | undefined;
+  let closeAfterFlush = false;
+
+  const clearDrainTimer = () => {
+    if (drainTimer) {
+      clearTimeout(drainTimer);
+      drainTimer = undefined;
+    }
+  };
+
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    clearDrainTimer();
+    waitingForDrain = false;
+    pendingChunk = undefined;
+    closeAfterFlush = false;
+    res.off('drain', onDrain);
+    opts.onClose();
+  };
+
+  const onDrain = () => {
+    clearDrainTimer();
+    if (closed || res.destroyed || res.writableEnded) return;
+    waitingForDrain = false;
+    while (!closed && !waitingForDrain && pendingChunk !== undefined) {
+      const nextChunk = pendingChunk;
+      const shouldClose = closeAfterFlush;
+      pendingChunk = undefined;
+      closeAfterFlush = false;
+      write(nextChunk, shouldClose);
+    }
+    if (!closed && !waitingForDrain && closeAfterFlush) {
+      close();
+    }
+  };
+
+  const write = (chunk: string, isTerminal = false): boolean => {
+    if (closed || res.destroyed || res.writableEnded) return false;
+    if (waitingForDrain) {
+      if (chunk !== ': ping\n\n' || pendingChunk === undefined) {
+        pendingChunk = chunk;
+      }
+      if (isTerminal) closeAfterFlush = true;
+      return true;
+    }
+    try {
+      const ok = res.write(chunk);
+      if (!ok) {
+        waitingForDrain = true;
+        if (isTerminal) closeAfterFlush = true;
+        clearDrainTimer();
+        drainTimer = setTimeout(close, drainTimeoutMs);
+        drainTimer.unref();
+        res.once('drain', onDrain);
+      } else if (isTerminal) {
+        close();
+      }
+      return true;
+    } catch {
+      close();
+      return false;
+    }
+  };
+
+  const finishWhenFlushed = () => {
+    if (closed) return;
+    if (waitingForDrain) closeAfterFlush = true;
+    else close();
+  };
+
+  return { write, finishWhenFlushed, close, isWaitingForDrain: () => waitingForDrain };
+}
 
 function isMissingError(error: unknown): boolean {
   return (error as NodeJS.ErrnoException)?.code === 'ENOENT';
@@ -86,14 +179,21 @@ function parseUuidParam(raw: string, label: string): string {
   return parsed.data;
 }
 
-function sanitizeOmittedReason(root: string, error: unknown): string {
-  if (isMissingError(error)) return 'Run artifacts missing';
-  if (error instanceof z.ZodError) return 'Invalid run metadata';
-  const raw = error instanceof Error ? error.message : 'Could not export run';
-  if (raw.includes(root) || /(?:^|[\s'"])(?:\/|[A-Za-z]:\\)\S+/.test(raw)) {
-    return 'Run artifacts could not be exported';
+function classifyOmittedReason(error: unknown): OmittedRunReason {
+  if (isMissingError(error)) return 'missing_run_file';
+  if (error instanceof z.ZodError) return 'invalid_run_metadata';
+  if (error instanceof SyntaxError) {
+    return error.stack?.includes('readJson') ? 'invalid_run_metadata' : 'invalid_event_log';
   }
-  return raw.slice(0, 200);
+  if (error instanceof Error) {
+    if (error.message === 'Run ID mismatch' || /^Invalid JSON:/i.test(error.message)) {
+      return 'invalid_run_metadata';
+    }
+    if (error.message === 'Invalid run event sequence' || /^Run .+ did not complete$/.test(error.message)) {
+      return 'invalid_event_log';
+    }
+  }
+  return 'export_failed';
 }
 
 const raceRequestSchema = z.strictObject({
@@ -112,6 +212,7 @@ export interface StartStudioOptions {
   pushDispatcher?: PushDispatcher;
   previewContest?: typeof defaultPreviewContest;
   ssePollMs?: number;
+  sseDrainTimeoutMs?: number;
 }
 
 export async function startStudio(root: string, port = 0, opts: StartStudioOptions = {}) {
@@ -121,6 +222,7 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
   const pushTargets = opts.pushTargets ?? new PushTargets();
   const pushDispatcher = opts.pushDispatcher ?? opts.queue?.pushDispatcher ?? new PushDispatcher(pushTargets);
   const ssePollMs = Math.max(50, Math.min(5_000, Math.floor(opts.ssePollMs ?? 750)));
+  const sseDrainTimeoutMs = Math.max(50, Math.min(60_000, Math.floor(opts.sseDrainTimeoutMs ?? DEFAULT_SSE_DRAIN_TIMEOUT_MS)));
   const plans = new Map<string, Plan>();
   const control = new AbortController();
   const sseResponses = new Set<ServerResponse>();
@@ -456,7 +558,7 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
         }
         const seenRunIds = new Set<string>();
         const results: Result[] = [];
-        const omitted_runs: Array<{ run_id: string; reason: string }> = [];
+        const omitted_runs: Array<{ run_id: string; reason: OmittedRunReason }> = [];
         for (const b of targetBatches) {
           for (const job of b.jobs) {
             if (job.status !== 'completed' || !job.run_id || seenRunIds.has(job.run_id)) continue;
@@ -466,7 +568,7 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
             } catch (error) {
               omitted_runs.push({
                 run_id: job.run_id,
-                reason: sanitizeOmittedReason(root, error),
+                reason: classifyOmittedReason(error),
               });
             }
           }
@@ -529,11 +631,13 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
           let timer: ReturnType<typeof setInterval> | undefined;
           let lastSent = '';
           let polling = false;
+          let sseWriter!: ReturnType<typeof createSseWriter>;
 
           const cleanup = () => {
             if (closed) return;
             closed = true;
             if (timer) clearInterval(timer);
+            sseWriter?.close();
             sseResponses.delete(res);
             req.off('close', cleanup);
             res.off('close', cleanup);
@@ -543,16 +647,10 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
             if (!res.writableEnded && !res.destroyed) res.end();
           };
 
-          const safeWrite = (chunk: string) => {
-            if (closed || res.destroyed || res.writableEnded) return false;
-            try {
-              res.write(chunk);
-              return true;
-            } catch {
-              cleanup();
-              return false;
-            }
-          };
+          sseWriter = createSseWriter(res, {
+            drainTimeoutMs: sseDrainTimeoutMs,
+            onClose: cleanup,
+          });
 
           req.once('close', cleanup);
           res.once('close', cleanup);
@@ -566,8 +664,7 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
               status,
               ...(reason ? { reason } : {}),
             });
-            safeWrite(`event: status\ndata: ${payload}\n\n`);
-            cleanup();
+            sseWriter.write(`event: status\ndata: ${payload}\n\n`, true);
           };
 
           const tick = async () => {
@@ -578,24 +675,24 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
               if (closed || res.destroyed || res.writableEnded) return;
               const serialized = JSON.stringify(snapshot);
               const changed = serialized !== lastSent;
+              const isSnapshotTerminal = snapshot.status === 'completed' || snapshot.status === 'void';
               if (changed) {
                 lastSent = serialized;
-                if (!safeWrite(`event: progress\ndata: ${serialized}\n\n`)) return;
+                if (!sseWriter.write(`event: progress\ndata: ${serialized}\n\n`, isSnapshotTerminal)) return;
               }
-              if (snapshot.status === 'completed' || snapshot.status === 'void') {
-                cleanup();
+              if (isSnapshotTerminal) {
+                if (!changed) sseWriter.finishWhenFlushed();
                 return;
               }
-              // Non-terminal progress snapshot: verify the queue job has not already terminated
-              // (e.g. cancelled or interrupted externally).
+              // Non-terminal progress snapshot: verify the queue job still exists and has not terminated.
               const current = await lookupRun(root, runId).catch(() => undefined);
               if (closed || res.destroyed || res.writableEnded) return;
-              if (current && TERMINAL_JOB_STATUSES.has(current.job.status)) {
-                emitTerminalStatus(current.job.status, current.job.reason);
+              if (!current || TERMINAL_JOB_STATUSES.has(current.job.status)) {
+                emitTerminalStatus(current?.job.status ?? 'void', current?.job.reason);
                 return;
               }
               if (!changed) {
-                safeWrite(': ping\n\n');
+                sseWriter.write(': ping\n\n');
               }
             } catch {
               if (closed || res.destroyed || res.writableEnded) return;
@@ -606,7 +703,7 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
                 emitTerminalStatus(current?.job.status ?? 'void', current?.job.reason);
                 return;
               }
-              safeWrite(': ping\n\n');
+              sseWriter.write(': ping\n\n');
             } finally {
               polling = false;
             }

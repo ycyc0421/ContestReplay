@@ -7,11 +7,13 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { loadContest, loadInputs, resolveContest, resolveOjAccountPolicy } from '../dist/config.js';
 import { Connections } from '../dist/connections.js';
-import { JudgeInfrastructureError, OjAccountPool, OjAccounts } from '../dist/judges/index.js';
+import { createCodeforcesJudge, JudgeInfrastructureError, OjAccountPool, OjAccounts } from '../dist/judges/index.js';
 import { match } from '../dist/match.js';
 import { makePlan, planSchema, verifyPlan } from '../dist/plan.js';
 import { PushDispatcher, PushTargets } from '../dist/push.js';
-import { dispatch, enqueue, getBatch, requestBatchStop, requestRunCancel } from '../dist/queue.js';
+import { dispatch, enqueue, getBatch, listBatches, MAX_BATCH_BYTES, requestBatchStop, requestRunCancel } from '../dist/queue.js';
+import { exportRun } from '../dist/results.js';
+import { runBench } from '../dist/run.js';
 
 const FAKE_IMAGE = 'sha256:' + 'a'.repeat(64);
 const getImage = async () => FAKE_IMAGE;
@@ -918,4 +920,278 @@ test('parallel dispatch regressions: sibling drain before flock release, default
   assert.equal(hugeHook.body.total, 1001);
   assert.equal(hugeHook.body.completed, 1001);
   assert.equal(hugeHook.body.jobs, undefined, 'Oversized >1000-job batch.completed must omit jobs array');
+});
+
+test('final polish regressions: 5000-job batch persistence & oversized rejection, aborted sibling interrupted status, CF language canonicalization & pre-network check, account_id+handle & drift check, legacy Accepted normalization', async t => {
+  const dir = await makeTempDir('cr-final-polish-');
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const runsRoot = join(dir, 'runs');
+  const contestFile = join(dir, 'local-contest.json');
+  const answersFile = join(dir, 'local.judge.json');
+  await writeFile(answersFile, JSON.stringify({
+    schema_version: 1,
+    problems: [{ id: '1', max_points: 10, accepted_answers: ['42'] }],
+  }));
+  await writeFile(contestFile, JSON.stringify({
+    schema_version: 2,
+    contest_id: 'polish-local',
+    data_version: 1,
+    title: 'Polish Local',
+    source: { name: 'Fixture' },
+    materials: { entrypoint: { kind: 'pdf', path: DEMO_PDF } },
+    problems: [{ id: '1', max_points: 10 }],
+    judge: { kind: 'local', answers: { path: answersFile } },
+  }));
+
+  // 1. 5,000-job batch serialization stays under MAX_BATCH_BYTES and readable by listBatches
+  const singlePlan = await makePlan(
+    { schema_version: 1, agents: [DEMO_AGENT], contests: [contestFile] },
+    dir,
+    getImage,
+  );
+  const templateJob = singlePlan.jobs[0];
+  const jobs5000 = Array.from({ length: 5000 }, (_, i) => ({
+    ...templateJob,
+    contest_path: join(dir, `batch-contest-${i}.json`),
+    contest_id: `batch-contest-${i}`,
+  }));
+  const plan5000 = planSchema.parse({
+    schema_version: 2,
+    protocol_sha256: singlePlan.protocol_sha256,
+    jobs: jobs5000,
+  });
+  const batch5000 = await enqueue(runsRoot, plan5000, { concurrency: 4 });
+  const batchFileBytes = (await readFile(join(runsRoot, '.batches', `${batch5000.id}.json`))).length;
+  assert.ok(batchFileBytes < MAX_BATCH_BYTES, '5000-job batch must stay under MAX_BATCH_BYTES');
+  const listed = await listBatches(runsRoot);
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].jobs.length, 5000);
+
+  // Oversized batch rejected BEFORE writing to .batches/
+  const hugeId = 'x'.repeat(14_000);
+  const oversizedPlan = planSchema.parse({
+    schema_version: 2,
+    protocol_sha256: singlePlan.protocol_sha256,
+    jobs: Array.from({ length: 5000 }, (_, i) => ({
+      ...templateJob,
+      agent_id: hugeId,
+      contest_path: join(dir, `huge-contest-${i}.json`),
+      contest_id: `huge-${i}`,
+    })),
+  });
+  await assert.rejects(enqueue(runsRoot, oversizedPlan), /maximum persisted size/i);
+  assert.equal((await listBatches(runsRoot)).length, 1, 'Rejected oversized batch must not leave a file in .batches/');
+
+  // 2. Fatal sibling worker abort persists 'interrupted' (NOT 'void')
+  const plan2 = await makePlan(
+    { schema_version: 2, cells: [{ agent: DEMO_AGENT, contest: contestFile, repeats: 2 }] },
+    dir,
+    getImage,
+  );
+  const siblingRuns = join(dir, 'sibling-runs');
+  const batchSibling = await enqueue(siblingRuns, plan2, { concurrency: 2 });
+  let startCount = 0;
+  await assert.rejects(
+    dispatch(siblingRuns, batchSibling.id, new AbortController().signal, {
+      concurrency: 2,
+      preflight: async () => {},
+      onJobStart: () => {
+        if (++startCount === 2) throw new Error('Fatal sibling crash');
+      },
+      execute: async (_plan, _job, opts) => {
+        await new Promise(resolveWait => {
+          if (opts.signal.aborted) return resolveWait();
+          opts.signal.addEventListener('abort', () => resolveWait(), { once: true });
+        });
+        return { runId: opts.runId, directory: join(opts.out, opts.runId), status: 'void', reason: 'interrupted' };
+      },
+    }),
+    /Fatal sibling crash/,
+  );
+  const afterSiblingCrash = await getBatch(siblingRuns, batchSibling.id);
+  const abortedSibling = afterSiblingCrash.jobs[0];
+  assert.equal(abortedSibling.status, 'interrupted', 'Aborted sibling worker must persist interrupted, not void');
+  assert.equal(abortedSibling.reason, 'executor_stopped');
+
+  // 3. Codeforces language canonicalization ("089" == "89" == 89) & non-numeric rejection (config + adapter pre-network)
+  const cfPath = join(dir, 'cf-lang.json');
+  const cfNum = await resolveContest(
+    baseContestDoc({ kind: 'codeforces', contest_id: 1900, handle: 'cf_bot', languages: { cpp20: 89 } }),
+    cfPath,
+  );
+  const cfStr = await resolveContest(
+    baseContestDoc({ kind: 'codeforces', contest_id: 1900, handle: 'cf_bot', languages: { cpp20: '89' } }),
+    cfPath,
+  );
+  const cfLeadingZero = await resolveContest(
+    baseContestDoc({ kind: 'codeforces', contest_id: 1900, handle: 'cf_bot', languages: { cpp20: '089' } }),
+    cfPath,
+  );
+  assert.equal(cfNum.contestRevision, cfStr.contestRevision);
+  assert.equal(cfNum.contestRevision, cfLeadingZero.contestRevision);
+  assert.equal(cfLeadingZero.contest.judge.languages.cpp20, '89');
+
+  await assert.rejects(
+    resolveContest(
+      baseContestDoc({ kind: 'codeforces', contest_id: 1900, handle: 'cf_bot', languages: { cpp20: 'C++20' } }),
+      cfPath,
+    ),
+    /Invalid config/,
+  );
+  await assert.rejects(
+    resolveContest(
+      baseContestDoc({ kind: 'codeforces', contest_id: 1900, handle: 'cf_bot', languages: { cpp20: '0' } }),
+      cfPath,
+    ),
+    /Invalid config/,
+  );
+
+  let networkCalled = false;
+  const cfAdapter = createCodeforcesJudge(
+    { contest_id: 1900, handle: 'cf_bot', languages: { cpp20: 'C++20' } },
+    {
+      cookie: 'JSESSIONID=test-cookie',
+      fetchImpl: async () => {
+        networkCalled = true;
+        throw new Error('should not be called');
+      },
+    },
+  );
+  await assert.rejects(
+    cfAdapter.submit('A', 'cpp20', 'int main(){}', AbortSignal.timeout(2000)),
+    /Invalid Codeforces programTypeId/i,
+  );
+  assert.equal(networkCalled, false, 'Invalid programTypeId must fail BEFORE network I/O');
+
+  // 4. account_id + mismatched handle rejected; matching handle accepted; post-acquire drift rejected & lease released
+  const ojStore = new OjAccounts(join(dir, 'oj-accounts'));
+  await ojStore.create({
+    id: 'cf-acc-1',
+    label: 'CF One',
+    platform: 'codeforces',
+    handle: 'Real_Handle',
+    pool: 'default',
+    transport: 'cookie',
+    secret: 'JSESSIONID=secret-val-12345',
+  });
+  await assert.rejects(
+    resolveOjAccountPolicy(
+      { kind: 'codeforces', contest_id: 1900, account_id: 'cf-acc-1', handle: 'different_handle', languages: { cpp20: '89' } },
+      ojStore,
+    ),
+    /handle.*does not match/i,
+  );
+  const okPolicy = await resolveOjAccountPolicy(
+    { kind: 'codeforces', contest_id: 1900, account_id: 'cf-acc-1', handle: 'real_handle', languages: { cpp20: '89' } },
+    ojStore,
+  );
+  assert.equal(okPolicy.matchedAccounts[0].id, 'cf-acc-1');
+
+  // Post-acquire drift in runBench: mock pool returns an account whose handle drifted while waiting
+  const cfContestFile = join(dir, 'cf-drift-contest.json');
+  await writeFile(
+    cfContestFile,
+    JSON.stringify(
+      baseContestDoc({
+        kind: 'codeforces',
+        contest_id: 1900,
+        account_id: 'cf-acc-1',
+        handle: 'Real_Handle',
+        languages: { cpp20: '89' },
+      }),
+    ),
+  );
+  const driftInputs = await loadInputs(cfContestFile, DEMO_AGENT);
+  let leaseReleased = false;
+  const driftedPool = {
+    async acquire() {
+      return {
+        account: {
+          id: 'cf-acc-1',
+          label: 'CF One',
+          platform: 'codeforces',
+          handle: 'Drifted_Handle',
+          pool: 'default',
+          transport: 'cookie',
+          ready: true,
+        },
+        release() {
+          leaseReleased = true;
+        },
+      };
+    },
+  };
+  const driftResult = await runBench(driftInputs, {
+    out: join(dir, 'drift-runs'),
+    image: FAKE_IMAGE,
+    key: 'test-model-key',
+    signal: new AbortController().signal,
+    ojAccounts: ojStore,
+    ojPool: driftedPool,
+  });
+  assert.equal(leaseReleased, true, 'Drifted OJ lease must be released immediately');
+  assert.equal(driftResult.status, 'void');
+  assert.equal(driftResult.reason, 'oj_account_drifted');
+
+  // 5. Legacy ProgramJudge emitting 'Accepted' normalizes verdict -> 'accepted' + raw_verdict: 'Accepted' and counts as solved in exportRun
+  const legacyContestFile = join(dir, 'legacy-verdict-contest.json');
+  await writeFile(
+    legacyContestFile,
+    JSON.stringify(
+      baseContestDoc(
+        { kind: 'qoj', contest_id: 42, languages: { cpp20: 'C++20' }, problem_map: { P1: '7001' } },
+        { problems: [{ id: 'P1', max_points: 50 }] },
+      ),
+    ),
+  );
+  const legacyInputs = await loadInputs(legacyContestFile, DEMO_AGENT);
+  const legacyEvents = [];
+  const legacyAcJudge = {
+    async submit() { return 'legacy-ac-1'; },
+    async verdicts(ids) { return new Map(ids.map(id => [id, 'Accepted'])); },
+  };
+  const mAc = match(legacyInputs, e => legacyEvents.push(e), legacyAcJudge, undefined, 10);
+  try {
+    mAc.submit({ problem_id: 'P1', language: 'cpp20', source: 'int main(){}' });
+    await mAc.settle(AbortSignal.timeout(2000));
+    assert.equal(mAc.score(), 50);
+    assert.equal(mAc.status('s1').verdict, 'accepted');
+    const judged = legacyEvents.find(e => e.type === 'submission_judged');
+    assert.ok(judged);
+    assert.equal(judged.verdict, 'accepted');
+    assert.equal(judged.raw_verdict, 'Accepted');
+
+    // Verify exportRun counts this normalized event as solved
+    const exportRoot = join(dir, 'export-legacy');
+    const expRunId = randomUUID();
+    const expDir = join(exportRoot, expRunId);
+    await mkdir(expDir, { recursive: true });
+    await writeFile(join(expDir, 'run.json'), JSON.stringify({
+      schema_version: 1,
+      run_id: expRunId,
+      contest_id: legacyInputs.contest.contest_id,
+      data_version: 1,
+      contest_revision: legacyInputs.contestRevision,
+      input_sha256: { contest: legacyInputs.contestDigest },
+      problems: legacyInputs.contest.problems,
+      protocol_id: 'codex-pdf-pages-mcp',
+      protocol_version: 2,
+      protocol_sha256: 'd'.repeat(64),
+      agent_id: legacyInputs.agent.agent_id,
+      agent_revision: 'e'.repeat(64),
+      harness: legacyInputs.agent.harness,
+      model: { model: legacyInputs.profile.model },
+    }));
+    const fullEvents = [
+      { schema_version: 1, seq: 1, elapsed_ms: 0, type: 'run_started', started_at: new Date().toISOString() },
+      ...legacyEvents.map((ev, idx) => ({ schema_version: 1, seq: idx + 2, elapsed_ms: (idx + 1) * 100, ...ev })),
+      { schema_version: 1, seq: legacyEvents.length + 2, elapsed_ms: 1000, type: 'run_ended', status: 'completed', reason: 'finish', score: 50, max_score: 50 },
+    ];
+    await writeFile(join(expDir, 'events.jsonl'), fullEvents.map(e => JSON.stringify(e)).join('\n') + '\n');
+    const exported = await exportRun(exportRoot, expRunId);
+    assert.equal(exported.score, 50);
+    assert.equal(exported.submissions[0].verdict, 'accepted');
+  } finally {
+    await mAc.dispose();
+  }
 });

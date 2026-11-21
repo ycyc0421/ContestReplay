@@ -12,6 +12,8 @@ import { readRunProgress } from './progress.js';
 import type { PushDispatcher } from './push.js';
 
 const idSchema = z.uuid();
+export const MAX_BATCH_BYTES = 64 * 1024 * 1024;
+const PER_QUEUED_JOB_TERMINAL_HEADROOM = 256;
 export const concurrencySchema = z.number().int().min(1).max(8);
 const jobSchema = z.strictObject({
   status: z.enum(['queued', 'running', 'completed', 'void', 'cancelled', 'interrupted']),
@@ -51,16 +53,26 @@ async function exists(path: string) {
   try { await access(path); return true; }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
 }
+function serializeBatchChecked(batch: Batch): string {
+  const payload = JSON.stringify(batch, null, 2) + '\n';
+  const queuedJobs = batch.jobs.filter(j => j.status === 'queued').length;
+  const worstCaseBytes = Buffer.byteLength(payload, 'utf8') + queuedJobs * PER_QUEUED_JOB_TERMINAL_HEADROOM;
+  if (worstCaseBytes > MAX_BATCH_BYTES) {
+    throw new Error(`Batch exceeds maximum persisted size (${MAX_BATCH_BYTES} bytes)`);
+  }
+  return payload;
+}
 async function persist(root: string, batch: Batch) {
+  const payload = serializeBatchChecked(batch);
   const target = batchFile(root, batch.id);
   const tmp = `${target}.${randomUUID()}.tmp`;
   try {
-    await writeFile(tmp, JSON.stringify(batch, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+    await writeFile(tmp, payload, { flag: 'wx', mode: 0o600 });
     await rename(tmp, target);
   } finally { await rm(tmp, { force: true }); }
 }
 export async function getBatch(root: string, batchId: string) {
-  const batch = batchSchema.parse(await readJson(batchFile(root, batchId)));
+  const batch = batchSchema.parse(await readJson(batchFile(root, batchId), MAX_BATCH_BYTES));
   if (batch.id !== batchId) throw new Error('Batch ID does not match its file');
   if (await exists(batchStop(root, batchId))) {
     for (const job of batch.jobs) if (job.status === 'queued') {
@@ -132,6 +144,8 @@ export async function enqueue(root: string, plan: Plan, opts: { concurrency?: nu
     plan: planSchema.parse(plan),
     jobs: plan.jobs.map(() => ({ status: 'queued' })),
   };
+  // Validate worst-case serialized size BEFORE touching .batches/ so unreadable batches can never be published.
+  serializeBatchChecked(batch);
   await mkdir(batchesDir(root), { recursive: true, mode: 0o700 });
   await persist(root, batch);
   return batch;
@@ -353,7 +367,7 @@ export async function dispatch(root: string, batchId: string, signal: AbortSigna
             if (await stopped()) {
               nextStatus = 'cancelled';
               nextReason = 'cancelled';
-            } else if (signal.aborted) {
+            } else if (signal.aborted || workerAbort.signal.aborted) {
               nextStatus = 'interrupted';
               nextReason = 'executor_stopped';
             }

@@ -22,6 +22,13 @@ export const legacyContestSchema = z.strictObject({ schema_version: z.literal(1)
 const legacyContest = legacyContestSchema;
 export const localBackend = z.strictObject({ kind: z.literal('local'), answers: artifact });
 const remoteLanguageId = z.string().trim().min(1).max(64);
+const codeforcesLanguageId = z.union([
+  version,
+  z.string().trim().regex(/^[0-9]+$/).refine(value => {
+    const num = Number(value);
+    return Number.isSafeInteger(num) && num >= 1;
+  }, 'Codeforces language ID must be a positive safe integer'),
+]).transform(value => String(Number(value)));
 const remoteProblemTarget = z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9._:/-]+$/);
 const settlementMsSchema = z.number().int().min(1000).max(1_800_000);
 const remoteContestRef = z.union([version, z.string().trim().min(1).max(128)]);
@@ -33,7 +40,7 @@ export const codeforcesBackend = z.strictObject({
   account_id: ojAccountId.optional(),
   pool: ojPoolName.optional(),
   base_url: endpoint.optional(),
-  languages: z.record(id, z.union([version, remoteLanguageId])),
+  languages: z.record(id, codeforcesLanguageId),
   problem_map: z.record(id, z.string().regex(/^[A-Za-z0-9]{1,12}$/)).optional(),
   points_known: z.boolean().optional(),
   settlement_ms: settlementMsSchema.optional(),
@@ -193,8 +200,8 @@ export function selectMatchingOjAccounts(
   return candidates.filter(acc => {
     if (acc.platform !== judge.kind || !acc.ready) return false;
     if (effectiveOriginFor(acc) !== targetOrigin) return false;
-    if (judge.account_id) return acc.id === judge.account_id;
-    if (judge.pool && acc.pool !== judge.pool) return false;
+    if (judge.account_id && acc.id !== judge.account_id) return false;
+    if (!judge.account_id && judge.pool && acc.pool !== judge.pool) return false;
     if (judge.handle && acc.handle.toLowerCase() !== judge.handle.toLowerCase()) return false;
     return true;
   });
@@ -224,6 +231,9 @@ export async function resolveOjAccountPolicy(
     const bound = effectiveOriginFor(acc);
     if (bound !== targetOrigin) {
       throw new Error(`OJ account ${judge.account_id} origin (${bound ?? 'none'}) does not match ${targetOrigin}`);
+    }
+    if (judge.handle && acc.handle.toLowerCase() !== judge.handle.toLowerCase()) {
+      throw new Error(`OJ account ${judge.account_id} handle (${acc.handle}) does not match ${judge.handle}`);
     }
     if (!acc.ready) {
       throw new Error(`OJ account ${judge.account_id} is not ready (credential or submitter unavailable)`);
@@ -302,6 +312,19 @@ export function validated<T>(schema: z.ZodType<T>, value: unknown, path: string)
   if (result.success) return result.data;
   throw new Error(`Invalid config: ${path}: ${result.error.issues.map(i => `${i.path.join('.') || '(root)'} (${i.code})`).join(', ')}`);
 }
+export type ContestArtifactReader = (
+  baseDir: string,
+  binding: z.infer<typeof artifact>,
+  limit: number,
+  role: 'entrypoint' | 'attachment' | 'answers',
+) => Promise<{ path: string; bytes: Buffer; hash: string }>;
+
+export type AgentExternalFileReader = (
+  refPath: string,
+  expectedSha256: string | undefined,
+  limit: number,
+) => Promise<Buffer>;
+
 async function readArtifact(base: string, binding: z.infer<typeof artifact>, limit: number) {
   const path = resolve(base, binding.path);
   const bytes = await file(path, limit);
@@ -309,14 +332,18 @@ async function readArtifact(base: string, binding: z.infer<typeof artifact>, lim
   if (binding.sha256 && binding.sha256 !== hash) throw new Error(`SHA-256 mismatch: ${path}`);
   return { path, bytes, hash };
 }
-export async function resolveContest(raw: unknown, contestPath: string) {
+export async function resolveContest(
+  raw: unknown,
+  contestPath: string,
+  artifactReader: ContestArtifactReader = (baseDir, binding, limit) => readArtifact(baseDir, binding, limit),
+) {
   const old = legacyContest.safeParse(raw);
   const v = old.success ? validated(contestSchema, { schema_version: 2, contest_id: old.data.contest_id, data_version: old.data.data_version,
     title: old.data.title, source: old.data.source, materials: { entrypoint: { kind: 'pdf', ...old.data.statement } },
     judge: { kind: 'local', answers: old.data.judge } }, contestPath) : validated(contestSchema, raw, contestPath);
   const base = dirname(contestPath);
   const preset = protocolPresets[resolveProtocolPreset(v.rules)];
-  const paper = await readArtifact(base, v.materials.entrypoint, Math.max(40_000_000, preset.pdfMaxBytes));
+  const paper = await artifactReader(base, v.materials.entrypoint, Math.max(40_000_000, preset.pdfMaxBytes), 'entrypoint');
   if (!paper.bytes.subarray(0, 5).equals(Buffer.from('%PDF-'))) throw new Error(`Missing PDF header: ${paper.path}`);
   v.materials.entrypoint.sha256 = paper.hash;
   const attachments = [];
@@ -325,7 +352,7 @@ export async function resolveContest(raw: unknown, contestPath: string) {
   for (const attachment of v.materials.attachments) {
     if (names.has(attachment.name)) throw new Error('Duplicate attachment name');
     names.add(attachment.name);
-    const material = await readArtifact(base, attachment, 16_000_000);
+    const material = await artifactReader(base, attachment, 16_000_000, 'attachment');
     attachmentBytes += material.bytes.length;
     if (attachmentBytes > 32_000_000) throw new Error('Attachments exceed 32 MB');
     attachment.sha256 = material.hash;
@@ -334,7 +361,7 @@ export async function resolveContest(raw: unknown, contestPath: string) {
   let localJudge: z.infer<typeof judgeSchema> | undefined;
   let judgePath: string | undefined;
   if (v.judge.kind === 'local') {
-    const answerFile = await readArtifact(base, v.judge.answers, 4_000_000);
+    const answerFile = await artifactReader(base, v.judge.answers, 4_000_000, 'answers');
     judgePath = answerFile.path;
     v.judge.answers.sha256 = answerFile.hash;
     localJudge = validated(judgeSchema, json(answerFile.bytes, answerFile.path), answerFile.path);
@@ -392,8 +419,16 @@ export async function loadContest(contestFile: string) {
   return resolveContest(json(await file(contestPath, 1_000_000), contestPath), contestPath);
 }
 export function agentToml(raw: unknown) { return serializeDocument(validated(agentSchema, raw, 'Agent'), 'toml'); }
-export async function resolveAgentManifest(raw: unknown, agentPath: string, store: Connections) {
+export async function resolveAgentManifest(
+  raw: unknown,
+  agentPath: string,
+  store: Connections,
+  readExternal?: AgentExternalFileReader,
+) {
   return resolveManifest(raw, store, async (ref, digest) => {
+    if (readExternal) {
+      return (await readExternal(ref, digest, 64_000)).toString('utf8');
+    }
     const data = await readArtifact(dirname(agentPath), { path: ref, sha256: digest, redistribution: 'unknown' }, 64_000);
     return data.bytes.toString('utf8');
   });
@@ -417,10 +452,14 @@ export function agentDigests(profile: AgentProfile, native?: NativeOverride, nat
     })),
   };
 }
-export async function loadAgent(agentFile: string, store = new Connections()) {
-  const agentPath = resolve(agentFile);
-  const bytes = await file(agentPath, 1_000_000);
-  let raw = parseDocumentText(bytes.toString('utf8'), documentFormat(agentPath));
+export async function resolveLoadedAgent(
+  parsed: unknown,
+  bytes: Buffer,
+  agentPath: string,
+  store = new Connections(),
+  readExternal?: AgentExternalFileReader,
+) {
+  let raw = parsed;
   let native: NativeOverride | undefined;
   let nativeText: string | undefined;
   let env: HarnessEnv | undefined;
@@ -429,14 +468,16 @@ export async function loadAgent(agentFile: string, store = new Connections()) {
   let profile: AgentProfile;
   if (raw && typeof raw === 'object' && 'kind' in raw) {
     if (raw.kind !== agentKind) throw new Error('Unsupported Agent manifest kind');
-    const resolved = await resolveAgentManifest(raw, agentPath, store);
+    const resolved = await resolveAgentManifest(raw, agentPath, store, readExternal);
     ({ profile, native, nativeText, env } = resolved);
     vendor = resolved.manifest.vendor;
     connection = manifestProvider(resolved.manifest);
   } else {
     if (raw && typeof raw === 'object' && ('schema_version' in raw || 'agent_id' in raw)) {
       const legacy = validated(legacyAgent, raw, agentPath);
-      const contents = await file(resolve(dirname(agentPath), legacy.config), 64_000);
+      const contents = readExternal
+        ? await readExternal(legacy.config, undefined, 64_000)
+        : await file(resolve(dirname(agentPath), legacy.config), 64_000);
       const parsedLegacy = Object(parseDocumentText(contents.toString('utf8'), 'toml')) as Record<string, unknown>;
       const { name: _displayName, ...nativeCore } = parsedLegacy;
       nativeText = canonical(nativeCore);
@@ -450,6 +491,12 @@ export async function loadAgent(agentFile: string, store = new Connections()) {
     profile, native, env, vendor, connection,
     agentName: profile.name, speedTier: profile.speed_tier ?? 'standard',
   };
+}
+export async function loadAgent(agentFile: string, store = new Connections()) {
+  const agentPath = resolve(agentFile);
+  const bytes = await file(agentPath, 1_000_000);
+  const raw = parseDocumentText(bytes.toString('utf8'), documentFormat(agentPath));
+  return resolveLoadedAgent(raw, bytes, agentPath, store);
 }
 export async function loadInputs(contestFile: string, agentFile: string, store?: Connections) {
   return { ...await loadContest(contestFile), ...await loadAgent(agentFile, store) };

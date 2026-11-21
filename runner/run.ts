@@ -12,7 +12,7 @@ import type { ResponseInput } from 'openai/resources/responses/responses.js';
 import { z } from 'zod';
 import { createContest, createMcp, finishArgs, statusArgs, submitArgs, type EventSink } from './contest.js';
 import { protocol, protocolDigestForPreset, protocolForPreset, resolveProtocolPreset, resolveScoringMode } from './protocol.js';
-import { agentRevision, resolveOjAccountPolicy, type Inputs } from './config.js';
+import { agentRevision, resolveOjAccountPolicy, selectMatchingOjAccounts, type Inputs } from './config.js';
 import { launch, renderPdf, resources, SandboxCleanupError } from './docker.js';
 import { match, type AnyProgramJudge } from './match.js';
 import { createProgramJudge, OjAccountPool, OjAccounts, type OjAccountLease, type ProgramJudge as UnifiedProgramJudge } from './judges/index.js';
@@ -180,6 +180,17 @@ export async function runBench(inputs: Inputs, opts: {
     agent_revision: agentRevision(inputs, opts.image, effectiveProtocolDigest),
     agent_digests: { source_sha256: inputs.agentDigest, profile_sha256: inputs.profileDigest, native_sha256: inputs.nativeDigest, effective_sha256: inputs.effectiveDigest },
     harness: inputs.agent.harness, runner_version: '0.2.0', adapter_version: '0.2.0', judge_kind: inputs.contest.judge.kind,
+    ...(inputs.contest.judge.kind !== 'local'
+      ? {
+          judge_selector: {
+            kind: inputs.contest.judge.kind,
+            ...(inputs.contest.judge.account_id ? { account_id: inputs.contest.judge.account_id } : {}),
+            ...(inputs.contest.judge.pool ? { pool: inputs.contest.judge.pool } : {}),
+            ...(inputs.contest.judge.handle ? { handle: inputs.contest.judge.handle } : {}),
+            ...(inputs.contest.judge.base_url ? { base_url: inputs.contest.judge.base_url } : {}),
+          },
+        }
+      : {}),
     sandbox: { runtime: 'docker', image: opts.image, resources: sandboxResources },
     model: {
       model: inputs.profile.model, api: inputs.profile.api, base_url: inputs.profile.base_url,
@@ -265,11 +276,24 @@ export async function runBench(inputs: Inputs, opts: {
         let pool = opts.ojPool;
         if (policy.mode === 'account_pool') {
           pool ??= new OjAccountPool(accounts);
-          ojLease = await pool.acquire(
+          const lease = await pool.acquire(
             backend.kind,
             { accountIds: policy.matchedAccounts.map(acc => acc.id) },
             opts.signal,
           );
+          if (selectMatchingOjAccounts(backend, [lease.account], policy.targetOrigin).length !== 1) {
+            lease.release();
+            throw new RunFailure('oj_account_drifted');
+          }
+          ojLease = lease;
+          runMeta.oj_account_id = lease.account.id;
+          const tmpMeta = `${runJsonPath}.${randomUUID()}.tmp`;
+          try {
+            await writeFile(tmpMeta, credentialJson(runMeta, opts.key, 2) + '\n', { mode: 0o600, flag: 'wx' });
+            await rename(tmpMeta, runJsonPath);
+          } catch {
+            await rm(tmpMeta, { force: true }).catch(() => {});
+          }
         }
         ownedJudge = createProgramJudge(backend, {
           accounts,
