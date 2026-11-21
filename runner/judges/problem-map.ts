@@ -175,6 +175,12 @@ export function inferProblemMap(
     const remoteAlphaList = remainingRemotes2.map(r => normalizeLabel(r.remote_id));
     const allRemotesAlpha = remoteAlphaList.every(n => /^[A-Z]$/.test(n));
 
+    // Check for duplicate normalized local keys (e.g. "P1" and "Task 1") regardless of input order
+    const localNumCounts = new Map<number, number>();
+    if (allLocalsNumeric) {
+      for (const n of parsedLocalNums) localNumCounts.set(n, (localNumCounts.get(n) ?? 0) + 1);
+    }
+
     if (allLocalsNumeric && allRemotesAlpha && isPlausibleOrdinalNumbers(parsedLocalNums)) {
       const remoteAlphaMap = new Map<string, RemoteProblemDescriptor[]>();
       for (const r of remainingRemotes2) {
@@ -184,11 +190,15 @@ export function inferProblemMap(
         remoteAlphaMap.set(norm, list);
       }
       const sameLength = remainingLocals2.length === remainingRemotes2.length;
-      // Only map if all local numbers map to unique remote letters
       const planned: Array<{ local: string; remote: RemoteProblemDescriptor }> = [];
       let allMatched = true;
       for (let i = 0; i < remainingLocals2.length; i++) {
-        const letter = alphaFromIndex(parsedLocalNums[i]!);
+        const num = parsedLocalNums[i]!;
+        if ((localNumCounts.get(num) ?? 0) > 1) {
+          allMatched = false;
+          continue;
+        }
+        const letter = alphaFromIndex(num);
         const candidates = letter ? remoteAlphaMap.get(letter) : undefined;
         if (candidates?.length === 1) {
           planned.push({ local: remainingLocals2[i]!, remote: candidates[0]! });
@@ -215,6 +225,12 @@ export function inferProblemMap(
     const parsedRemoteNums = remainingRemotes3.map(r => parsePositiveInt(normalizeLabel(r.remote_id)));
     const allRemotesNumeric = parsedRemoteNums.every((n): n is number => n !== undefined);
 
+    // Detect duplicate normalized local letters (e.g. "Problem A" & "Task A") so neither enters confirmed_map
+    const localAlphaCounts = new Map<number, number>();
+    if (allLocalsAlpha) {
+      for (const idx of parsedLocalAlphas) localAlphaCounts.set(idx, (localAlphaCounts.get(idx) ?? 0) + 1);
+    }
+
     // Prevent mis-pairing ['A','B','C'] against arbitrary numeric IDs like ['3','100','101']!
     if (allLocalsAlpha && allRemotesNumeric && isPlausibleOrdinalNumbers(parsedRemoteNums)) {
       const remoteNumMap = new Map<number, RemoteProblemDescriptor[]>();
@@ -229,6 +245,10 @@ export function inferProblemMap(
       let allMatched = true;
       for (let i = 0; i < remainingLocals3.length; i++) {
         const idx = parsedLocalAlphas[i]!;
+        if ((localAlphaCounts.get(idx) ?? 0) > 1) {
+          allMatched = false;
+          continue;
+        }
         const candidates = remoteNumMap.get(idx);
         if (candidates?.length === 1) {
           planned.push({ local: remainingLocals3[i]!, remote: candidates[0]! });

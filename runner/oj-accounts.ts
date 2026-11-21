@@ -156,6 +156,8 @@ export type OjAccount = z.infer<typeof ojAccountResponseSchema>;
 export interface ExpectedAccountBinding {
   platform: OjPlatform;
   origin: string;
+  handle?: string;
+  credential_ref?: string;
 }
 
 export interface ResolvedAccountTransport {
@@ -208,6 +210,18 @@ function assertAccountBinding(value: StoredOjAccount, expected: ExpectedAccountB
   if (!boundOrigin || boundOrigin !== expectedOrigin) {
     throw new OjAccountError(
       `OJ account ${value.id} is bound to a different origin; refusing to release credential`,
+      409,
+    );
+  }
+  if (expected.handle !== undefined && value.handle.toLowerCase() !== expected.handle.toLowerCase()) {
+    throw new OjAccountError(
+      `OJ account ${value.id} handle changed since lease acquisition; refusing to release credential`,
+      409,
+    );
+  }
+  if (expected.credential_ref !== undefined && value.credential_ref !== expected.credential_ref) {
+    throw new OjAccountError(
+      `OJ account ${value.id} credential reference changed since lease acquisition; refusing to release credential`,
       409,
     );
   }

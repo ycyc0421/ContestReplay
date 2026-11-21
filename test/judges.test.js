@@ -22,6 +22,8 @@ import {
   listJudgeBackends,
   mapHydroStatus,
   normalizeVerdict,
+  parseCfMySubmissionsHtml,
+  parseQojSubmissionListPage,
   parseQojSubmissionPage,
   parseUpstreamProblemRef,
   previewCodeforcesContest,
@@ -66,7 +68,7 @@ test('normalizeVerdict handles standard, partial, pending, and infrastructure ve
   assert.equal(normalizeVerdict('COMPILATION_ERROR'), 'compilation_error');
   assert.equal(normalizeVerdict('PRESENTATION_ERROR'), 'presentation_error');
   assert.equal(normalizeVerdict('IDLENESS_LIMIT_EXCEEDED'), 'idleness_limit_exceeded');
-  // Infrastructure failures MUST map to judge_error (even with positive score)
+  // Infrastructure failures and unrecognized statuses MUST map to judge_error (even with 100/100!)
   assert.equal(normalizeVerdict('FAILED'), 'judge_error');
   assert.equal(normalizeVerdict('FAILED', 50, 100), 'judge_error');
   assert.equal(normalizeVerdict('INPUT_PREPARATION_CRASHED'), 'judge_error');
@@ -74,6 +76,8 @@ test('normalizeVerdict handles standard, partial, pending, and infrastructure ve
   assert.equal(normalizeVerdict('Judgement Failed'), 'judge_error');
   assert.equal(normalizeVerdict('Judgment Failed'), 'judge_error');
   assert.equal(normalizeVerdict('Remote OJ Unavailable'), 'judge_error');
+  assert.equal(normalizeVerdict('UNRECOGNIZED_STATUS', 100, 100), 'judge_error');
+  assert.equal(normalizeVerdict('MYSTERY_VERDICT'), 'judge_error');
 });
 
 test('inferProblemMap preserves bare Q, avoids non-ordinal mis-pairing, and separates confirmed vs suggested maps', () => {
@@ -104,10 +108,16 @@ test('inferProblemMap preserves bare Q, avoids non-ordinal mis-pairing, and sepa
   assert.deepEqual(nonOrdinal.suggested_map, { A: '3', B: '100', C: '101' });
   assert.ok(nonOrdinal.matches.every(m => m.strategy === 'positional' && m.confidence === 'low'));
 
-  // 4. Normalized collision stays unmapped (strict 1-to-1)
+  // 4. Normalized collision stays unmapped in BOTH Pass 1b AND Pass 2/3 (strict 1-to-1, order-independent)
   const collision = inferProblemMap(['Problem A', 'Task A'], [{ remote_id: 'A' }]);
   assert.deepEqual(collision.confirmed_map, {});
   assert.deepEqual(collision.unmapped_local, ['Problem A', 'Task A']);
+
+  const alphaNumCollision = inferProblemMap(['Problem A', 'Task A'], [{ remote_id: '1' }, { remote_id: '2' }]);
+  assert.deepEqual(alphaNumCollision.confirmed_map, {});
+
+  const numAlphaCollision = inferProblemMap(['P1', 'Task 1'], [{ remote_id: 'A' }, { remote_id: 'B' }]);
+  assert.deepEqual(numAlphaCollision.confirmed_map, {});
 
   // 5. Mismatched lengths leave unmapped entries
   const mismatch = inferProblemMap(['A', 'B', 'C'], [{ remote_id: '7810' }, { remote_id: '7811' }]);
@@ -217,6 +227,40 @@ test('Cross-origin binding and env-cookie guard block unauthorized origins with 
   );
   await assert.rejects(
     badEnvHydro.submit('P1', 'cpp20', 'int main(){}', AbortSignal.timeout(5000)),
+    err => err instanceof JudgeInfrastructureError && err.code === 'auth_expired',
+  );
+  assert.equal(fetchCalls, 0);
+
+  // 4. Reverse bidirectional check: CR_QOJ_BASE_URL set to mirror -> official https://qoj.ac MUST be rejected (0 requests!)
+  const prevQojCookie = process.env.CR_QOJ_COOKIE;
+  const prevQojBase = process.env.CR_QOJ_BASE_URL;
+  process.env.CR_QOJ_COOKIE = 'UOJSESSID=mirror-only-cookie';
+  process.env.CR_QOJ_BASE_URL = 'https://mirror.qoj.example';
+  t.after(() => {
+    if (prevQojCookie === undefined) delete process.env.CR_QOJ_COOKIE;
+    else process.env.CR_QOJ_COOKIE = prevQojCookie;
+    if (prevQojBase === undefined) delete process.env.CR_QOJ_BASE_URL;
+    else process.env.CR_QOJ_BASE_URL = prevQojBase;
+  });
+  const reverseQoj = createQojJudge(
+    { handle: 'qoj_user', languages: { cpp20: 'C++20' } },
+    { fetchImpl: countingFetch },
+  );
+  await assert.rejects(
+    reverseQoj.submit('100', 'cpp20', 'int main(){}', AbortSignal.timeout(5000)),
+    err => err instanceof JudgeInfrastructureError && err.code === 'auth_expired',
+  );
+  assert.equal(fetchCalls, 0);
+
+  // 5. Stale pool lease whose handle was modified in OjAccounts fails closed with 0 requests
+  const leaseAcc = await store.get('cf-official');
+  await store.patch('cf-official', { handle: 'different_handle' });
+  const staleLeaseJudge = createCodeforcesJudge(
+    { contest_id: 1, languages: { cpp20: 89 } },
+    { accounts: store, account: leaseAcc, fetchImpl: countingFetch },
+  );
+  await assert.rejects(
+    staleLeaseJudge.submit('A', 'cpp20', 'int main(){}', AbortSignal.timeout(5000)),
     err => err instanceof JudgeInfrastructureError && err.code === 'auth_expired',
   );
   assert.equal(fetchCalls, 0);
@@ -862,6 +906,257 @@ test('Hydro uses real /p/<pid>/submit route, handles >100 partial scores, status
   await assert.rejects(
     practiceJudge.verdicts(['rec-no-user'], new Map([['rec-no-user', 'A']]), AbortSignal.timeout(5000)),
     err => err instanceof JudgeInfrastructureError && err.code === 'identity_mismatch',
+  );
+});
+
+test('Final review regression suite: QOJ maintenance page & bare score, CF Gym auth precheck & strict /my parsing, strict problems/contestId/docId checks, and post-POST stream drops', async t => {
+  // 1. QOJ HTTP 200 maintenance page MUST NOT be treated as empty submission list; bare score keeps max_score undefined; login page -> auth_expired
+  assert.equal(parseQojSubmissionListPage('<html><body>Site under maintenance</body></html>').recognized, false);
+  assert.equal(
+    parseQojSubmissionListPage('<table><thead><tr><th>ID</th><th>Problem</th><th>Submitter</th><th>Result</th></tr></thead><tbody></tbody></table>').recognized,
+    true,
+  );
+  const bareScoreHtml = `
+    <table><tr>
+      <td><a href="/submission/6001">#6001</a></td>
+      <td><a href="/problem/7801">Task</a></td>
+      <td><a href="/user/profile/qoj_tester">qoj_tester</a></td>
+      <td><a class="uoj-score">65</a></td>
+    </tr></table>
+  `;
+  const bareRow = parseQojSubmissionPage('6001', bareScoreHtml);
+  assert.equal(bareRow?.score, 65);
+  assert.equal(bareRow?.max_score, undefined);
+
+  const qojMaintJudge = createQojJudge(
+    { handle: 'qoj_tester', languages: { cpp20: 'C++20' }, problem_map: { A: '7801' } },
+    {
+      cookie: 'UOJSESSID=abc',
+      fetchImpl: async (input, init) => {
+        const url = new URL(String(input));
+        if (url.pathname === '/problem/7801' && (!init?.method || init.method === 'GET')) {
+          return htmlResponse('<form><input type="hidden" name="_token" value="t"><textarea name="answer_answer_editor"></textarea></form>');
+        }
+        if (url.pathname === '/submissions') {
+          return htmlResponse('<html><body>Maintenance in progress</body></html>', 200);
+        }
+        if (url.pathname === '/problem/7801' && init?.method === 'POST') {
+          return redirectResponse('/submissions');
+        }
+        if (url.pathname === '/submission/9001') {
+          return htmlResponse('<form action="/login"><input name="username"></form>', 200);
+        }
+        throw new Error(url.href);
+      },
+    },
+  );
+  // Baseline was HTTP 200 maintenance page -> baselineKnown=false -> redirect to /submissions MUST fail submission_unconfirmed!
+  await assert.rejects(
+    qojMaintJudge.submit('A', 'cpp20', 'int main(){}', AbortSignal.timeout(5000)),
+    err => err instanceof JudgeInfrastructureError && err.code === 'submission_unconfirmed',
+  );
+  // Polling a login page MUST return auth_expired (NOT identity_mismatch)
+  await assert.rejects(
+    qojMaintJudge.verdicts(['9001'], new Map([['9001', 'A']]), AbortSignal.timeout(5000)),
+    err => err instanceof JudgeInfrastructureError && err.code === 'auth_expired',
+  );
+  // Missing problem mapping in verdicts() MUST fail closed with identity_mismatch
+  await assert.rejects(
+    qojMaintJudge.verdicts(['9001'], new Map(), AbortSignal.timeout(5000)),
+    err => err instanceof JudgeInfrastructureError && err.code === 'identity_mismatch',
+  );
+
+  // 2. CF Gym authenticated /gym/<id> preview fallback + strict parseCfMySubmissionsHtml (no fabricated defaults) + subpath profile check
+  const subpathFormHtml = `
+    <a href="/cf/profile/cf_sub">cf_sub</a>
+    <form action="?csrf_token=subtok">
+      <input type="hidden" name="csrf_token" value="subtok">
+      <select name="submittedProblemIndex"></select>
+      <textarea name="source"></textarea>
+    </form>
+  `;
+  assert.equal(
+    cfFormForContest(subpathFormHtml, 42, 'cf_sub', { origin: 'https://mirror.example/cf' }).fields.get('csrf_token'),
+    'subtok',
+  );
+  // Off-origin spoofed profile link must be rejected
+  assert.throws(
+    () =>
+      cfFormForContest(
+        subpathFormHtml.replace('/cf/profile/cf_sub', 'https://evil.example/cf/profile/cf_sub'),
+        42,
+        'cf_sub',
+        { origin: 'https://mirror.example/cf' },
+      ),
+    err => err instanceof JudgeInfrastructureError && err.code === 'auth_expired',
+  );
+
+  const gymPreview = await previewCodeforcesContest(104567, {
+    gym: true,
+    cookie: 'JSESSIONID=gym-auth',
+    fetchImpl: async input => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/contest.standings') return jsonResponse({ status: 'FAILED' }, 403);
+      if (url.pathname === '/gym/104567') {
+        return htmlResponse(`
+          <html><head><title>Private Gym - Codeforces</title></head><body>
+            <a href="/gym/104567/problem/A">Alpha</a>
+            <a href="https://evil.example/gym/104567/problem/Z">Spoofed</a>
+          </body></html>
+        `);
+      }
+      throw new Error(url.href);
+    },
+  });
+  assert.equal(gymPreview.title, 'Private Gym');
+  assert.deepEqual(
+    gymPreview.problems.map(p => p.remote_id),
+    ['A'],
+  );
+
+  // parseCfMySubmissionsHtml MUST reject rows missing author, timestamp, or explicit PRACTICE marker
+  const myHtml = `
+    <table>
+      <tr data-submission-id="1001">
+        <td>1001</td>
+        <td class="status-small"><span class="format-time">Nov/21/2026 19:30</span></td>
+        <td class="status-party-cell">* <a href="/profile/cf_tester">cf_tester</a></td>
+        <td><a href="/gym/104567/problem/A">A</a></td>
+        <td>C++20</td>
+        <td class="status-verdict-cell"><span submissionverdict="OK">Accepted</span></td>
+      </tr>
+      <tr data-submission-id="1002">
+        <td>1002</td>
+        <td class="status-small">not-a-date</td>
+        <td class="status-party-cell">* <a href="/profile/cf_tester">cf_tester</a></td>
+        <td><a href="/gym/104567/problem/A">A</a></td>
+        <td>C++20</td>
+        <td class="status-verdict-cell"><span submissionverdict="OK">Accepted</span></td>
+      </tr>
+      <tr data-submission-id="1003">
+        <td>1003</td>
+        <td class="status-small"><span class="format-time">Nov/21/2026 19:31</span></td>
+        <td class="status-party-cell"><a href="/profile/cf_tester">cf_tester</a> #</td>
+        <td><a href="/gym/104567/problem/A">A</a></td>
+        <td>C++20</td>
+        <td class="status-verdict-cell"><span submissionverdict="OK">Accepted</span></td>
+      </tr>
+      <tr data-submission-id="1004">
+        <td>1004</td>
+        <td class="status-small"><span class="format-time">Nov/21/2026 19:32</span></td>
+        <td class="status-party-cell">no-profile-link</td>
+        <td><a href="/gym/104567/problem/A">A</a></td>
+        <td>C++20</td>
+        <td class="status-verdict-cell"><span submissionverdict="OK">Accepted</span></td>
+      </tr>
+    </table>
+  `;
+  const parsedMy = parseCfMySubmissionsHtml(myHtml, 104567);
+  assert.deepEqual(
+    parsedMy.map(r => ({ id: r.id, type: r.author.participantType })),
+    [
+      { id: 1001, type: 'PRACTICE' },
+      { id: 1003, type: 'VIRTUAL' },
+    ],
+  );
+
+  // 3. VJudge contest mode missing contestId & missing problems entry MUST fail closed; post-POST stream error -> submission_unconfirmed
+  const vjContest = createVjudgeJudge(
+    { contest_id: 567890, handle: 'vj_bot', languages: { cpp20: 'C++20' }, problem_map: { A: 'A' } },
+    {
+      cookie: 'JSESSIONID=vj',
+      fetchImpl: async input => {
+        const url = new URL(String(input));
+        if (url.pathname === '/contest/submit') {
+          return {
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            body: null,
+            text: async () => {
+              throw new Error('RAW_STREAM_SECRET_MARKER');
+            },
+          };
+        }
+        if (url.pathname === '/solution/data/555') {
+          // Missing contestId in contest mode!
+          return jsonResponse({ runId: 555, status: 'Accepted', processing: false, author: 'vj_bot', contestNum: 'A' });
+        }
+        throw new Error(url.href);
+      },
+    },
+  );
+  await assert.rejects(
+    vjContest.submit('A', 'cpp20', 'int main(){}', AbortSignal.timeout(5000)),
+    err => {
+      assert.ok(err instanceof JudgeInfrastructureError);
+      assert.equal(err.code, 'submission_unconfirmed');
+      assert.ok(!err.message.includes('RAW_STREAM_SECRET_MARKER'));
+      return true;
+    },
+  );
+  await assert.rejects(
+    vjContest.verdicts(['555'], new Map([['555', 'A']]), AbortSignal.timeout(5000)),
+    err => err instanceof JudgeInfrastructureError && err.code === 'identity_mismatch',
+  );
+  await assert.rejects(
+    vjContest.verdicts(['555'], new Map(), AbortSignal.timeout(5000)),
+    err => err instanceof JudgeInfrastructureError && err.code === 'identity_mismatch',
+  );
+
+  // 4. Hydro rdoc.pid contradicting pdoc.docId & missing problems entry MUST fail closed
+  const hydroStrict = createHydroJudge(
+    { base_url: 'http://127.0.0.1:8888', handle: 'hydro_bot', languages: { cpp20: 'cc.cc20o2' }, problem_map: { A: 'P1001' } },
+    {
+      cookie: 'sid=a; sid.sig=b',
+      fetchImpl: async () =>
+        jsonResponse({
+          rdoc: { _id: 'rec-contradict', status: HYDRO_STATUS.ACCEPTED, score: 100, pid: 999 },
+          pdoc: { docId: 42, pid: 'P1001' },
+          udoc: { uname: 'hydro_bot' },
+        }),
+    },
+  );
+  await assert.rejects(
+    hydroStrict.verdicts(['rec-contradict'], new Map([['rec-contradict', 'A']]), AbortSignal.timeout(5000)),
+    err => err instanceof JudgeInfrastructureError && err.code === 'identity_mismatch',
+  );
+  await assert.rejects(
+    hydroStrict.verdicts(['rec-contradict'], new Map(), AbortSignal.timeout(5000)),
+    err => err instanceof JudgeInfrastructureError && err.code === 'identity_mismatch',
+  );
+
+  // 5. runExternalSubmitter abort path scrubs child stderr/stdout
+  const dir = await mkdtemp(join(tmpdir(), 'cr-abort-exec-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const slowExec = join(dir, 'slow.mjs');
+  await writeFile(slowExec, '#!/usr/bin/env node\nprocess.stderr.write("SENSITIVE_ABORT_STDERR");\nsetTimeout(()=>{}, 10000);\n', {
+    mode: 0o755,
+  });
+  await chmod(slowExec, 0o755);
+  const ac = new AbortController();
+  const abortJudge = createCodeforcesJudge(
+    { contest_id: 1, handle: 'h', languages: { cpp20: 89 } },
+    {
+      executable: slowExec,
+      skipContestCheck: true,
+      execImpl: async (_file, _args, opts) => {
+        ac.abort();
+        const err = new Error('Command killed: SENSITIVE_ABORT_STDERR');
+        err.stderr = 'SENSITIVE_ABORT_STDERR';
+        if (opts.signal?.aborted) throw err;
+        return { stdout: '{}', stderr: '' };
+      },
+    },
+  );
+  await assert.rejects(
+    abortJudge.submit('A', 'cpp20', 'int main(){}', ac.signal),
+    err => {
+      assert.equal(err.name, 'AbortError');
+      assert.ok(!err.message.includes('SENSITIVE_ABORT_STDERR'));
+      assert.equal(err.stderr, undefined);
+      return true;
+    },
   );
 });
 

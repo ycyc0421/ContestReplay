@@ -21,6 +21,7 @@ import {
   resolveBaseUrl,
   runExternalSubmitter,
   safeResponseJson,
+  serializeAccountSubmission,
   serializeCookieHeader,
   walkHtml,
 } from './types.js';
@@ -125,12 +126,23 @@ export function cfFormForContest(
   const expectedPath = `${basePath}/${routePrefix(gym)}/${contest}/submit`;
   const submitPageUrl = `${origin}${expectedPath}`;
   const nodes = parseHtmlNodes(markup);
-  const profile = nodes.some(
-    el =>
-      el.tagName === 'a' &&
-      htmlAttr(el, 'href')?.toLowerCase() === `/profile/${handle.toLowerCase()}` &&
-      htmlText(el).trim().toLowerCase() === handle.toLowerCase(),
-  );
+  const expectedProfilePath = `${basePath}/profile/${handle.toLowerCase()}`;
+  const profile = nodes.some(el => {
+    if (el.tagName !== 'a') return false;
+    const rawHref = htmlAttr(el, 'href');
+    if (!rawHref) return false;
+    let resolved: URL;
+    try {
+      resolved = new URL(rawHref, submitPageUrl);
+    } catch {
+      return false;
+    }
+    return (
+      resolved.origin === origin &&
+      resolved.pathname.toLowerCase() === expectedProfilePath &&
+      htmlText(el).trim().toLowerCase() === handle.toLowerCase()
+    );
+  });
   const form = nodes.find(
     el =>
       el.tagName === 'form' &&
@@ -191,11 +203,36 @@ export function cfReceiptForContest(
   return Number.isSafeInteger(value) && value > 0 ? String(value) : undefined;
 }
 
+function parseCfTimestampSeconds(raw: string): number | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  // Support numeric epoch seconds, ISO-8601, or CF "Nov/21/2026 19:30" / "2026-11-21 19:30:00"
+  if (/^\d{9,11}$/.test(trimmed)) return Number(trimmed);
+  const cfDate = trimmed.match(/^([A-Za-z]{3})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (cfDate) {
+    const parsed = Date.parse(`${cfDate[1]} ${cfDate[2]}, ${cfDate[3]} ${cfDate[4]}:${cfDate[5]}:${cfDate[6] ?? '00'} UTC`);
+    return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : undefined;
+  }
+  const iso = Date.parse(trimmed);
+  return Number.isFinite(iso) ? Math.floor(iso / 1000) : undefined;
+}
+
 /**
  * Parse authenticated `/gym/<id>/my` HTML status table into CfStatusRow records
  * as a fallback when Codeforces API `contest.status` is restricted for a Gym.
+ * Fail closed: NEVER fabricate author handle, participantType, or timestamp!
+ * Rows missing explicit author, explicit PRACTICE status, problem index, or timestamp are skipped.
  */
-export function parseCfMySubmissionsHtml(markup: string, contest: number, handle: string): CfStatusRow[] {
+export function parseCfMySubmissionsHtml(
+  markup: string,
+  contest: number,
+  opts?: { baseUrl?: string },
+): CfStatusRow[] {
+  const { baseUrl, origin } = resolveBaseUrl(opts?.baseUrl ?? CODEFORCES_DEFAULT_ORIGIN, 'codeforces');
+  const basePath = new URL(baseUrl).pathname.replace(/\/+$/, '');
+  const escapedBase = basePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pageUrl = `${baseUrl}/gym/${contest}/my`;
+
   const nodes = parseHtmlNodes(markup);
   const rows: CfStatusRow[] = [];
   for (const tr of nodes) {
@@ -208,26 +245,60 @@ export function parseCfMySubmissionsHtml(markup: string, contest: number, handle
     if (tds.length < 6) continue;
 
     let problemIndex: string | undefined;
-    let authorHandle: string | undefined;
+    const authorHandles: string[] = [];
+    let participantType: string | undefined;
+    let creationTimeSeconds: number | undefined;
     let verdictText = '';
     let timeMs: number | undefined;
     let memBytes: number | undefined;
 
-    for (const td of tds) {
+    for (let colIdx = 0; colIdx < tds.length; colIdx++) {
+      const td = tds[colIdx]!;
+      const cls = htmlAttr(td, 'class') ?? '';
+      const txt = htmlText(td).replace(/\s+/g, ' ').trim();
       const tdNodes = walkHtml(td);
+
+      // Parse explicit timestamp from time cell (column 1 or status-small / format-time)
+      if (creationTimeSeconds === undefined && (colIdx === 1 || cls.includes('status-small'))) {
+        const formatTimeNode = tdNodes.find(n => (htmlAttr(n, 'class') ?? '').includes('format-time'));
+        const tsText = formatTimeNode ? htmlText(formatTimeNode) : txt;
+        const parsedTs = parseCfTimestampSeconds(tsText);
+        if (parsedTs !== undefined) creationTimeSeconds = parsedTs;
+      }
+
+      // Parse explicit author & participantType from party cell (column 2 or status-party-cell)
+      if (colIdx === 2 || cls.includes('status-party-cell')) {
+        const explicitAttr = htmlAttr(td, 'data-participant-type');
+        if (explicitAttr) {
+          participantType = explicitAttr.toUpperCase();
+        } else if (/\bvirtual\b/i.test(txt) || /\bcontestant\b/i.test(txt) || /#\s*$/.test(txt)) {
+          participantType = 'VIRTUAL';
+        } else if (/\bpractice\b/i.test(txt) || /^\s*\*/.test(txt) || /\*\s*$/.test(txt)) {
+          // CF renders practice authors with explicit "Practice" label or leading/trailing '*' indicator
+          participantType = 'PRACTICE';
+        }
+      }
+
       for (const n of tdNodes) {
         if (n.tagName === 'a') {
-          const href = htmlAttr(n, 'href') ?? '';
-          const pMatch = href.match(new RegExp(`/(?:gym|contest)/${contest}/problem/([A-Za-z0-9]+)`));
+          const rawHref = htmlAttr(n, 'href');
+          if (!rawHref) continue;
+          let resolved: URL;
+          try {
+            resolved = new URL(rawHref, pageUrl);
+          } catch {
+            continue;
+          }
+          if (resolved.origin !== origin) continue;
+          const pMatch = resolved.pathname.match(new RegExp(`^${escapedBase}/gym/${contest}/problem/([A-Za-z0-9]+)/?$`));
           if (pMatch?.[1] && !problemIndex) problemIndex = pMatch[1];
-          const uMatch = href.match(/^\/profile\/([^/?#]+)$/);
-          if (uMatch?.[1] && !authorHandle) authorHandle = decodeURIComponent(uMatch[1]);
+          const uMatch = resolved.pathname.match(new RegExp(`^${escapedBase}/profile/([^/?#]+)/?$`));
+          if (uMatch?.[1]) authorHandles.push(decodeURIComponent(uMatch[1]));
         }
         const verdictAttr = htmlAttr(n, 'submissionverdict');
         if (verdictAttr) verdictText = verdictAttr;
       }
-      const cls = htmlAttr(td, 'class') ?? '';
-      const txt = htmlText(td).replace(/\s+/g, ' ').trim();
+
       if (cls.includes('status-verdict-cell') && !verdictText) verdictText = txt;
       if (cls.includes('time-consumed-cell')) {
         const m = txt.match(/(\d+)\s*ms/i);
@@ -239,17 +310,20 @@ export function parseCfMySubmissionsHtml(markup: string, contest: number, handle
       }
     }
 
-    if (!problemIndex) continue;
-    const effectiveHandle = authorHandle ?? handle;
+    // Fail closed: require explicit problemIndex, single explicit author handle, explicit participantType, and timestamp!
+    if (!problemIndex || authorHandles.length !== 1 || !participantType || creationTimeSeconds === undefined) {
+      continue;
+    }
+
     rows.push({
       id: subId,
       contestId: contest,
       problem: { index: problemIndex, contestId: contest },
       author: {
-        participantType: 'PRACTICE',
-        members: [{ handle: effectiveHandle }],
+        participantType,
+        members: [{ handle: authorHandles[0]! }],
       },
-      creationTimeSeconds: Math.floor(Date.now() / 1000),
+      creationTimeSeconds,
       ...(verdictText ? { verdict: verdictText } : {}),
       ...(timeMs !== undefined ? { timeConsumedMillis: timeMs } : {}),
       ...(memBytes !== undefined ? { memoryConsumedBytes: memBytes } : {}),
@@ -279,9 +353,89 @@ async function cfApiRequest(
   return safeResponseJson(response, 'codeforces', `API ${method}`);
 }
 
+async function previewGymPageHtml(
+  numericId: number,
+  opts: { baseUrl: string; origin: string; cookie: string; fetchImpl: FetchLike; signal?: AbortSignal },
+): Promise<ContestPreview> {
+  const session = parseCookieHeader(opts.cookie, 'codeforces');
+  const gymUrl = `${opts.baseUrl}/gym/${numericId}`;
+  const basePath = new URL(opts.baseUrl).pathname.replace(/\/+$/, '');
+  const escapedBase = basePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const signal = AbortSignal.any([AbortSignal.timeout(15_000), ...(opts.signal ? [opts.signal] : [])]);
+  let resp: Response;
+  try {
+    resp = await opts.fetchImpl(gymUrl, {
+      headers: { cookie: serializeCookieHeader(session) },
+      redirect: 'manual',
+      signal,
+    });
+  } catch (err) {
+    if (opts.signal?.aborted) throw err;
+    throw new JudgeInfrastructureError('upstream_unavailable', 'Codeforces Gym page fetch failed', {
+      platform: 'codeforces',
+    });
+  }
+  if (resp.status >= 300 && resp.status < 400) {
+    await resp.body?.cancel();
+    throw new JudgeInfrastructureError('auth_expired', 'Codeforces redirected Gym page request (sign-in required)', {
+      platform: 'codeforces',
+      status: resp.status,
+    });
+  }
+  if (!resp.ok) {
+    await resp.body?.cancel();
+    throw classifyHttpError(resp.status, 'gym page');
+  }
+  const html = await resp.text();
+  if (detectCaptchaChallenge(html)) {
+    throw new JudgeInfrastructureError('captcha_required', 'Codeforces Gym page returned captcha challenge', {
+      platform: 'codeforces',
+    });
+  }
+  const nodes = parseHtmlNodes(html);
+  const titleNode = nodes.find(n => n.tagName === 'title');
+  const title = (titleNode ? htmlText(titleNode) : `Codeforces Gym ${numericId}`)
+    .replace(/\s*-\s*Codeforces.*$/i, '')
+    .trim();
+
+  const problems: Array<{ remote_id: string; title?: string }> = [];
+  const seen = new Set<string>();
+  for (const n of nodes) {
+    if (n.tagName !== 'a') continue;
+    const rawHref = htmlAttr(n, 'href');
+    if (!rawHref) continue;
+    let resolved: URL;
+    try {
+      resolved = new URL(rawHref, gymUrl);
+    } catch {
+      continue;
+    }
+    if (resolved.origin !== opts.origin) continue;
+    const m = resolved.pathname.match(new RegExp(`^${escapedBase}/gym/${numericId}/problem/([A-Za-z0-9]+)/?$`));
+    if (m?.[1] && !seen.has(m[1])) {
+      seen.add(m[1]);
+      const t = htmlText(n).replace(/\s+/g, ' ').trim();
+      problems.push({ remote_id: m[1], ...(t && t !== m[1] ? { title: t } : {}) });
+    }
+  }
+  if (!problems.length) {
+    throw new JudgeInfrastructureError('upstream_unavailable', 'Codeforces Gym page did not expose problem list', {
+      platform: 'codeforces',
+    });
+  }
+  return {
+    platform: 'codeforces',
+    contest_ref: `gym:${numericId}`,
+    title: title || `Codeforces Gym ${numericId}`,
+    status: 'finished',
+    problems,
+    suggested_languages: CODEFORCES_LANGUAGE_PRESETS,
+  };
+}
+
 export async function previewCodeforcesContest(
   contestId: number | string,
-  opts?: { gym?: boolean; baseUrl?: string; fetchImpl?: FetchLike; signal?: AbortSignal },
+  opts?: { gym?: boolean; baseUrl?: string; cookie?: string; fetchImpl?: FetchLike; signal?: AbortSignal },
 ): Promise<ContestPreview> {
   const numericId = typeof contestId === 'number' ? contestId : Number(String(contestId).replace(/^gym:/i, ''));
   if (!Number.isSafeInteger(numericId) || numericId <= 0) {
@@ -290,15 +444,36 @@ export async function previewCodeforcesContest(
     });
   }
   const gym = opts?.gym ?? (typeof contestId === 'string' && /^gym:/i.test(contestId));
-  const { baseUrl } = resolveBaseUrl(opts?.baseUrl ?? CODEFORCES_DEFAULT_ORIGIN, 'codeforces');
+  const { baseUrl, origin } = resolveBaseUrl(opts?.baseUrl ?? CODEFORCES_DEFAULT_ORIGIN, 'codeforces');
   const fetchImpl = opts?.fetchImpl ?? fetch;
 
-  // Regular contests do not pass extra from/count params (matching runner/codeforces.ts).
-  const params: Record<string, string> = gym
-    ? { contestId: String(numericId), showUnofficial: 'false' }
-    : { contestId: String(numericId) };
+  // Use minimal official parameter (contestId only) for contest.standings.
+  let raw: unknown;
+  try {
+    raw = await cfApiRequest('contest.standings', { contestId: String(numericId) }, {
+      baseUrl,
+      fetchImpl,
+      signal: opts?.signal,
+    });
+  } catch (err) {
+    // Private/restricted Gym contests may fail public contest.standings; fall back to authenticated /gym/<id> HTML page.
+    if (
+      gym &&
+      opts?.cookie &&
+      err instanceof JudgeInfrastructureError &&
+      (err.code === 'auth_expired' || err.details?.status === 400)
+    ) {
+      return previewGymPageHtml(numericId, {
+        baseUrl,
+        origin,
+        cookie: opts.cookie,
+        fetchImpl,
+        signal: opts?.signal,
+      });
+    }
+    throw err;
+  }
 
-  const raw = await cfApiRequest('contest.standings', params, { baseUrl, fetchImpl, signal: opts?.signal });
   const parsed = cfStandingsResponseSchema.safeParse(raw);
   if (!parsed.success) {
     throw new JudgeInfrastructureError('upstream_unavailable', 'Unexpected Codeforces contest.standings payload', {
@@ -380,7 +555,7 @@ export function createCodeforcesJudge(
     });
   }
 
-  async function fetchGymMyHtml(handle: string, cookie: string, signal: AbortSignal): Promise<CfStatusRow[]> {
+  async function fetchGymMyHtml(cookie: string, signal: AbortSignal): Promise<CfStatusRow[]> {
     const session = parseCookieHeader(cookie, 'codeforces');
     const url = `${baseUrl}/gym/${config.contest_id}/my`;
     const resp = await fetchImpl(url, {
@@ -389,13 +564,17 @@ export function createCodeforcesJudge(
       signal,
     });
     if (resp.status >= 300 && resp.status < 400) {
+      await resp.body?.cancel();
       throw new JudgeInfrastructureError('auth_expired', 'Codeforces redirected /gym/my request (sign-in required)', {
         platform: 'codeforces',
         status: resp.status,
       });
     }
-    if (!resp.ok) throw classifyHttpError(resp.status, 'gym my submissions');
-    return parseCfMySubmissionsHtml(await resp.text(), config.contest_id, handle);
+    if (!resp.ok) {
+      await resp.body?.cancel();
+      throw classifyHttpError(resp.status, 'gym my submissions');
+    }
+    return parseCfMySubmissionsHtml(await resp.text(), config.contest_id, { baseUrl });
   }
 
   async function fetchSubmissions(
@@ -425,7 +604,7 @@ export function createCodeforcesJudge(
           err instanceof JudgeInfrastructureError &&
           (err.code === 'auth_expired' || err.details?.status === 400)
         ) {
-          return fetchGymMyHtml(handle, cookie, signal);
+          return fetchGymMyHtml(cookie, signal);
         }
         throw err;
       }
@@ -508,7 +687,19 @@ export function createCodeforcesJudge(
     }
 
     const location = uploaded.headers.get('location');
-    const redirect = location && uploaded.status >= 300 && uploaded.status < 400 ? new URL(location, submitUrl) : undefined;
+    let redirect: URL | undefined;
+    if (location && uploaded.status >= 300 && uploaded.status < 400) {
+      try {
+        redirect = new URL(location, submitUrl);
+      } catch {
+        await uploaded.body?.cancel();
+        throw new JudgeInfrastructureError(
+          'submission_unconfirmed',
+          'Codeforces returned an invalid redirect after submit POST; will not retry',
+          { platform: 'codeforces', status: uploaded.status },
+        );
+      }
+    }
     const directId = redirect ? cfReceiptForContest(redirect.href, config.contest_id, { gym, origin: baseUrl }) : undefined;
     if (directId) {
       await uploaded.body?.cancel();
@@ -517,8 +708,20 @@ export function createCodeforcesJudge(
 
     const expectedMyPath = `${basePath}/${prefix}/${config.contest_id}/my`;
     const listRedirect = redirect?.origin === origin && redirect.pathname === expectedMyPath;
-    const bodyText = uploaded.ok ? await uploaded.text() : '';
-    if (!uploaded.ok) await uploaded.body?.cancel();
+    let bodyText = '';
+    if (uploaded.ok) {
+      try {
+        bodyText = await uploaded.text();
+      } catch {
+        throw new JudgeInfrastructureError(
+          'submission_unconfirmed',
+          'Codeforces response stream interrupted after submit POST; will not retry',
+          { platform: 'codeforces', status: uploaded.status },
+        );
+      }
+    } else {
+      await uploaded.body?.cancel();
+    }
     if (bodyText && detectCaptchaChallenge(bodyText)) {
       throw new JudgeInfrastructureError('captcha_required', 'Codeforces challenged the submission with captcha', {
         platform: 'codeforces',
@@ -529,7 +732,17 @@ export function createCodeforcesJudge(
     if (listRedirect || confirmed) {
       for (let attempt = 0; attempt < 4; attempt++) {
         await delayImpl(2500, requestSignal);
-        const rows = await fetchSubmissions(handle, 30, requestSignal, serializeCookieHeader(session));
+        let rows: CfStatusRow[];
+        try {
+          rows = await fetchSubmissions(handle, 30, requestSignal, serializeCookieHeader(session));
+        } catch (err) {
+          if (signal.aborted) throw err;
+          throw new JudgeInfrastructureError(
+            'submission_unconfirmed',
+            'Failed to correlate Codeforces submission after POST; will not retry',
+            { platform: 'codeforces' },
+          );
+        }
         const candidates = exactPracticeCandidates(rows, {
           baseline,
           contest: config.contest_id,
@@ -584,6 +797,7 @@ export function createCodeforcesJudge(
           const checkPromise = previewCodeforcesContest(config.contest_id, {
             gym,
             baseUrl,
+            ...(transport.mode === 'cookie' ? { cookie: transport.cookie } : {}),
             fetchImpl,
             signal,
           }).then(preview => {
@@ -634,14 +848,18 @@ export function createCodeforcesJudge(
         return submitViaCookie(target, String(langId), source, transport.handle, transport.cookie!, signal);
       };
 
-      if (deps.pool) {
-        return deps.pool.enqueueSubmission(transport.queueKey, execute, signal);
-      }
-      return execute();
+      return serializeAccountSubmission(transport.queueKey, execute, signal, deps.pool);
     },
 
     async verdicts(ids, problems, signal) {
       if (!ids.length) return new Map();
+      for (const id of ids) {
+        if (!problems.has(id)) {
+          throw new JudgeInfrastructureError('identity_mismatch', `Missing expected problem mapping for submission ${id}`, {
+            platform: 'codeforces',
+          });
+        }
+      }
       const transport = await resolveTransport();
       const handle = transport.handle;
       const rows = await fetchSubmissions(handle, 1000, signal, transport.mode === 'cookie' ? transport.cookie : undefined);

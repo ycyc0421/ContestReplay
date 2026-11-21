@@ -18,6 +18,7 @@ import {
   resolveBaseUrl,
   runExternalSubmitter,
   safeResponseJson,
+  serializeAccountSubmission,
   serializeCookieHeader,
 } from './types.js';
 
@@ -119,7 +120,8 @@ export function mapHydroStatus(
     case HYDRO_STATUS.HACKED:
       return { verdict: 'wrong_answer', raw: 'HACKED' };
     case HYDRO_STATUS.IGNORED:
-      return { verdict: 'other', raw: 'IGNORED' };
+      // Unscored / ignored judge records must not silently settle as accepted/other.
+      return { verdict: 'judge_error', raw: 'IGNORED', infraError: true };
     default:
       return { verdict: 'judge_error', raw: `STATUS_${status}`, infraError: true };
   }
@@ -365,7 +367,16 @@ export function createHydroJudge(config: HydroJudgeConfig, deps: HydroJudgeDeps 
 
     const location = response.headers.get('location');
     if (location && response.status >= 300 && response.status < 400) {
-      const targetUrl = new URL(location, submitUrl);
+      let targetUrl: URL;
+      try {
+        targetUrl = new URL(location, submitUrl);
+      } catch {
+        await response.body?.cancel();
+        throw new JudgeInfrastructureError('submission_unconfirmed', 'Hydro returned invalid redirect after submit POST', {
+          platform: 'hydro',
+          status: response.status,
+        });
+      }
       if (targetUrl.origin === origin) {
         const ridMatch = targetUrl.pathname.match(/\/record\/([A-Za-z0-9_-]+)\/?$/);
         if (ridMatch?.[1]) {
@@ -374,7 +385,7 @@ export function createHydroJudge(config: HydroJudgeConfig, deps: HydroJudgeDeps 
         }
       }
       await response.body?.cancel();
-      throw new JudgeInfrastructureError('auth_expired', 'Unexpected Hydro submit redirect', {
+      throw new JudgeInfrastructureError('submission_unconfirmed', 'Unexpected Hydro submit redirect; will not retry', {
         platform: 'hydro',
         status: response.status,
       });
@@ -466,14 +477,18 @@ export function createHydroJudge(config: HydroJudgeConfig, deps: HydroJudgeDeps 
         return submitViaCookie(remoteProblemId, remoteLang, source, transport.cookie!, signal);
       };
 
-      if (deps.pool) {
-        return deps.pool.enqueueSubmission(transport.queueKey, execute, signal);
-      }
-      return execute();
+      return serializeAccountSubmission(transport.queueKey, execute, signal, deps.pool);
     },
 
     async verdicts(ids, problems, signal) {
       if (!ids.length) return new Map();
+      for (const id of ids) {
+        if (!problems.has(id)) {
+          throw new JudgeInfrastructureError('identity_mismatch', `Missing expected problem mapping for Hydro record ${id}`, {
+            platform: 'hydro',
+          });
+        }
+      }
       const transport = await resolveTransport();
       const headers: Record<string, string> = { accept: 'application/json' };
       if (transport.mode === 'cookie') {
@@ -539,24 +554,23 @@ export function createHydroJudge(config: HydroJudgeConfig, deps: HydroJudgeDeps 
           });
         }
 
-        const localProblem = problems.get(id);
-        if (localProblem) {
-          const expected = targetFor(localProblem);
-          const candidatePids = new Set<string>();
-          if (envelope.success && envelope.data.pdoc?.pid !== undefined) {
-            candidatePids.add(String(envelope.data.pdoc.pid));
-          }
-          if (envelope.success && envelope.data.pdoc?.docId !== undefined) {
-            candidatePids.add(String(envelope.data.pdoc.docId));
-          }
-          if (directRecord.pid !== undefined) {
-            candidatePids.add(String(directRecord.pid));
-          }
-          if (!candidatePids.size || !candidatePids.has(expected)) {
-            throw new JudgeInfrastructureError('identity_mismatch', `Hydro record ${id} missing or mismatched problem`, {
-              platform: 'hydro',
-            });
-          }
+        const localProblem = problems.get(id)!;
+        const expected = targetFor(localProblem);
+        const pdoc = envelope.success ? envelope.data.pdoc : undefined;
+        // First verify rdoc.pid (numeric docId) is consistent with pdoc.docId when both are present!
+        if (directRecord.pid !== undefined && pdoc?.docId !== undefined && String(directRecord.pid) !== String(pdoc.docId)) {
+          throw new JudgeInfrastructureError('identity_mismatch', `Hydro record ${id} rdoc.pid contradicts pdoc.docId`, {
+            platform: 'hydro',
+          });
+        }
+        const candidatePids = new Set<string>();
+        if (pdoc?.pid !== undefined) candidatePids.add(String(pdoc.pid));
+        if (pdoc?.docId !== undefined) candidatePids.add(String(pdoc.docId));
+        if (directRecord.pid !== undefined) candidatePids.add(String(directRecord.pid));
+        if (!candidatePids.size || !candidatePids.has(expected)) {
+          throw new JudgeInfrastructureError('identity_mismatch', `Hydro record ${id} missing or mismatched problem`, {
+            platform: 'hydro',
+          });
         }
 
         const score = directRecord.score;

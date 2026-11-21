@@ -7,6 +7,7 @@ import { parse } from 'parse5';
 import { z } from 'zod';
 import {
   OjAccountError,
+  OjAccountPool,
   type OjAccount,
   type OjAccounts,
   type OjPlatform,
@@ -238,14 +239,9 @@ export function normalizeVerdict(raw: string, score?: number, maxScore?: number)
     return isPartialScore ? 'partial' : 'runtime_error';
   }
 
-  if (score !== undefined && maxScore !== undefined && maxScore > 0) {
-    if (score >= maxScore) return 'accepted';
-    if (score > 0) return 'partial';
-  } else if (score !== undefined && score > 0) {
-    return 'partial';
-  }
-
-  return 'other';
+  // Any unrecognized status MUST NOT settle as 'accepted' (even with 100/100) or 'other';
+  // classify as 'judge_error' so callers fail closed as infrastructure error.
+  return 'judge_error';
 }
 
 export function isFinalVerdict(verdict: NormalizedVerdict): boolean {
@@ -436,7 +432,12 @@ export async function resolveAdapterTransport(input: {
       );
     }
     try {
-      const secret = await deps.accounts.resolveSecret(account.id, { platform, origin });
+      const secret = await deps.accounts.resolveSecret(account.id, {
+        platform,
+        origin,
+        handle: account.handle,
+        ...(account.credential_ref ? { credential_ref: account.credential_ref } : {}),
+      });
       return { mode: 'cookie', cookie: secret, handle, accountId: account.id, queueKey };
     } catch (err) {
       if (err instanceof OjAccountError) {
@@ -510,23 +511,25 @@ export async function resolveAdapterTransport(input: {
   const envCookie = process.env[`CR_${envPrefix}_COOKIE`]?.trim();
   if (envCookie) {
     const approvedEnvBase = process.env[`CR_${envPrefix}_BASE_URL`]?.trim();
-    const isDefaultOrigin = defaultOrigin !== undefined && origin === defaultOrigin;
-    if (!isDefaultOrigin) {
-      let approvedOrigin: string | undefined;
-      if (approvedEnvBase) {
-        try {
-          approvedOrigin = resolveBaseUrl(approvedEnvBase, platform).origin;
-        } catch {
-          approvedOrigin = undefined;
-        }
+    // Bidirectional single-origin binding:
+    // - If CR_<PLATFORM>_BASE_URL is set, ONLY that origin is approved (reject even the official default origin!).
+    // - Otherwise, only the platform's official default origin is approved (none for Hydro).
+    let approvedOrigin: string | undefined;
+    if (approvedEnvBase) {
+      try {
+        approvedOrigin = resolveBaseUrl(approvedEnvBase, platform).origin;
+      } catch {
+        approvedOrigin = undefined;
       }
-      if (!approvedOrigin || approvedOrigin !== origin) {
-        throw new JudgeInfrastructureError(
-          'auth_expired',
-          `Approve ${baseUrl} via CR_${envPrefix}_BASE_URL before sending CR_${envPrefix}_COOKIE to a non-default origin`,
-          { platform },
-        );
-      }
+    } else {
+      approvedOrigin = defaultOrigin;
+    }
+    if (!approvedOrigin || approvedOrigin !== origin) {
+      throw new JudgeInfrastructureError(
+        'auth_expired',
+        `Origin mismatch: CR_${envPrefix}_COOKIE is not approved for ${baseUrl}`,
+        { platform },
+      );
     }
     return { mode: 'cookie', cookie: envCookie, handle, queueKey };
   }
@@ -534,6 +537,19 @@ export async function resolveAdapterTransport(input: {
   throw new JudgeInfrastructureError('auth_expired', `No ${platform} OJ account, cookie, or submitter configured`, {
     platform,
   });
+}
+
+// Process-wide fallback serializer so correlation-based submissions never run concurrently
+// on the same (platform, origin, handle) even when callers do not pass an OjAccountPool.
+const processSubmissionSerializer = new OjAccountPool([]);
+
+export function serializeAccountSubmission<T>(
+  queueKey: string,
+  fn: (signal?: AbortSignal) => Promise<T>,
+  signal: AbortSignal,
+  pool?: OjAccountPool,
+): Promise<T> {
+  return (pool ?? processSubmissionSerializer).enqueueSubmission(queueKey, fn, signal);
 }
 
 const submitterOutputSchema = z.strictObject({
@@ -612,7 +628,12 @@ export async function runExternalSubmitter(input: {
     return result.data.submission_id;
   } catch (err) {
     if (err instanceof JudgeInfrastructureError) throw err;
-    if (input.signal.aborted) throw err;
+    if (input.signal.aborted) {
+      // Never rethrow the raw child_process error (which may contain child stdout/stderr).
+      const abortErr = new Error(`${input.platform} external submitter aborted`);
+      abortErr.name = 'AbortError';
+      throw abortErr;
+    }
     const rawErr = err as { code?: number | string | null; signal?: string | null };
     const exitCode = typeof rawErr?.code === 'number' ? rawErr.code : null;
     const sig = typeof rawErr?.signal === 'string' ? rawErr.signal : null;

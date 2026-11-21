@@ -21,6 +21,7 @@ import {
   resolveBaseUrl,
   runExternalSubmitter,
   safeParseJson,
+  serializeAccountSubmission,
   serializeCookieHeader,
   walkHtml,
 } from './types.js';
@@ -113,7 +114,8 @@ function parseScoreText(text: string): { score?: number; max_score?: number; exp
   }
   const bare = text.trim().match(/^(\d+(?:\.\d+)?)$/);
   if (bare?.[1]) {
-    return { score: Number(bare[1]), max_score: 100, explicitRatio: false };
+    // Do NOT fabricate max_score = 100 for bare numeric scores (IOI tasks can have != 100 max points).
+    return { score: Number(bare[1]), explicitRatio: false };
   }
   return { explicitRatio: false };
 }
@@ -264,31 +266,70 @@ export function parseQojSubmissionPage(expectedId: string, body: string): QojSub
   return undefined;
 }
 
-export function parseQojSubmissionList(markup: string): Array<{ id: string; problem_id?: string; submitter?: string }> {
+export interface QojSubmissionListResult {
+  recognized: boolean;
+  rows: Array<{ id: string; problem_id?: string; submitter?: string }>;
+}
+
+/**
+ * Parse a QOJ/UOJ `/submissions` HTML page and verify that it actually contains
+ * a recognizable submissions table structure (prevents misinterpreting HTTP 200
+ * maintenance/error pages as an empty submission list with baseline 0).
+ */
+export function parseQojSubmissionListPage(markup: string): QojSubmissionListResult {
   const nodes = parseHtmlNodes(markup);
   const rows: Array<{ id: string; problem_id?: string; submitter?: string }> = [];
   const seen = new Set<string>();
-  for (const tr of nodes) {
-    if (tr.tagName !== 'tr') continue;
-    const anchors = collectAnchors(tr);
-    let subId: string | undefined;
-    let problemId: string | undefined;
-    let submitter: string | undefined;
-    for (const a of anchors) {
-      const href = htmlAttr(a, 'href') ?? '';
-      const s = href.match(/\/submission\/(\d+)(?:$|[/?#])/);
-      if (s?.[1] && !subId) subId = s[1];
-      const p = href.match(/\/problem\/(\d+)(?:$|[/?#])/);
-      if (p?.[1] && !problemId) problemId = p[1];
-      const u = href.match(/\/user\/profile\/([^/?#]+)/);
-      if (u?.[1] && !submitter) submitter = decodeURIComponent(u[1]);
+  let recognizedTable = false;
+
+  for (const table of nodes) {
+    if (table.tagName !== 'table') continue;
+    const tableNodes = walkHtml(table);
+    const headerText = tableNodes
+      .filter(n => n.tagName === 'th')
+      .map(n => htmlText(n).trim().toLowerCase())
+      .join(' ');
+    const tableClass = (htmlAttr(table, 'class') ?? '').toLowerCase();
+    const hasSubmissionHeaders =
+      (headerText.includes('id') || headerText.includes('#')) &&
+      (headerText.includes('problem') ||
+        headerText.includes('submitter') ||
+        headerText.includes('result') ||
+        headerText.includes('score') ||
+        headerText.includes('题目') ||
+        headerText.includes('提交'));
+    if (hasSubmissionHeaders || tableClass.includes('submissions')) {
+      recognizedTable = true;
     }
-    if (subId && !seen.has(subId)) {
-      seen.add(subId);
-      rows.push({ id: subId, ...(problemId ? { problem_id: problemId } : {}), ...(submitter ? { submitter } : {}) });
+
+    for (const tr of tableNodes) {
+      if (tr.tagName !== 'tr') continue;
+      const anchors = collectAnchors(tr);
+      let subId: string | undefined;
+      let problemId: string | undefined;
+      let submitter: string | undefined;
+      for (const a of anchors) {
+        const href = htmlAttr(a, 'href') ?? '';
+        const s = href.match(/\/submission\/(\d+)(?:$|[/?#])/);
+        if (s?.[1] && !subId) subId = s[1];
+        const p = href.match(/\/problem\/(\d+)(?:$|[/?#])/);
+        if (p?.[1] && !problemId) problemId = p[1];
+        const u = href.match(/\/user\/profile\/([^/?#]+)/);
+        if (u?.[1] && !submitter) submitter = decodeURIComponent(u[1]);
+      }
+      if (subId && !seen.has(subId)) {
+        seen.add(subId);
+        recognizedTable = true;
+        rows.push({ id: subId, ...(problemId ? { problem_id: problemId } : {}), ...(submitter ? { submitter } : {}) });
+      }
     }
   }
-  return rows;
+
+  return { recognized: recognizedTable, rows };
+}
+
+export function parseQojSubmissionList(markup: string): Array<{ id: string; problem_id?: string; submitter?: string }> {
+  return parseQojSubmissionListPage(markup).rows;
 }
 
 async function fetchSameOriginManual(
@@ -368,25 +409,33 @@ export async function previewQojContest(
   const seenScoped = new Set<string>();
   let statementPdfUrl: string | undefined;
 
+  const basePath = new URL(baseUrl).pathname.replace(/\/+$/, '');
+  const escapedBase = basePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const contestProblemRegex = new RegExp(`^${escapedBase}/contest/${cleanId}/problem/(\\d+)/?$`);
+
   for (const node of nodes) {
     if (node.tagName !== 'a') continue;
     const href = htmlAttr(node, 'href') ?? '';
+    if (!href) continue;
     const linkText = htmlText(node).replace(/\s+/g, ' ').trim();
 
-    if (!statementPdfUrl && (/\.pdf($|\?)/i.test(href) || /download.*statement|statements?\.pdf/i.test(href))) {
-      try {
-        const resolved = new URL(href, contestUrl);
-        if ((resolved.protocol === 'https:' || resolved.protocol === 'http:') && resolved.origin === origin) {
-          statementPdfUrl = resolved.href;
-        }
-      } catch {
-        // ignore malformed href
+    let resolved: URL;
+    try {
+      resolved = new URL(href, contestUrl);
+    } catch {
+      continue;
+    }
+    if (resolved.origin !== origin) continue;
+
+    if (!statementPdfUrl && (/\.pdf($|\?)/i.test(resolved.pathname) || /download.*statement|statements?\.pdf/i.test(resolved.pathname))) {
+      if (resolved.protocol === 'https:' || resolved.protocol === 'http:') {
+        statementPdfUrl = resolved.href;
       }
     }
 
-    // Strictly match problems scoped to this contest (`/contest/<id>/problem/<pid>`)
-    const scopedMatch = href.match(new RegExp(`^.*/contest/${cleanId}/problem/(\\d+)(?:$|[/?#])|^/contest/${cleanId}/problem/(\\d+)(?:$|[/?#])`));
-    const pid = scopedMatch?.[1] ?? scopedMatch?.[2];
+    // Strictly match same-origin problems scoped to this contest (`<basePath>/contest/<id>/problem/<pid>`)
+    const scopedMatch = resolved.pathname.match(contestProblemRegex);
+    const pid = scopedMatch?.[1];
     if (pid && !seenScoped.has(pid)) {
       seenScoped.add(pid);
       const cleanTitle = linkText.replace(/^#?\d+\.\s*/, '').trim();
@@ -467,7 +516,7 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
     remoteProblemId: string,
     session: Map<string, string>,
     signal: AbortSignal,
-  ) {
+  ): Promise<QojSubmissionListResult> {
     const url = new URL(`${baseUrl}/submissions`);
     url.searchParams.set('submitter', handle);
     url.searchParams.set('problem_id', remoteProblemId);
@@ -477,13 +526,29 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
       signal,
     });
     if (resp.status >= 300 && resp.status < 400) {
+      await resp.body?.cancel();
       throw new JudgeInfrastructureError('auth_expired', 'QOJ redirected submissions list request', {
         platform: 'qoj',
         status: resp.status,
       });
     }
-    if (!resp.ok) throw classifyHttpError(resp.status, 'submissions list');
-    return parseQojSubmissionList(await resp.text());
+    if (!resp.ok) {
+      await resp.body?.cancel();
+      throw classifyHttpError(resp.status, 'submissions list');
+    }
+    const listHtml = await resp.text();
+    const challenge = detectCaptchaOrLogin(listHtml);
+    if (challenge === 'captcha') {
+      throw new JudgeInfrastructureError('captcha_required', 'QOJ submissions list returned captcha challenge', {
+        platform: 'qoj',
+      });
+    }
+    if (challenge === 'login') {
+      throw new JudgeInfrastructureError('auth_expired', 'QOJ submissions list returned login page', {
+        platform: 'qoj',
+      });
+    }
+    return parseQojSubmissionListPage(listHtml);
   }
 
   async function submitViaCookie(
@@ -533,13 +598,16 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
       });
     }
 
-    // Record baseline submission ID before posting. NEVER default failed baseline to 0!
+    // Record baseline submission ID before posting.
+    // ONLY mark baselineKnown=true if the response actually rendered a recognized QOJ submissions table!
     let baselineKnown = false;
     let baseline = 0;
     try {
       const before = await fetchRecentSubmissions(handle, remoteProblemId, session, requestSignal);
-      baseline = Math.max(0, ...before.map(r => Number(r.id)).filter(Number.isFinite));
-      baselineKnown = true;
+      if (before.recognized) {
+        baseline = Math.max(0, ...before.rows.map(r => Number(r.id)).filter(Number.isFinite));
+        baselineKnown = true;
+      }
     } catch {
       baselineKnown = false;
     }
@@ -575,7 +643,16 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
     // 1. Check redirect receipt
     const location = postResp.headers.get('location');
     if (location && postResp.status >= 300 && postResp.status < 400) {
-      const targetUrl = new URL(location, submitPageUrl);
+      let targetUrl: URL;
+      try {
+        targetUrl = new URL(location, submitPageUrl);
+      } catch {
+        await postResp.body?.cancel();
+        throw new JudgeInfrastructureError('submission_unconfirmed', 'QOJ returned invalid redirect after submit POST', {
+          platform: 'qoj',
+          status: postResp.status,
+        });
+      }
       const escapedBase = basePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       if (targetUrl.origin === origin) {
         const directMatch = targetUrl.pathname.match(new RegExp(`^${escapedBase}/submission/(\\d+)/?$`));
@@ -599,7 +676,7 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
         }
       }
       await postResp.body?.cancel();
-      throw new JudgeInfrastructureError('auth_expired', 'Unexpected QOJ submit redirect', {
+      throw new JudgeInfrastructureError('submission_unconfirmed', 'Unexpected QOJ submit redirect; will not retry', {
         platform: 'qoj',
         status: postResp.status,
       });
@@ -619,7 +696,15 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
       );
     }
 
-    const bodyText = await postResp.text();
+    let bodyText: string;
+    try {
+      bodyText = await postResp.text();
+    } catch {
+      throw new JudgeInfrastructureError('submission_unconfirmed', 'QOJ response stream interrupted after submit POST', {
+        platform: 'qoj',
+        status: postResp.status,
+      });
+    }
     const contentType = postResp.headers.get('content-type') ?? '';
     if (contentType.includes('application/json') || bodyText.trim().startsWith('{')) {
       const json = safeParseJson(bodyText, 'qoj', 'submit response', 'submission_unconfirmed') as {
@@ -657,8 +742,19 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
   ): Promise<string> {
     for (let attempt = 0; attempt < 4; attempt++) {
       await delayImpl(1500, signal);
-      const rows = await fetchRecentSubmissions(handle, remoteProblemId, session, signal);
-      const newer = rows.filter(r => Number(r.id) > baseline);
+      let list: QojSubmissionListResult;
+      try {
+        list = await fetchRecentSubmissions(handle, remoteProblemId, session, signal);
+      } catch (err) {
+        if (signal.aborted) throw err;
+        throw new JudgeInfrastructureError(
+          'submission_unconfirmed',
+          'Failed to query QOJ submissions list after POST; will not retry',
+          { platform: 'qoj' },
+        );
+      }
+      if (!list.recognized) continue;
+      const newer = list.rows.filter(r => Number(r.id) > baseline);
       const exact = newer.filter(
         r =>
           r.problem_id === remoteProblemId &&
@@ -718,14 +814,18 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
         return submitViaCookie(remoteProblemId, remoteLang, source, transport.handle, transport.cookie!, signal);
       };
 
-      if (deps.pool) {
-        return deps.pool.enqueueSubmission(transport.queueKey, execute, signal);
-      }
-      return execute();
+      return serializeAccountSubmission(transport.queueKey, execute, signal, deps.pool);
     },
 
     async verdicts(ids, problems, signal) {
       if (!ids.length) return new Map();
+      for (const id of ids) {
+        if (!problems.has(id)) {
+          throw new JudgeInfrastructureError('identity_mismatch', `Missing expected problem mapping for QOJ submission #${id}`, {
+            platform: 'qoj',
+          });
+        }
+      }
       const transport = await resolveTransport();
       const headers: Record<string, string> = {};
       if (transport.mode === 'cookie') {
@@ -750,14 +850,31 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
           });
         }
         if (resp.status >= 300 && resp.status < 400) {
+          await resp.body?.cancel();
           throw new JudgeInfrastructureError('auth_expired', `QOJ redirected while polling submission #${id}`, {
             platform: 'qoj',
             status: resp.status,
           });
         }
-        if (!resp.ok) throw classifyHttpError(resp.status, `submission #${id}`);
+        if (!resp.ok) {
+          await resp.body?.cancel();
+          throw classifyHttpError(resp.status, `submission #${id}`);
+        }
 
         const body = await resp.text();
+        // Check login / captcha challenge BEFORE parsing summary row so auth/captcha pages are classified accurately.
+        const challenge = detectCaptchaOrLogin(body);
+        if (challenge === 'captcha') {
+          throw new JudgeInfrastructureError('captcha_required', `QOJ returned captcha while polling #${id}`, {
+            platform: 'qoj',
+          });
+        }
+        if (challenge === 'login') {
+          throw new JudgeInfrastructureError('auth_expired', `QOJ session expired while polling #${id}`, {
+            platform: 'qoj',
+          });
+        }
+
         const row = parseQojSubmissionPage(id, body);
         if (!row) {
           throw new JudgeInfrastructureError(
@@ -777,14 +894,12 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
             platform: 'qoj',
           });
         }
-        const localProblem = problems.get(id);
-        if (localProblem) {
-          const expectedProblem = targetFor(localProblem);
-          if (!row.problem_id || row.problem_id !== expectedProblem) {
-            throw new JudgeInfrastructureError('identity_mismatch', `QOJ submission #${id} missing or mismatched problem`, {
-              platform: 'qoj',
-            });
-          }
+        const localProblem = problems.get(id)!;
+        const expectedProblem = targetFor(localProblem);
+        if (!row.problem_id || row.problem_id !== expectedProblem) {
+          throw new JudgeInfrastructureError('identity_mismatch', `QOJ submission #${id} missing or mismatched problem`, {
+            platform: 'qoj',
+          });
         }
 
         const normalized = normalizeVerdict(row.raw_verdict, row.score, row.max_score);

@@ -20,6 +20,7 @@ import {
   resolveBaseUrl,
   runExternalSubmitter,
   safeParseJson,
+  serializeAccountSubmission,
   serializeCookieHeader,
 } from './types.js';
 
@@ -398,7 +399,15 @@ export function createVjudgeJudge(config: VjudgeJudgeConfig, deps: VjudgeJudgeDe
     }
     mergeSetCookies(session, response.headers);
 
-    const rawText = await response.text();
+    let rawText: string;
+    try {
+      rawText = await response.text();
+    } catch {
+      throw new JudgeInfrastructureError('submission_unconfirmed', 'VJudge response stream interrupted after submit POST', {
+        platform: 'vjudge',
+        status: response.status,
+      });
+    }
     let rawParsed: unknown;
     try {
       rawParsed = JSON.parse(rawText);
@@ -481,14 +490,18 @@ export function createVjudgeJudge(config: VjudgeJudgeConfig, deps: VjudgeJudgeDe
         return submitViaCookie(target, remoteLang, source, transport.cookie!, signal);
       };
 
-      if (deps.pool) {
-        return deps.pool.enqueueSubmission(transport.queueKey, execute, signal);
-      }
-      return execute();
+      return serializeAccountSubmission(transport.queueKey, execute, signal, deps.pool);
     },
 
     async verdicts(ids, problems, signal) {
       if (!ids.length) return new Map();
+      for (const id of ids) {
+        if (!problems.has(id)) {
+          throw new JudgeInfrastructureError('identity_mismatch', `Missing expected problem mapping for VJudge submission #${id}`, {
+            platform: 'vjudge',
+          });
+        }
+      }
       const transport = await resolveTransport();
       const headers: Record<string, string> = { 'x-requested-with': 'XMLHttpRequest' };
       if (transport.mode === 'cookie') {
@@ -569,36 +582,34 @@ export function createVjudgeJudge(config: VjudgeJudgeConfig, deps: VjudgeJudgeDe
           });
         }
 
-        const localProblem = problems.get(id);
-        if (localProblem) {
-          const expected = targetFor(localProblem);
-          if (normalizedContestId !== undefined) {
-            if (data.contestId !== undefined && String(data.contestId) !== normalizedContestId) {
-              throw new JudgeInfrastructureError('identity_mismatch', `VJudge submission #${id} contest mismatch`, {
-                platform: 'vjudge',
-              });
-            }
-            if (!data.contestNum || data.contestNum !== expected) {
-              throw new JudgeInfrastructureError(
-                'identity_mismatch',
-                `VJudge submission #${id} missing or mismatched contest problem index`,
-                { platform: 'vjudge' },
-              );
-            }
-          } else {
-            const upstream = parseUpstreamProblemRef(expected);
-            if (
-              !data.oj ||
-              !data.probNum ||
-              data.oj.toLowerCase() !== upstream.oj.toLowerCase() ||
-              data.probNum !== upstream.probNum
-            ) {
-              throw new JudgeInfrastructureError(
-                'identity_mismatch',
-                `VJudge submission #${id} missing or mismatched upstream problem`,
-                { platform: 'vjudge' },
-              );
-            }
+        const localProblem = problems.get(id)!;
+        const expected = targetFor(localProblem);
+        if (normalizedContestId !== undefined) {
+          if (data.contestId === undefined || String(data.contestId) !== normalizedContestId) {
+            throw new JudgeInfrastructureError('identity_mismatch', `VJudge submission #${id} missing or mismatched contestId`, {
+              platform: 'vjudge',
+            });
+          }
+          if (!data.contestNum || data.contestNum !== expected) {
+            throw new JudgeInfrastructureError(
+              'identity_mismatch',
+              `VJudge submission #${id} missing or mismatched contest problem index`,
+              { platform: 'vjudge' },
+            );
+          }
+        } else {
+          const upstream = parseUpstreamProblemRef(expected);
+          if (
+            !data.oj ||
+            !data.probNum ||
+            data.oj.toLowerCase() !== upstream.oj.toLowerCase() ||
+            data.probNum !== upstream.probNum
+          ) {
+            throw new JudgeInfrastructureError(
+              'identity_mismatch',
+              `VJudge submission #${id} missing or mismatched upstream problem`,
+              { platform: 'vjudge' },
+            );
           }
         }
 
