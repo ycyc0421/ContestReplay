@@ -444,18 +444,21 @@ async function previewGymPageHtml(
 
   const candidateBoxes = nodes.filter(n => {
     const cls = (htmlAttr(n, 'class') ?? '').toLowerCase();
-    return cls.includes('sidebox') || (cls.includes('rtable') && !cls.includes('sidebox'));
+    return cls.includes('sidebox') || cls.includes('rtable');
   });
-  // Prefer top-level sideboxes over nested rtables inside them
-  const sideboxes = candidateBoxes.filter(n => (htmlAttr(n, 'class') ?? '').toLowerCase().includes('sidebox'));
-  const boxesToInspect = sideboxes.length ? sideboxes : candidateBoxes;
+  // Exclude only nested duplicate boxes (e.g. an .rtable inside a .sidebox),
+  // preserving standalone .rtable status tables alongside unrelated .sidebox panels.
+  const nestedNodes = new Set<(typeof candidateBoxes)[number]>();
+  for (const box of candidateBoxes) {
+    for (const child of walkHtml(box)) {
+      if (child !== box) nestedNodes.add(child);
+    }
+  }
+  const boxesToInspect = candidateBoxes.filter(box => !nestedNodes.has(box));
 
+  // Only trust boxes explicitly attributed to the target Gym (/gym/<id>) with no foreign contest links.
   const currentGymBoxes = boxesToInspect.filter(box => {
     const sub = walkHtml(box);
-    const hasStateNode = sub.some(el => {
-      const cls = (htmlAttr(el, 'class') ?? '').toLowerCase();
-      return cls.includes('contest-state-phase') || cls.includes('contest-state-regular');
-    });
     let linksCurrent = false;
     let linksOther = false;
     for (const el of sub) {
@@ -478,7 +481,7 @@ async function previewGymPageHtml(
         }
       }
     }
-    return !linksOther && (hasStateNode || linksCurrent);
+    return linksCurrent && !linksOther;
   });
 
   let status: ContestPreview['status'] = 'unknown';

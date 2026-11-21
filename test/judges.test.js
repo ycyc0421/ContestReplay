@@ -1093,7 +1093,7 @@ test('Final review regression suite: QOJ maintenance page & bare score, CF Gym a
       if (url.pathname === '/gym/104567') {
         return htmlResponse(`
           <html><head><title>Private Gym - Codeforces</title></head><body>
-            <div class="sidebox"><div class="contest-state-phase">Finished</div><div>Final standings</div></div>
+            <div class="sidebox"><a href="/gym/104567">Private Gym</a><div class="contest-state-phase">Finished</div><div>Final standings</div></div>
             <a href="/gym/104567/problem/A">Alpha</a>
             <a href="https://evil.example/gym/104567/problem/Z">Spoofed</a>
           </body></html>
@@ -1173,6 +1173,41 @@ test('Final review regression suite: QOJ maintenance page & bare score, CF Gym a
     },
   });
   assert.equal(gymFinishedWithOtherCountdownSidebox.status, 'finished');
+
+  // Standalone .rtable linked to current Gym (Coding) alongside an unlinked .sidebox (Finished) MUST return 'active'
+  const gymStandaloneRtableWithUnlinkedSidebox = await previewCodeforcesContest(104567, {
+    gym: true,
+    cookie: 'JSESSIONID=gym-auth',
+    fetchImpl: async input => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/contest.standings') return jsonResponse({ status: 'FAILED' }, 403);
+      return htmlResponse(`
+        <html><body>
+          <table class="rtable"><tr><th><a href="/gym/104567">Current Gym</a></th></tr><tr><td class="contest-state-phase">Coding</td></tr></table>
+          <div class="sidebox"><div class="contest-state-phase">Finished</div><div>Final standings</div></div>
+          <a href="/gym/104567/problem/A">Alpha</a>
+        </body></html>
+      `);
+    },
+  });
+  assert.equal(gymStandaloneRtableWithUnlinkedSidebox.status, 'active');
+
+  // Unattributed .sidebox without a link to the target Gym MUST return 'unknown' (never 'finished')
+  const gymUnattributedFinishedBox = await previewCodeforcesContest(104567, {
+    gym: true,
+    cookie: 'JSESSIONID=gym-auth',
+    fetchImpl: async input => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/contest.standings') return jsonResponse({ status: 'FAILED' }, 403);
+      return htmlResponse(`
+        <html><body>
+          <div class="sidebox"><div class="contest-state-phase">Finished</div><div>Final standings</div></div>
+          <a href="/gym/104567/problem/A">Alpha</a>
+        </body></html>
+      `);
+    },
+  });
+  assert.equal(gymUnattributedFinishedBox.status, 'unknown');
 
   // Minute-precision /gym/<id>/my correlation (HH:MM floored to start of current UTC minute)
   const nowDate = new Date();
