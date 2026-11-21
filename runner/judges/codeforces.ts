@@ -437,26 +437,74 @@ async function previewGymPageHtml(
     });
   }
 
-  // Explicitly verify finished status ONLY from CF sidebar/status containers (never fuzzy-match page title like "Practice Round").
-  const stateContainers = nodes.filter(n => {
+  // Explicitly verify finished status ONLY from the current Gym's own status sidebox/table
+  // (never scan page-wide .countdown or unrelated sideboxes belonging to other contests/rounds).
+  const currentGymLinkRe = new RegExp(`^${escapedBase}/gym/${numericId}(?:/|$)`);
+  const anyContestLinkRe = new RegExp(`^${escapedBase}/(contest|gym)/(\\d+)(?:/|$)`);
+
+  const candidateBoxes = nodes.filter(n => {
     const cls = (htmlAttr(n, 'class') ?? '').toLowerCase();
-    return (
-      cls.includes('contest-state-phase') ||
-      cls.includes('contest-state-regular') ||
-      cls.includes('rtable') ||
-      cls.includes('sidebox')
-    );
+    return cls.includes('sidebox') || (cls.includes('rtable') && !cls.includes('sidebox'));
   });
-  const stateText = stateContainers
-    .map(n => htmlText(n).replace(/\s+/g, ' ').trim())
-    .join(' ');
-  const hasCountdown =
-    nodes.some(n => (htmlAttr(n, 'class') ?? '').toLowerCase().includes('countdown')) ||
-    /\b\d{1,2}:\d{2}:\d{2}\b/.test(stateText);
-  const hasActiveMarker =
-    hasCountdown || /\b(contest is running|before the contest|pending system test|system testing)\b/i.test(stateText);
-  const hasFinishedMarker = /\b(final standings|contest is over|finished)\b/i.test(stateText);
-  const status: ContestPreview['status'] = hasActiveMarker ? 'active' : hasFinishedMarker ? 'finished' : 'unknown';
+  // Prefer top-level sideboxes over nested rtables inside them
+  const sideboxes = candidateBoxes.filter(n => (htmlAttr(n, 'class') ?? '').toLowerCase().includes('sidebox'));
+  const boxesToInspect = sideboxes.length ? sideboxes : candidateBoxes;
+
+  const currentGymBoxes = boxesToInspect.filter(box => {
+    const sub = walkHtml(box);
+    const hasStateNode = sub.some(el => {
+      const cls = (htmlAttr(el, 'class') ?? '').toLowerCase();
+      return cls.includes('contest-state-phase') || cls.includes('contest-state-regular');
+    });
+    let linksCurrent = false;
+    let linksOther = false;
+    for (const el of sub) {
+      if (el.tagName !== 'a') continue;
+      const rawHref = htmlAttr(el, 'href');
+      if (!rawHref) continue;
+      let resolved: URL;
+      try {
+        resolved = new URL(rawHref, gymUrl);
+      } catch {
+        continue;
+      }
+      if (resolved.origin !== opts.origin) continue;
+      if (currentGymLinkRe.test(resolved.pathname)) {
+        linksCurrent = true;
+      } else {
+        const other = resolved.pathname.match(anyContestLinkRe);
+        if (other && (other[1] !== 'gym' || other[2] !== String(numericId))) {
+          linksOther = true;
+        }
+      }
+    }
+    return !linksOther && (hasStateNode || linksCurrent);
+  });
+
+  let status: ContestPreview['status'] = 'unknown';
+  if (currentGymBoxes.length > 0) {
+    const boxNodes = currentGymBoxes.flatMap(walkHtml);
+    const stateText = boxNodes
+      .filter(n => n.value !== undefined)
+      .map(n => n.value!)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const hasCountdown =
+      boxNodes.some(n => (htmlAttr(n, 'class') ?? '').toLowerCase().includes('countdown')) ||
+      /\b\d{1,2}:\d{2}:\d{2}\b/.test(stateText);
+    const hasActiveMarker =
+      hasCountdown || /\b(contest is running|before the contest|pending system test|system testing|coding)\b/i.test(stateText);
+    const hasFinishedMarker = /\b(final standings|contest is over|finished)\b/i.test(stateText);
+
+    if (hasActiveMarker && hasFinishedMarker) {
+      status = 'unknown';
+    } else if (hasActiveMarker) {
+      status = 'active';
+    } else if (hasFinishedMarker) {
+      status = 'finished';
+    }
+  }
 
   return {
     platform: 'codeforces',

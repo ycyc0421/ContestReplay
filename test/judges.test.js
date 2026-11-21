@@ -1131,11 +1131,48 @@ test('Final review regression suite: QOJ maintenance page & bare score, CF Gym a
       const url = new URL(String(input));
       if (url.pathname === '/api/contest.standings') return jsonResponse({ status: 'FAILED' }, 403);
       return htmlResponse(
-        '<html><body><div class="sidebox"><div class="contest-state-phase">Contest is running</div><span class="countdown">01:23:45</span></div><a href="/gym/104567/problem/A">Alpha</a></body></html>',
+        '<html><body><div class="sidebox"><a href="/gym/104567">Gym</a><div class="contest-state-phase">Contest is running</div><span class="countdown">01:23:45</span></div><a href="/gym/104567/problem/A">Alpha</a></body></html>',
       );
     },
   });
   assert.equal(gymPreviewActive.status, 'active');
+
+  // Unrelated sidebox with previous round "Final standings" MUST NOT mark a Coding gym as 'finished'
+  const gymCodingWithOtherFinishedSidebox = await previewCodeforcesContest(104567, {
+    gym: true,
+    cookie: 'JSESSIONID=gym-auth',
+    fetchImpl: async input => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/contest.standings') return jsonResponse({ status: 'FAILED' }, 403);
+      return htmlResponse(`
+        <html><body>
+          <div class="sidebox"><a href="/gym/104567">Current Gym</a><div class="contest-state-phase">Coding</div></div>
+          <div class="sidebox"><a href="/contest/1999">Previous Round</a><div class="contest-state-phase">Finished</div><a href="/contest/1999/standings">Final standings</a></div>
+          <a href="/gym/104567/problem/A">Alpha</a>
+        </body></html>
+      `);
+    },
+  });
+  assert.notEqual(gymCodingWithOtherFinishedSidebox.status, 'finished');
+  assert.equal(gymCodingWithOtherFinishedSidebox.status, 'active');
+
+  // Unrelated sidebox with next round's countdown MUST NOT override a Finished gym's status
+  const gymFinishedWithOtherCountdownSidebox = await previewCodeforcesContest(104567, {
+    gym: true,
+    cookie: 'JSESSIONID=gym-auth',
+    fetchImpl: async input => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/contest.standings') return jsonResponse({ status: 'FAILED' }, 403);
+      return htmlResponse(`
+        <html><body>
+          <div class="sidebox"><a href="/gym/104567">Current Gym</a><div class="contest-state-phase">Finished</div><div>Final standings</div></div>
+          <div class="sidebox"><a href="/contest/2001">Next Round</a><div class="contest-state-phase">Before the contest</div><span class="countdown">02:15:00</span></div>
+          <a href="/gym/104567/problem/A">Alpha</a>
+        </body></html>
+      `);
+    },
+  });
+  assert.equal(gymFinishedWithOtherCountdownSidebox.status, 'finished');
 
   // Minute-precision /gym/<id>/my correlation (HH:MM floored to start of current UTC minute)
   const nowDate = new Date();
