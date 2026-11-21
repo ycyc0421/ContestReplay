@@ -1,7 +1,10 @@
 import { writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { z } from 'zod';
-import { agentToml, resolveContest } from './config.js';
+import { agentToml, resolveAgentManifest, resolveContest } from './config.js';
+import { Connections } from './connections.js';
+import { manifestProvider } from './agent-manifest.js';
+import { documentFormat, serializeDocument } from './serialization.js';
 import { importCodeforces } from './codeforces.js';
 
 export async function saveAgent(path: string, raw: unknown) {
@@ -9,6 +12,18 @@ export async function saveAgent(path: string, raw: unknown) {
   await writeFile(path, agentToml(raw), { mode: 0o600, flag: 'wx' });
   return resolve(path);
 }
+export async function saveAgentManifest(path: string, raw: unknown, store = new Connections()) {
+  const target = resolve(path);
+  const format = documentFormat(target);
+  const { manifest } = await resolveAgentManifest(raw, target, store);
+  return persistAgentManifest(target, manifestProvider(manifest), serializeDocument(manifest, format), store);
+}
+
+export async function persistAgentManifest(target: string, connection: string, serialized: string, store: Connections) {
+  await store.register(connection, target, () => writeFile(target, serialized, { mode: 0o600, flag: 'wx' }));
+  return target;
+}
+
 export async function saveContest(path: string, raw: unknown) {
   const { contest } = await resolveContest(raw, resolve(path));
   const { statement: _legacy, ...manifest } = contest;

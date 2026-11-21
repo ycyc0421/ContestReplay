@@ -18,6 +18,7 @@ import { codeforces, type ProgramJudge } from './codeforces.js';
 import { codexConfig, serveContestChannels } from './codex.js';
 import type { Infer } from './model.js';
 import { send } from './wire.js';
+import { credentialJson, redactCredentialStream } from './credential-redaction.js';
 
 const ready = z.strictObject({ op: z.literal('ready') });
 const next = z.strictObject({ op: z.literal('next') });
@@ -41,7 +42,7 @@ export async function runBench(inputs: Inputs, opts: {
   const directory = resolve(opts.out, runId);
   await mkdir(resolve(opts.out), { recursive: true, mode: 0o700 });
   await mkdir(directory, { mode: 0o700 });
-  await writeFile(join(directory, 'run.json'), JSON.stringify({
+  await writeFile(join(directory, 'run.json'), credentialJson({
     schema_version: 1, run_id: runId, created_at: new Date().toISOString(),
     contest_id: inputs.contest.contest_id, data_version: inputs.contest.data_version,
     local_inputs: { contest: inputs.contestPath, agent: inputs.agentPath, pdf: inputs.pdfPath, judge: inputs.judgePath },
@@ -51,28 +52,27 @@ export async function runBench(inputs: Inputs, opts: {
     protocol_id: inputs.profile.harness === 'codex' ? 'codex-pdf-pages-mcp' : protocol.id, protocol_version: 2,
     protocol_sha256: protocolDigest, rules: inputs.contest.rules,
     agent_id: inputs.agent.agent_id,
-    agent_revision: agentRevision(inputs, opts.image),
+    agent_revision: agentRevision(inputs, opts.image, protocolDigest),
+    agent_digests: { source_sha256: inputs.agentDigest, profile_sha256: inputs.profileDigest, native_sha256: inputs.nativeDigest, effective_sha256: inputs.effectiveDigest },
     harness: inputs.agent.harness, runner_version: '0.2.0', adapter_version: '0.2.0', judge_kind: inputs.contest.judge.kind,
     sandbox: { runtime: 'docker', image: opts.image, resources: inputs.profile.harness === 'codex' ? { ...resources, memory: '2g', workspace: '256m' } : resources },
-    model: { model: inputs.profile.model, api: inputs.profile.api, base_url: inputs.profile.base_url, model_family_id: inputs.profile.model_family_id,
+    model: { model: inputs.profile.model, api: inputs.profile.api, base_url: inputs.profile.base_url, vendor: inputs.vendor, model_family_id: inputs.profile.model_family_id,
       ...(inputs.profile.harness === 'codex' ? { reasoning_effort: inputs.profile.reasoning_effort } : { temperature: inputs.profile.temperature, max_output_tokens: protocol.maxOutputTokens }) },
-  }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+  }, opts.key, 2) + '\n', { mode: 0o600, flag: 'wx' });
   const log: WriteStream = createWriteStream(join(directory, 'events.jsonl'), { mode: 0o600, flags: 'wx' });
   const logClosed = finished(log);
   // Attach a rejection handler before the first async operation; await below to surface failure.
   void logClosed.catch(() => {});
   await once(log, 'open');
-  const writers: { stream: WriteStream; closed: Promise<void> }[] = [];
+  const writers: { stream: WriteStream; closed: Promise<void>; flush: () => void }[] = [];
   const diagnostic = (name: 'stdout' | 'stderr') => {
     const stream = createWriteStream(join(directory, `agent.${name}.log`), { mode: 0o600, flags: 'wx' });
     const closed = finished(stream);
     void closed.catch(() => {});
-    writers.push({ stream, closed });
     let total = 0;
     let truncated = false;
-    return (chunk: Buffer | string) => {
-      if (truncated || stream.destroyed) return;
-      const bytes = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+    const redactor = redactCredentialStream(opts.key, bytes => {
+      if (truncated || stream.destroyed || bytes.length === 0) return;
       const budget = 1024 * 1024 - total;
       total += bytes.length;
       stream.write(bytes.subarray(0, budget));
@@ -80,12 +80,14 @@ export async function runBench(inputs: Inputs, opts: {
         truncated = true;
         stream.write('\n[cr: diagnostics truncated at 1 MiB]\n');
       }
-    };
+    });
+    writers.push({ stream, closed, flush: redactor.end });
+    return (chunk: Buffer | string) => redactor.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
   };
   let elapsed = () => 0;
   let seq = 0;
   const event: EventSink = entry => {
-    log.write(JSON.stringify({ schema_version: 1, seq: ++seq, elapsed_ms: elapsed(), ...entry }) + '\n');
+    log.write(credentialJson({ schema_version: 1, seq: ++seq, elapsed_ms: elapsed(), ...entry }, opts.key) + '\n');
   };
   const cleanup = new AbortController();
   const deadline = new AbortController();
@@ -125,7 +127,7 @@ export async function runBench(inputs: Inputs, opts: {
       const attachments = join(input, 'attachments');
       await mkdir(attachments, { mode: 0o755 });
       for (const file of inputs.attachments) await writeFile(join(attachments, file.name), file.bytes, { mode: 0o444 });
-      await codexConfig(input, inputs.profile);
+      await codexConfig(input, inputs.profile, inputs.native);
       const channels = join(stage, 'channels');
       const judge = opts.programJudge ?? (inputs.contest.judge.kind === 'codeforces' ? codeforces(inputs.contest.judge) : undefined);
       // Create the session lazily at t=0, after the container is launched.
@@ -133,12 +135,12 @@ export async function runBench(inputs: Inputs, opts: {
       const session = () => live ??= (contestMatch = match(inputs, event, judge));
       let endRun!: (reason: string) => void;
       const terminal = new Promise<string>(resolve => { endRun = resolve; });
-      closeChannels = await serveContestChannels({ dir: channels, profile: inputs.profile, key: opts.key, signal: stopped,
+      closeChannels = await serveContestChannels({ dir: channels, profile: inputs.profile, native: inputs.native, key: opts.key, signal: stopped,
         contest: { submit: args => session().submit(args), status: id => session().status(id), close: () => session().close() },
         event, finish: () => {
           endRun('finish');
         }, fault: endRun });
-      sandbox = await launch(runId, opts.image, pdfPath, opts.signal, stderr, { input, channels, onStdout: stdout });
+      sandbox = await launch(runId, opts.image, pdfPath, opts.signal, stderr, { input, channels, env: inputs.env, onStdout: stdout });
       elapsed = session().elapsed;
       started = true;
       timer = setTimeout(() => deadline.abort(), limits.time_limit_ms);
@@ -272,7 +274,7 @@ export async function runBench(inputs: Inputs, opts: {
       }
       await contestMatch.dispose();
     }
-    for (const writer of writers) writer.stream.end();
+    for (const writer of writers) { writer.flush(); writer.stream.end(); }
     await Promise.allSettled(writers.map(writer => writer.closed));
     event({ type: 'run_ended', status, reason, score: status === 'completed' ? contestMatch?.score() ?? contest?.score() ?? 0 : null,
       max_score: inputs.contest.problems.reduce((sum, p) => sum + p.max_points, 0) });

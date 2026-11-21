@@ -6,7 +6,7 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { stringify } from 'smol-toml';
+import { effectiveFor, type NativeOverride } from './harnesses.js';
 import type { AgentProfile } from './config.js';
 import { finishArgs, type EventSink } from './contest.js';
 import { submissionSchema, statusSchema, type match } from './match.js';
@@ -22,15 +22,8 @@ async function listen(server: Endpoint, path: string) {
   });
   await chmod(path, 0o666);
 }
-export async function codexConfig(dir: string, profile: Codex) {
-  const config = {
-    model: profile.model, model_provider: 'cr', ...(profile.reasoning_effort ? { model_reasoning_effort: profile.reasoning_effort } : {}),
-    approval_policy: 'never', sandbox_mode: 'danger-full-access', web_search: 'disabled', analytics: { enabled: false },
-    model_providers: { cr: { name: 'ContestReplay relay', base_url: 'http://127.0.0.1:8745/v1', wire_api: 'responses',
-      request_max_retries: 0, stream_max_retries: 0 } },
-    mcp_servers: { contest: { command: 'node', args: ['/app/bridge.js', 'mcp'], required: true } },
-  };
-  await writeFile(join(dir, 'config.toml'), stringify(config), { mode: 0o444 });
+export async function codexConfig(dir: string, profile: Codex, native?: NativeOverride) {
+  await writeFile(join(dir, 'config.toml'), effectiveFor(profile, native).content, { mode: 0o444 });
 }
 async function requestBody(req: IncomingMessage) {
   const buffers: Buffer[] = []; let size = 0;
@@ -60,7 +53,7 @@ export function checkModelRequest(body: Record<string, unknown>, model: string) 
   return { ...body, store: false };
 }
 export async function serveContestChannels(opts: { dir: string; profile: Codex; key: string; signal: AbortSignal;
-  contest: Pick<ReturnType<typeof match>, 'submit' | 'status' | 'close'>; event: EventSink; finish: () => void; fault: (reason: string) => void }) {
+  native?: NativeOverride; contest: Pick<ReturnType<typeof match>, 'submit' | 'status' | 'close'>; event: EventSink; finish: () => void; fault: (reason: string) => void }) {
   const { dir, profile, key, signal, contest, event } = opts;
   await mkdir(dir, { mode: 0o755 });
   const stop = new AbortController();
@@ -81,11 +74,19 @@ export async function serveContestChannels(opts: { dir: string; profile: Codex; 
       let body: ReturnType<typeof checkModelRequest>;
       try { body = checkModelRequest(await requestBody(req), profile.model); }
       catch (error) { event({ type: 'model_request_rejected', reason: error instanceof Error && !(error instanceof SyntaxError) ? error.message : 'Invalid JSON' }); opts.fault('invalid_model_request'); reject(400, 'Disallowed request'); return; }
+      // Codex may omit native verbosity for models absent from its catalog.
+      // Apply the explicitly configured value to the approved Responses request.
+      const verbosity = opts.native?.model_verbosity;
+      if (verbosity) {
+        const text = (body as Record<string, unknown>).text;
+        Object.assign(body, { text: { ...(text && typeof text === 'object' && !Array.isArray(text) ? text : {}), verbosity } });
+      }
       const turn = ++calls;
       event({ type: 'model_request', turn, model: profile.model, reasoning: (body as Record<string, unknown>).reasoning ?? null });
       const disconnected = new AbortController();
       res.once('close', () => { if (!res.writableFinished) disconnected.abort(); });
       const requestSignal = AbortSignal.any([current, disconnected.signal, AbortSignal.timeout(protocol.requestTimeoutMs)]);
+      let completed = false;
       try {
         const upstream = await fetch(profile.base_url.replace(/\/+$/, '') + '/responses', {
           method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' }, body: JSON.stringify(body), redirect: 'error', signal: requestSignal,
@@ -109,7 +110,10 @@ export async function serveContestChannels(opts: { dir: string; profile: Codex; 
               event({ type: 'model_identity', turn, model: value.model, response_id: value.id });
             }
             if (typeof value.model === 'string' && value.model !== profile.model && /^gpt-.*-\d{4}-\d{2}-\d{2}$/.test(profile.model)) opts.fault('unexpected_model');
-            if (value.usage && (record.type === 'response.completed' || record.object === 'response')) event({ type: 'model_usage', turn, usage: value.usage });
+            if (record.type === 'response.completed' || record.object === 'response') {
+              completed = true;
+              if (value.usage) event({ type: 'model_usage', turn, usage: value.usage });
+            }
             if (['response.failed', 'error'].includes(String(record.type))) opts.fault('model_request_failed');
           } catch { /* non-data SSE line */ }
         };
@@ -121,7 +125,7 @@ export async function serveContestChannels(opts: { dir: string; profile: Codex; 
         });
         else { reader.on('data', (chunk: Buffer) => { if (line.length <= 1_000_000) line += decoder.decode(chunk, { stream: true }); }); reader.once('end', () => observe(line)); }
         await pipeline(reader, res, { signal: requestSignal });
-      } catch { if (!current.aborted) opts.fault('model_request_failed'); reject(502, 'Upstream transport failed'); }
+      } catch { if (!current.aborted && !finished && !(completed && disconnected.signal.aborted)) opts.fault('model_request_failed'); reject(502, 'Upstream transport failed'); }
     })().finally(() => { inFlight = false; }).catch(() => res.destroy());
   });
   relay.on('connection', track);

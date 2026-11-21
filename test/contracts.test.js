@@ -61,15 +61,21 @@ test('result export omits raw answers/logs, merges by run and ranks Agent revisi
   await mkdir(dir);
   await writeFile(join(dir, 'run.json'), JSON.stringify({ run_id, contest_id: 'demo', data_version: 1, input_sha256: { contest: hash },
     protocol_id: 'test', protocol_version: 2, protocol_sha256: hash, agent_id: 'a', agent_revision: hash, harness: { kind: 'codex', version: 'test' },
-    model: { model: 'fixture', model_family_id: 'family', base_url: 'private' }, local_inputs: { pdf: '/private' } }));
+    model: { model: 'fixture', model_family_id: 'family', vendor: 'openai', base_url: 'private' }, local_inputs: { pdf: '/private' } }));
   const events = [{ type: 'submission_received', submission_id: 's1', problem_id: 'A', elapsed_ms: 100, source: 'private code' },
     { type: 'submission_judged', submission_id: 's1', verdict: 'OK' }, { type: 'run_ended', status: 'completed', score: 1, max_score: 2 }];
   await writeFile(join(dir, 'events.jsonl'), events.map((e, i) => JSON.stringify({ schema_version: 1, seq: i+1, ...e })).join('\n')+'\n');
   const first = await exportRun(root, run_id);
   assert.doesNotMatch(JSON.stringify(first), /private/);
   const second = { ...first, run_id: randomUUID(), agent_revision: 'b'.repeat(64), score: 2 };
-  const bundle = { schema_version: 1, results: [first, second] };
+  const bundle = { schema_version: 2, results: [first, second] };
+  const { vendor: _vendor, ...legacyModel } = first.model;
+  const legacy = { schema_version: 1, results: [{ ...first, run_id: randomUUID(), model: legacyModel }] };
+  assert.equal(mergeResults([bundle, legacy]).results.length, 3);
+  assert.equal(mergeResults([bundle, bundle]).schema_version, 2);
   assert.equal(mergeResults([bundle, bundle]).results.length, 2);
   assert.deepEqual(rankResults(bundle, 'family')[0].map(row => row.result.score), [2, 1]);
   assert.deepEqual(rankResults(bundle, 'another'), []);
+  assert.equal(rankResults(bundle, undefined, 'openai')[0].length, 2);
+  assert.deepEqual(rankResults(legacy, undefined, 'openai'), []);
 });
