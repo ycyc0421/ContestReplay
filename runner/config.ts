@@ -21,7 +21,8 @@ const legacyContest = z.strictObject({ schema_version: z.literal(1), ...common, 
 export const localBackend = z.strictObject({ kind: z.literal('local'), answers: artifact });
 export const codeforcesBackend = z.strictObject({ kind: z.literal('codeforces'), contest_id: version,
   handle: z.string().regex(/^[A-Za-z0-9_.-]{1,50}$/), languages: z.record(id, version),
-  problem_map: z.record(id, z.string().regex(/^[A-Za-z0-9]{1,12}$/)).optional() });
+  problem_map: z.record(id, z.string().regex(/^[A-Za-z0-9]{1,12}$/)).optional(),
+  points_known: z.boolean().optional() });
 const problem = z.strictObject({ id, max_points: version });
 const unique = (problems: { id: string; max_points: number }[]) => new Set(problems.map(p => p.id)).size === problems.length &&
   Number.isSafeInteger(problems.reduce((sum, p) => sum + p.max_points, 0));

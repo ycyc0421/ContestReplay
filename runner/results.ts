@@ -53,6 +53,7 @@ export const resultSchema = z.strictObject({
   protocol_sha256: digest,
   protocol_preset: z.string().optional(),
   scoring_mode: z.enum(scoringModes).optional(),
+  points_known: z.boolean().optional(),
   agent_id: z.string(),
   agent_name: z.string().optional(),
   agent_revision: digest,
@@ -296,6 +297,7 @@ function mergeCompatibleRun(existing: Result, incoming: Result): Result {
   const contest_title = mergeOptionalField(existing.contest_title, incoming.contest_title, runId);
   const protocol_preset = mergeOptionalField(existing.protocol_preset, incoming.protocol_preset, runId);
   const scoring_mode = mergeOptionalField(existing.scoring_mode, incoming.scoring_mode, runId);
+  const points_known = mergeOptionalField(existing.points_known, incoming.points_known, runId);
   const agent_name = mergeOptionalField(existing.agent_name, incoming.agent_name, runId);
   const telemetry = mergeOptionalField(existing.telemetry, incoming.telemetry, runId);
   const vendor = mergeOptionalField(existing.model.vendor, incoming.model.vendor, runId);
@@ -313,6 +315,7 @@ function mergeCompatibleRun(existing: Result, incoming: Result): Result {
     protocol_sha256: existing.protocol_sha256,
     ...(protocol_preset !== undefined ? { protocol_preset } : {}),
     ...(scoring_mode !== undefined ? { scoring_mode } : {}),
+    ...(points_known !== undefined ? { points_known } : {}),
     agent_id: existing.agent_id,
     ...(agent_name !== undefined ? { agent_name } : {}),
     agent_revision: existing.agent_revision,
@@ -466,12 +469,12 @@ export function scoreResult(result: Result, mode: ScoringMode = result.scoring_m
     return {
       mode, primary: result.score, secondary: lastAcMs, solved, points: result.score,
       tie_break_ms: lastAcMs, ...(resolvedLastAc !== undefined ? { last_ac_ms: resolvedLastAc } : {}),
-      ...(result.submissions.length > 0 && result.score > 0 ? { scoring_unavailable: true } : {}),
+      scoring_unavailable: true,
       per_problem,
     };
   }
   if (mode === 'cf') {
-    if (missingCfWeight) {
+    if (result.points_known === false || missingCfWeight) {
       return {
         mode, primary: result.score, secondary: lastAcMs, solved, points: result.score,
         tie_break_ms: lastAcMs, ...(resolvedLastAc !== undefined ? { last_ac_ms: resolvedLastAc } : {}),

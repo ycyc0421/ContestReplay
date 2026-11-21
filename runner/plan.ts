@@ -24,7 +24,7 @@ export const planSchema = z.strictObject({ schema_version: z.literal(2), protoco
   jobs: z.array(z.strictObject({
     image: imageRef, harness: z.enum(['builtin-responses', 'codex']), model_family_id: z.string().optional(),
     agent_path: absPath, agent_id: z.string().min(1), agent_name: z.string().min(1).max(120).optional(),
-    speed_tier: speedTierSchema.optional(), credential_source: z.string().min(1).max(256),
+    speed_tier: speedTierSchema.optional(), credential_source: z.string().min(1).max(256).optional(),
     agent_revision: digest,
     agent_sha256: digest, profile_sha256: digest, native_sha256: digest.optional(), effective_sha256: digest.optional(),
     contest_path: absPath, contest_id: z.string().min(1), data_version: z.number().int().positive(), contest_sha256: digest,
@@ -126,6 +126,9 @@ function verifyAgent(job: PlanJob, input: AgentInput, contest: ContestInput['con
   const expectedPreset = resolveProtocolPreset(contest.rules);
   if (job.protocol_preset !== undefined && job.protocol_preset !== expectedPreset) {
     throw new Error('Plan protocol preset does not match contest rules; regenerate the plan');
+  }
+  if (!job.credential_source) {
+    throw new Error('Plan predates credential source pinning; regenerate the plan');
   }
   // Display metadata such as `name` may change without invalidating an existing plan;
   // verify execution-affecting identity, credential source, speed_tier, and digests.

@@ -14,6 +14,7 @@ import { connect as netConnect } from 'node:net';
 import { readFile, stat } from 'node:fs/promises';
 import { assertCompatible } from '../dist/plan.js';
 import { checkChatOrMessagesRequest, checkModelRequest, checkResponsesCompactRequest, resolveRelayTarget, serveContestChannels } from '../dist/codex.js';
+import { streamSessions } from '../dist/bridge.js';
 import { protocolForPreset } from '../dist/protocol.js';
 
 test('program judge stays pending without blocking and settles against the received timestamp', async () => {
@@ -192,7 +193,7 @@ test('relay enforces strict route/method/header/model allowlists, maps service_t
     req.end();
   });
 
-  // 1. Blocked methods, blocked non-inference routes, mixed cross-protocol bodies, and model/tool bypasses produce ZERO upstream calls
+  // 1. Blocked methods, blocked non-inference routes, mixed cross-protocol bodies, unexpressible configured tiers, and model/tool bypasses produce ZERO upstream calls
   assert.equal((await callSock('DELETE', '/v1/responses')).status, 405);
   assert.equal((await callSock('GET', '/v1/models')).status, 405);
   assert.equal((await callSock('POST', '/v1/files', { model: 'gpt-5.3-codex' })).status, 404);
@@ -205,16 +206,20 @@ test('relay enforces strict route/method/header/model allowlists, maps service_t
   assert.equal((await callSock('POST', '/v1/chat/completions', { model: 'gpt-5.3-codex', input: 'mixed', messages: [] })).status, 400);
   assert.equal((await callSock('POST', '/v1/messages', { model: 'gpt-5.3-codex', input: 'mixed', messages: [] })).status, 400);
   assert.equal((await callSock('POST', '/v1/messages', { model: 'gpt-5.3-codex', mcp_servers: [], messages: [] })).status, 400);
+  // Profile has reasoning_effort:'high' + service_tier:'fast': routes that cannot express them (/messages, /responses/compact) MUST reject with 0 upstream calls
+  assert.equal((await callSock('POST', '/v1/messages', { model: 'gpt-5.3-codex', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] })).status, 400);
+  assert.equal((await callSock('POST', '/v1/responses/compact', { model: 'gpt-5.3-codex', input: 'hi' })).status, 400);
   assert.equal(seen.length, 0, 'Rejected requests must never hit upstream');
 
-  // 2. Chat Completions forwards with allowlisted headers only & strips client-supplied service_tier
+  // 2. Chat Completions forwards with allowlisted headers only, enforces host reasoning_effort ('high') & service_tier ('priority')
   const chat = await callSock('POST', '/v1/chat/completions',
-    { model: 'gpt-5.3-codex', service_tier: 'priority', messages: [{ role: 'user', content: 'hello' }] },
+    { model: 'gpt-5.3-codex', reasoning_effort: 'low', service_tier: 'flex', messages: [{ role: 'user', content: 'hello' }] },
     { authorization: 'Bearer spoofed', 'x-goog-api-key': 'spoof', 'openai-organization': 'org-x', 'openai-project': 'proj-x',
       'accept-encoding': 'gzip', 'x-forwarded-for': '1.2.3.4', 'x-custom-header': 'drop-me', accept: 'application/json' });
   assert.equal(chat.status, 200);
   assert.equal(seen[0].url, '/v1/chat/completions');
-  assert.equal(seen[0].body.service_tier, undefined);
+  assert.equal(seen[0].body.reasoning_effort, 'high');
+  assert.equal(seen[0].body.service_tier, 'priority');
   assert.equal(seen[0].headers.authorization, 'Bearer relay-secret-token');
   assert.equal(seen[0].headers['x-goog-api-key'], undefined);
   assert.equal(seen[0].headers['openai-organization'], undefined);
@@ -224,36 +229,62 @@ test('relay enforces strict route/method/header/model allowlists, maps service_t
   assert.equal(seen[0].headers['x-custom-header'], undefined);
   assert.equal(seen[0].headers.accept, 'application/json');
 
-  // 3. /v1/messages under passthrough injects x-api-key, forwards anthropic-version, strips service_tier, parses `data:` without space & trailing line
-  const msg = await callSock('POST', '/v1/messages',
-    { model: 'gpt-5.3-codex', service_tier: 'priority', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
-    { 'anthropic-version': '2023-06-01' });
-  assert.equal(msg.status, 200);
-  assert.equal(seen[1].body.service_tier, undefined);
-  assert.equal(seen[1].headers['x-api-key'], 'relay-secret-token');
-  assert.equal(seen[1].headers['anthropic-version'], '2023-06-01');
-  assert.ok(events.some(e => e.type === 'model_identity' && e.response_id === 'msg-1'));
-
-  // 4. /v1/responses enforces host service_tier ('fast' -> 'priority'), overrides spoofed reasoning.effort ('low' -> 'high'), and enforces store:false
+  // 3. /v1/responses enforces host service_tier ('fast' -> 'priority'), overrides spoofed reasoning.effort ('low' -> 'high'), and enforces store:false
   const resp = await callSock('POST', '/v1/responses', { model: 'gpt-5.3-codex', input: 'hi', store: true, service_tier: 'flex', reasoning: { effort: 'low' } });
   assert.equal(resp.status, 200);
-  assert.equal(seen[2].body.store, false);
-  assert.equal(seen[2].body.service_tier, 'priority');
-  assert.equal(seen[2].body.reasoning.effort, 'high');
+  assert.equal(seen[1].body.store, false);
+  assert.equal(seen[1].body.service_tier, 'priority');
+  assert.equal(seen[1].body.reasoning.effort, 'high');
 
-  // 4b. /v1/responses/compact strips store and service_tier (does NOT inject store:false) and recognizes response.compaction
-  const compact = await callSock('POST', '/v1/responses/compact', { model: 'gpt-5.3-codex', input: 'hi', store: true, service_tier: 'priority' });
-  assert.equal(compact.status, 200);
-  assert.equal(seen[3].url, '/v1/responses/compact');
-  assert.equal('store' in seen[3].body, false);
-  assert.equal('service_tier' in seen[3].body, false);
-  assert.ok(events.some(e => e.type === 'model_usage' && e.usage.input_tokens === 15));
-
-  // 5. Large >48 MiB payload accepted under cf-2h preset (112 MiB cap)
+  // 4. Large >48 MiB payload accepted under cf-2h preset (112 MiB cap)
   const bigInput = 'a'.repeat(50 * 1024 * 1024);
   const bigResp = await callSock('POST', '/v1/responses', JSON.stringify({ model: 'gpt-5.3-codex', input: bigInput }));
   assert.equal(bigResp.status, 200);
-  assert.ok(seen[4].bodyLength > 50 * 1024 * 1024);
+  assert.ok(seen[2].bodyLength > 50 * 1024 * 1024);
+
+  // 4b. Unconfigured profile allows /v1/messages (injects x-api-key, strips service_tier, parses `data:` without space & trailing line),
+  //     /v1/responses/compact (no store/service_tier, recognizes response.compaction), and strips client reasoning_effort/service_tier on /chat/completions
+  const eventsPlain = [];
+  const plainClose = await serveContestChannels({
+    dir: join(dir, 'channels-plain'),
+    profile: { id: 'p-plain', harness: 'codex', api: 'passthrough', model: 'gpt-5.3-codex',
+      base_url: `http://127.0.0.1:${upstream.address().port}/v1`, api_key_env: 'OPENAI_API_KEY' },
+    key: 'relay-secret-token', signal: new AbortController().signal, maxTurns: 6, requestTimeoutMs: 10_000,
+    contest: { submit: () => ({ verdict: 'ok' }), status: () => ({}), close: () => {} },
+    event: e => eventsPlain.push(e), finish: () => {}, fault: () => {},
+  });
+  t.after(async () => { await plainClose(); });
+  const callPlain = (path, body, extraHeaders = {}) => new Promise((resolve, reject) => {
+    const req = httpRequest({ socketPath: join(dir, 'channels-plain', 'model.sock'), method: 'POST', path, headers: {
+      'content-type': 'application/json', ...extraHeaders,
+    } }, res => {
+      const chunks = []; res.on('data', c => chunks.push(c)); res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('error', reject);
+    req.end(JSON.stringify(body));
+  });
+  const msg = await callPlain('/v1/messages',
+    { model: 'gpt-5.3-codex', service_tier: 'priority', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    { 'anthropic-version': '2023-06-01' });
+  assert.equal(msg.status, 200);
+  assert.equal(seen[3].body.service_tier, undefined);
+  assert.equal(seen[3].headers['x-api-key'], 'relay-secret-token');
+  assert.equal(seen[3].headers['anthropic-version'], '2023-06-01');
+  assert.ok(eventsPlain.some(e => e.type === 'model_identity' && e.response_id === 'msg-1'));
+
+  const compact = await callPlain('/v1/responses/compact', { model: 'gpt-5.3-codex', input: 'hi', store: true, service_tier: 'priority' });
+  assert.equal(compact.status, 200);
+  assert.equal(seen[4].url, '/v1/responses/compact');
+  assert.equal('store' in seen[4].body, false);
+  assert.equal('service_tier' in seen[4].body, false);
+  assert.ok(eventsPlain.some(e => e.type === 'model_usage' && e.usage.input_tokens === 15));
+
+  const plainChat = await callPlain('/v1/chat/completions',
+    { model: 'gpt-5.3-codex', reasoning_effort: 'high', service_tier: 'priority', messages: [{ role: 'user', content: 'hi' }] });
+  assert.equal(plainChat.status, 200);
+  assert.equal('reasoning_effort' in seen[5].body, false);
+  assert.equal('service_tier' in seen[5].body, false);
+  await plainClose();
 
   // 6. Disconnect AFTER response.completed does NOT fault; disconnect BEFORE response.completed DOES fault
   faults.length = 0;
@@ -420,6 +451,74 @@ test('turn_limit immediately closes submissions, host strips unconfigured servic
   await ch4();
   assert.equal(truncatedRes.status, 'truncated');
   assert.deepEqual(truncatedRes.files, ['big.jsonl']);
+
+  // 5. stopInference() immediately aborts an in-flight upstream request without triggering model_request_failed while keeping session.sock open
+  let releaseHang = () => {};
+  let upstreamAborted = false;
+  const hangUpstream = createServer((req, res) => {
+    req.on('close', () => { upstreamAborted = true; });
+    void new Promise(resolve => { releaseHang = resolve; }).then(() => { if (!res.destroyed) res.end('{}'); });
+  });
+  await new Promise(resolve => hangUpstream.listen(0, '127.0.0.1', resolve));
+  t.after(async () => {
+    releaseHang();
+    hangUpstream.closeAllConnections();
+    await new Promise(resolve => hangUpstream.close(resolve));
+  });
+  const abortFaults = [];
+  let afterAbortSession;
+  const ch5 = await serveContestChannels({
+    dir: join(root, 'c5'),
+    profile: { id: 'p', harness: 'codex', api: 'responses', model: 'gpt-5.3-codex',
+      base_url: `http://127.0.0.1:${hangUpstream.address().port}/v1`, api_key_env: 'OPENAI_API_KEY' },
+    key: 'secret-key', signal: new AbortController().signal, requestTimeoutMs: 30_000,
+    sessionArchive: { dir: join(root, 's5'), onResult: r => { afterAbortSession = r; } },
+    contest: { submit: () => ({ verdict: 'ok' }), status: () => ({}), close: () => {} },
+    event: () => {}, finish: () => {}, fault: r => abortFaults.push(r),
+  });
+  const inflightPromise = new Promise(resolve => {
+    const req = httpRequest({ socketPath: join(root, 'c5', 'model.sock'), method: 'POST', path: '/v1/responses', headers: { 'content-type': 'application/json' } }, res => {
+      res.resume(); res.on('end', () => resolve(res.statusCode));
+    });
+    req.on('error', () => resolve('aborted'));
+    req.end(JSON.stringify({ model: 'gpt-5.3-codex', input: 'hang' }));
+  });
+  await new Promise(r => setTimeout(r, 40));
+  ch5.stopInference();
+  const inflightOutcome = await inflightPromise;
+  assert.ok(inflightOutcome === 502 || inflightOutcome === 'aborted');
+  await new Promise(r => setTimeout(r, 30));
+  assert.equal(upstreamAborted, true, 'stopInference() must abort the in-flight upstream request');
+  assert.deepEqual(abortFaults, [], 'stopInference() must not spuriously trigger model_request_failed');
+  // Session socket remains open after stopInference() so bridge.js can flush!
+  await new Promise((resolve, reject) => {
+    const sock = netConnect(join(root, 'c5', 'session.sock'), () => {
+      sock.write(JSON.stringify({ path: 'flush.jsonl', data_base64: Buffer.from('ok\n').toString('base64') }) + '\n');
+      sock.end(JSON.stringify({ done: true }) + '\n');
+    });
+    sock.resume(); sock.on('error', reject); sock.on('close', resolve);
+  });
+  await ch5();
+  assert.deepEqual(afterAbortSession, { status: 'archived', files: ['flush.jsonl'] });
+
+  // 6. Real bridge.ts streamSessions() with 257 files sends { done: true, truncated: true } -> receiver records 'truncated'
+  const manySrc = join(root, 'many-sessions');
+  await mkdir(manySrc, { recursive: true });
+  await Promise.all(Array.from({ length: 257 }, (_, i) => writeFile(join(manySrc, `f${String(i).padStart(3, '0')}.jsonl`), `{"i":${i}}\n`)));
+  let bridgeTruncRes;
+  const ch6 = await serveContestChannels({
+    dir: join(root, 'c6'),
+    profile: { id: 'p', harness: 'codex', api: 'responses', model: 'gpt-5.3-codex',
+      base_url: `http://127.0.0.1:${upstream.address().port}/v1`, api_key_env: 'OPENAI_API_KEY' },
+    key: 'secret-key', signal: new AbortController().signal,
+    sessionArchive: { dir: join(root, 's6'), onResult: r => { bridgeTruncRes = r; } },
+    contest: { submit: () => ({ verdict: 'ok' }), status: () => ({}), close: () => {} },
+    event: () => {}, finish: () => {}, fault: () => {},
+  });
+  await streamSessions(manySrc, join(root, 'c6', 'session.sock'), 5_000);
+  await ch6();
+  assert.equal(bridgeTruncRes.status, 'truncated');
+  assert.equal(bridgeTruncRes.files.length, 256);
 });
 
 test('result export omits raw answers/logs, merges by run and ranks Agent revisions', async t => {

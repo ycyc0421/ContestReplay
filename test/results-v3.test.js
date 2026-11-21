@@ -14,7 +14,7 @@ import { agentRevision, loadAgent, loadContest } from '../dist/config.js';
 import { Connections } from '../dist/connections.js';
 import { agentCatalog } from '../dist/catalog.js';
 import { makePlan, planSchema, verifyJob, verifyPlan } from '../dist/plan.js';
-import { enqueue, summarize } from '../dist/queue.js';
+import { dispatch, enqueue, listBatches, summarize } from '../dist/queue.js';
 import { archiveSessionDir } from '../dist/run.js';
 import {
   exportRun, mergeResults, rankResults, rankResultsGrouped, resultBundle, resultsSchema, scoreResult,
@@ -201,9 +201,25 @@ test('Agent name does not affect agent_revision or invalidate plans, while servi
   await writeFile(badProtoFile, JSON.stringify({ ...baseDoc, provider: 'anthropic-only', speed_tier: 'standard' }));
   await assert.rejects(loadAgent(badProtoFile, store), /requires a responses or passthrough provider/);
 
-  // Plan requires credential_source (old plans without credential_source are rejected by planSchema)
+  // Historical batches without credential_source remain readable and do NOT block dispatching a new batch,
+  // while attempting to verify/execute an old plan lacking credential_source is strictly rejected!
   const { credential_source: _missingCred, ...legacyJob } = lockedPlan.jobs[0];
-  assert.throws(() => planSchema.parse({ ...lockedPlan, jobs: [legacyJob] }));
+  const legacyPlanWithoutCred = planSchema.parse({ ...lockedPlan, jobs: [legacyJob] });
+  await assert.rejects(verifyPlan(legacyPlanWithoutCred, false, store), /credential source pinning; regenerate the plan/i);
+  const historyRoot = join(dir, 'history-runs');
+  await mkdir(join(historyRoot, '.batches'), { recursive: true });
+  const histId = randomUUID();
+  await writeFile(join(historyRoot, '.batches', `${histId}.json`), JSON.stringify({
+    schema_version: 1, id: histId, created_at: new Date().toISOString(),
+    plan: legacyPlanWithoutCred, jobs: [{ status: 'completed', run_id: randomUUID(), reason: 'finish' }],
+  }));
+  assert.equal((await listBatches(historyRoot)).length, 1);
+  const freshBatch = await enqueue(historyRoot, lockedPlan);
+  const ranFresh = await dispatch(historyRoot, freshBatch.id, new AbortController().signal, {
+    preflight: async () => {},
+    execute: async (_p, _j, opts) => ({ runId: opts.runId, directory: join(opts.out, opts.runId), status: 'completed', reason: 'finish' }),
+  });
+  assert.equal(ranFresh.jobs[0].status, 'completed');
 
   // Two agents with the same id & effective config but different speed_tier can coexist in one matrix and have distinct revisions
   const stdTierFile = join(dir, 'agent-std.json');
@@ -455,13 +471,22 @@ test('results.json v3 export collects telemetry/submissions, reads v1/v2/v3, sco
   assert.equal(nonPen.solved, 1);
   assert.equal(nonPen.penalty_minutes, 10);
 
-  // 2. CF scoring without explicit weights marks scoring_unavailable and NEVER outranks a rankable CF run (revision & Policy C!)
+  // 2. CF scoring without explicit weights OR with points_known === false marks scoring_unavailable and NEVER outranks a rankable CF run
   const cfLegacy = scoreResult(v2.results[0], 'cf');
   assert.equal(cfLegacy.scoring_unavailable, true);
   assert.equal(cfLegacy.points, 500);
   const cfLegacy100 = scoreResult({ ...v2.results[0], score: 100 }, 'cf');
   assert.equal(cfLegacy100.scoring_unavailable, true);
   assert.equal(cfLegacy100.points, 100);
+  const cfPlaceholderOnePt = scoreResult({
+    ...exported,
+    points_known: false,
+    score: 1,
+    max_score: 2,
+    submissions: [{ id: 's1', problem_id: 'A', elapsed_ms: 600_000, verdict: 'OK', max_points: 1, score: 1 }],
+  }, 'cf');
+  assert.equal(cfPlaceholderOnePt.scoring_unavailable, true);
+  assert.equal(cfPlaceholderOnePt.points, 1);
   const cfRankable480 = {
     ...exported,
     run_id: randomUUID(),
@@ -493,7 +518,7 @@ test('results.json v3 export collects telemetry/submissions, reads v1/v2/v3, sco
   assert.equal(cfModelRank[0].result.run_id, cfRankable480.run_id, 'Unrankable 500-pt variant must never displace rankable 480-pt primary');
   assert.equal(cfModelRank[0].variants.length, 2);
 
-  // 3. IOI partial-only scoring separates tie_break_ms from last_ac_ms, and missing partial score marks scoring_unavailable (never 40 instead of 100!)
+  // 3. IOI partial-only scoring separates tie_break_ms from last_ac_ms; missing partial score marks scoring_unavailable even when score === 0!
   assert.equal(ioi.tie_break_ms, 240_000);
   assert.equal(ioi.last_ac_ms, undefined);
   const ioiMissingPartialScore = {
@@ -511,6 +536,20 @@ test('results.json v3 export collects telemetry/submissions, reads v1/v2/v3, sco
   const ioiIncomplete = scoreResult(ioiMissingPartialScore, 'ioi');
   assert.equal(ioiIncomplete.scoring_unavailable, true);
   assert.equal(ioiIncomplete.points, 100);
+  const ioiZeroMissingPartial = {
+    ...exported,
+    run_id: randomUUID(),
+    agent_id: 'ioi-zero-incomplete',
+    agent_revision: 'f'.repeat(64),
+    score: 0,
+    max_score: 200,
+    submissions: [
+      { id: 's1', problem_id: 'A', elapsed_ms: 60_000, verdict: 'partial', max_points: 100 },
+    ],
+  };
+  assert.equal(scoreResult(ioiZeroMissingPartial, 'ioi').scoring_unavailable, true);
+  const ioiZeroOnlyRanked = rankResults(resultBundle([ioiZeroMissingPartial]), { scoring: 'ioi' })[0];
+  assert.equal(ioiZeroOnlyRanked[0].rank, null, 'Incomplete partial with score 0 must get rank: null, never rank: 1');
   const ioiRanked = rankResults(resultBundle([ioiMissingPartialScore, ioiSample]), { scoring: 'ioi' })[0];
   assert.equal(ioiRanked[0].rank, 1);
   assert.equal(ioiRanked[0].result.run_id, ioiSample.run_id);

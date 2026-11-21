@@ -168,6 +168,8 @@ export async function runBench(inputs: Inputs, opts: {
       judge: inputs.contest.judge.kind === 'local' ? inputs.contest.judge.answers.sha256 : undefined },
     contest_title: inputs.contest.title, contest_revision: inputs.contestRevision,
     problems: inputs.contest.problems.map(({ id, max_points }) => ({ id, max_points })),
+    ...(inputs.contest.judge.kind === 'codeforces' && inputs.contest.judge.points_known !== undefined
+      ? { points_known: inputs.contest.judge.points_known } : {}),
     protocol_id: inputs.profile.harness === 'codex' ? 'codex-pdf-pages-mcp' : protocol.id, protocol_version: 2,
     protocol_preset: presetName, scoring_mode: scoringMode,
     protocol_sha256: effectiveProtocolDigest, rules: inputs.contest.rules,

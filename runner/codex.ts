@@ -352,6 +352,7 @@ function createSessionReceiver(opts: {
         }
         if (frame.done === true) {
           await closeCurrentFile(true);
+          if (frame.truncated === true) truncated = true;
           sawDone = true;
           socket.end('{"ok":true}\n');
           return;
@@ -448,7 +449,9 @@ export async function serveContestChannels(opts: { dir: string; profile: Antigra
   const maxRequestBytes = opts.maxRequestBytes ?? relayMaxRequestBytes(protocol);
   await mkdir(dir, { mode: 0o755 });
   const stop = new AbortController();
+  const inferenceStop = new AbortController();
   const current = AbortSignal.any([stop.signal, signal]);
+  const inferenceSignal = AbortSignal.any([stop.signal, signal, inferenceStop.signal]);
   let calls = 0;
   let finished = false;
   let inFlight = false;
@@ -471,9 +474,10 @@ export async function serveContestChannels(opts: { dir: string; profile: Antigra
       reject(msg === 'Unsupported model endpoint' ? 404 : 400, msg);
       return;
     }
-    if (finished || current.aborted || inFlight) { reject(429, 'Model request already in flight or run closed'); return; }
+    if (finished || inferenceSignal.aborted || inFlight) { reject(429, 'Model request already in flight or run closed'); return; }
     if (calls >= maxTurns) {
       finished = true;
+      inferenceStop.abort();
       contest.close();
       opts.fault('turn_limit');
       reject(429, 'Run model request limit reached');
@@ -485,11 +489,11 @@ export async function serveContestChannels(opts: { dir: string; profile: Antigra
       let rawBody: Buffer;
       try { rawBody = await rawRequestBody(req, maxRequestBytes); }
       catch (error) {
-        if (current.aborted || finished) { reject(499, 'Run closed'); return; }
+        if (inferenceSignal.aborted || finished) { reject(499, 'Run closed'); return; }
         event({ type: 'model_request_rejected', reason: error instanceof Error ? error.message : 'Request too large' });
         opts.fault('invalid_model_request'); reject(400, 'Disallowed request'); return;
       }
-      if (current.aborted || finished) { reject(499, 'Run closed'); return; }
+      if (inferenceSignal.aborted || finished) { reject(499, 'Run closed'); return; }
       let parsedJson: Record<string, unknown>;
       try {
         const parsed: unknown = JSON.parse(rawBody.toString('utf8'));
@@ -502,12 +506,12 @@ export async function serveContestChannels(opts: { dir: string; profile: Antigra
       // Dispatch strictly by canonical route — never allow payload sniffing to switch validators.
       let checked: Record<string, unknown>;
       const isResponsesRoute = resolved.subpath === '/responses' || resolved.subpath === '/responses/compact';
+      const mappedServiceTier = responsesServiceTier(profile.service_tier);
       try {
         if (resolved.subpath === '/responses') {
           checked = checkModelRequest(parsedJson, profile.model);
           // Host enforces billing tier and configured reasoning effort; never let sandbox spoof them.
           delete checked.service_tier;
-          const mappedServiceTier = responsesServiceTier(profile.service_tier);
           if (mappedServiceTier) checked.service_tier = mappedServiceTier;
           if (profile.reasoning_effort) {
             const existing = checked.reasoning && typeof checked.reasoning === 'object' && !Array.isArray(checked.reasoning)
@@ -522,26 +526,38 @@ export async function serveContestChannels(opts: { dir: string; profile: Antigra
             checked.text = { ...(text && typeof text === 'object' && !Array.isArray(text) ? text : {}), verbosity };
           }
         } else if (resolved.subpath === '/responses/compact') {
+          if (mappedServiceTier) {
+            throw new Error('Route /responses/compact cannot enforce configured service_tier');
+          }
           checked = checkResponsesCompactRequest(parsedJson, profile.model);
           if (profile.reasoning_effort && checked.reasoning !== undefined) {
             const existing = checked.reasoning && typeof checked.reasoning === 'object' && !Array.isArray(checked.reasoning)
               ? checked.reasoning as Record<string, unknown> : {};
             checked.reasoning = { ...existing, effort: profile.reasoning_effort };
           }
+        } else if (resolved.subpath === '/chat/completions') {
+          checked = checkChatOrMessagesRequest(parsedJson, profile.model, '/chat/completions');
+          delete checked.service_tier;
+          if (mappedServiceTier) checked.service_tier = mappedServiceTier;
+          if (profile.reasoning_effort) checked.reasoning_effort = profile.reasoning_effort;
+          else delete checked.reasoning_effort;
         } else {
-          checked = checkChatOrMessagesRequest(parsedJson, profile.model, resolved.subpath);
+          if (profile.reasoning_effort || mappedServiceTier) {
+            throw new Error('Route /messages cannot enforce configured reasoning_effort or service_tier');
+          }
+          checked = checkChatOrMessagesRequest(parsedJson, profile.model, '/messages');
         }
       } catch (error) {
         event({ type: 'model_request_rejected', reason: error instanceof Error ? error.message : 'Disallowed request' });
         opts.fault('invalid_model_request'); reject(400, 'Disallowed request'); return;
       }
       const outgoingBody = Buffer.from(JSON.stringify(checked));
-      const reasoning = checked.reasoning ?? null;
+      const reasoning = checked.reasoning ?? checked.reasoning_effort ?? null;
       const turn = ++calls;
       event({ type: 'model_request', turn, method, path: resolved.subpath, model: profile.model, reasoning });
       const disconnected = new AbortController();
       res.once('close', () => { if (!res.writableFinished) disconnected.abort(); });
-      const requestSignal = AbortSignal.any([current, disconnected.signal, AbortSignal.timeout(requestTimeoutMs)]);
+      const requestSignal = AbortSignal.any([inferenceSignal, disconnected.signal, AbortSignal.timeout(requestTimeoutMs)]);
       const startedAt = performance.now();
       let completed = false;
       let ttftMs: number | undefined;
@@ -624,7 +640,7 @@ export async function serveContestChannels(opts: { dir: string; profile: Antigra
       } catch {
         const durationMs = Math.max(0, Math.round(performance.now() - startedAt));
         event({ type: 'model_timing', turn, method, path: resolved.subpath, status: upstreamStatus ?? null, ttft_ms: ttftMs ?? durationMs, duration_ms: durationMs });
-        if (!current.aborted && !finished && !(completed && disconnected.signal.aborted)) opts.fault('model_request_failed');
+        if (!inferenceSignal.aborted && !finished && !(completed && disconnected.signal.aborted)) opts.fault('model_request_failed');
         reject(502, 'Upstream transport failed');
       }
     })().finally(() => { inFlight = false; }).catch(() => res.destroy());
@@ -644,7 +660,7 @@ export async function serveContestChannels(opts: { dir: string; profile: Antigra
     });
     server.registerTool('status', { description: 'Read submission verdict or contest summary.', inputSchema: statusSchema }, ({ submission_id }) => reply(contest.status(submission_id)));
     server.registerTool('finish', { description: 'Close submissions and end the contest.', inputSchema: finishArgs }, () => {
-      finished = true; contest.close(); opts.finish(); return reply({ status: 'finished' });
+      finished = true; inferenceStop.abort(); contest.close(); opts.finish(); return reply({ status: 'finished' });
     });
     socket.once('close', () => { peers--; void server.close().catch(() => {}); });
     socket.on('error', () => {});
@@ -668,7 +684,7 @@ export async function serveContestChannels(opts: { dir: string; profile: Antigra
     for (const connection of connections) connection.destroy();
     await Promise.all(servers.map(server => new Promise<void>(resolve => server.close(() => resolve()))));
   }) as ContestChannelsHandle;
-  close.stopInference = () => { finished = true; };
+  close.stopInference = () => { finished = true; inferenceStop.abort(); };
   try {
     await listen(relay, join(dir, 'model.sock'));
     await listen(mcp, join(dir, 'mcp.sock'));
