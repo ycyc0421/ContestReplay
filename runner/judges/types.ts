@@ -5,7 +5,15 @@ import { isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
 import { parse } from 'parse5';
 import { z } from 'zod';
-import type { OjPlatform } from '../oj-accounts.js';
+import {
+  OjAccountError,
+  type OjAccount,
+  type OjAccounts,
+  type OjPlatform,
+  defaultOriginFor,
+  effectiveOriginFor,
+  submissionQueueKey,
+} from '../oj-accounts.js';
 
 export type NormalizedVerdict =
   | 'pending'
@@ -74,11 +82,18 @@ export type JudgeInfrastructureErrorCode =
   | 'identity_mismatch'
   | 'submitter_failed';
 
+export interface JudgeInfrastructureErrorDetails {
+  platform?: OjPlatform;
+  status?: number;
+  exitCode?: number | null;
+  signal?: string | null;
+}
+
 export class JudgeInfrastructureError extends Error {
   constructor(
     readonly code: JudgeInfrastructureErrorCode,
     message: string,
-    readonly details?: { platform?: OjPlatform; status?: number; cause?: unknown },
+    readonly details?: JudgeInfrastructureErrorDetails,
   ) {
     super(message);
     this.name = 'JudgeInfrastructureError';
@@ -103,6 +118,7 @@ export const defaultExecFile: ExecFileLike = async (file, args, options) => {
 export function normalizeVerdict(raw: string, score?: number, maxScore?: number): NormalizedVerdict {
   const normalized = raw.trim().toLowerCase().replace(/[\s-]+/g, '_');
 
+  // 1. Pending / in-flight verdicts
   if (
     !normalized ||
     normalized === 'pending' ||
@@ -123,15 +139,45 @@ export function normalizeVerdict(raw: string, score?: number, maxScore?: number)
     return 'pending';
   }
 
+  // 2. Infrastructure / judge error verdicts MUST take precedence over wrong_answer or partial scores
+  if (
+    normalized === 'je' ||
+    normalized === 'se' ||
+    normalized === 'uke' ||
+    normalized === 'judge_error' ||
+    normalized === 'judgement_failed' ||
+    normalized === 'judgment_failed' ||
+    normalized === 'judge_failed' ||
+    normalized === 'crawling_failed' ||
+    normalized === 'system_error' ||
+    normalized === 'unknown_error' ||
+    normalized === 'submit_failed' ||
+    normalized === 'remote_oj_unavailable' ||
+    normalized === 'sync_error' ||
+    normalized === 'crashed' ||
+    normalized === 'input_preparation_crashed' ||
+    normalized === 'failed' ||
+    normalized === 'denial_of_judgement' ||
+    normalized === 'denial_of_judgment' ||
+    normalized === 'security_violated'
+  ) {
+    return 'judge_error';
+  }
+
+  // 3. Accepted (never classify as accepted if score is strictly less than maxScore)
   if (
     normalized === 'ok' ||
     normalized === 'ac' ||
     normalized === 'accepted' ||
     normalized === 'happy_new_year!'
   ) {
+    if (score !== undefined && maxScore !== undefined && maxScore > 0 && score < maxScore) {
+      return score > 0 ? 'partial' : 'wrong_answer';
+    }
     return 'accepted';
   }
 
+  // 4. Explicit partial
   if (
     normalized === 'partial' ||
     normalized === 'partially_accepted' ||
@@ -141,49 +187,7 @@ export function normalizeVerdict(raw: string, score?: number, maxScore?: number)
     return 'partial';
   }
 
-  if (
-    normalized === 'wa' ||
-    normalized === 'wrong_answer' ||
-    normalized === 'incorrect' ||
-    normalized === 'rejected' ||
-    normalized === 'failed' ||
-    normalized === 'hacked' ||
-    normalized === 'challenged'
-  ) {
-    if (score !== undefined && score > 0 && (maxScore === undefined || score < maxScore)) {
-      return 'partial';
-    }
-    return 'wrong_answer';
-  }
-
-  if (normalized === 'tle' || normalized === 'time_limit_exceeded' || normalized === 'time_limit') {
-    if (score !== undefined && score > 0 && (maxScore === undefined || score < maxScore)) {
-      return 'partial';
-    }
-    return 'time_limit_exceeded';
-  }
-
-  if (normalized === 'mle' || normalized === 'memory_limit_exceeded' || normalized === 'memory_limit') {
-    if (score !== undefined && score > 0 && (maxScore === undefined || score < maxScore)) {
-      return 'partial';
-    }
-    return 'memory_limit_exceeded';
-  }
-
-  if (
-    normalized === 're' ||
-    normalized === 'rte' ||
-    normalized === 'runtime_error' ||
-    normalized === 'dangerous_syscalls' ||
-    normalized === 'output_limit_exceeded' ||
-    normalized === 'ole'
-  ) {
-    if (score !== undefined && score > 0 && (maxScore === undefined || score < maxScore)) {
-      return 'partial';
-    }
-    return 'runtime_error';
-  }
-
+  // 5. Compilation / presentation / idleness
   if (
     normalized === 'ce' ||
     normalized === 'compile_error' ||
@@ -201,21 +205,37 @@ export function normalizeVerdict(raw: string, score?: number, maxScore?: number)
     return 'idleness_limit_exceeded';
   }
 
+  // 6. Wrong answer / TLE / MLE / RE (upgrade to partial when positive score < maxScore)
+  const isPartialScore = score !== undefined && score > 0 && (maxScore === undefined || score < maxScore);
+
   if (
-    normalized === 'je' ||
-    normalized === 'se' ||
-    normalized === 'uke' ||
-    normalized === 'judge_error' ||
-    normalized === 'judgement_failed' ||
-    normalized === 'judgment_failed' ||
-    normalized === 'system_error' ||
-    normalized === 'unknown_error' ||
-    normalized === 'submit_failed' ||
-    normalized === 'remote_oj_unavailable' ||
-    normalized === 'sync_error' ||
-    normalized === 'crashed'
+    normalized === 'wa' ||
+    normalized === 'wrong_answer' ||
+    normalized === 'incorrect' ||
+    normalized === 'rejected' ||
+    normalized === 'hacked' ||
+    normalized === 'challenged'
   ) {
-    return 'judge_error';
+    return isPartialScore ? 'partial' : 'wrong_answer';
+  }
+
+  if (normalized === 'tle' || normalized === 'time_limit_exceeded' || normalized === 'time_limit') {
+    return isPartialScore ? 'partial' : 'time_limit_exceeded';
+  }
+
+  if (normalized === 'mle' || normalized === 'memory_limit_exceeded' || normalized === 'memory_limit') {
+    return isPartialScore ? 'partial' : 'memory_limit_exceeded';
+  }
+
+  if (
+    normalized === 're' ||
+    normalized === 'rte' ||
+    normalized === 'runtime_error' ||
+    normalized === 'dangerous_syscalls' ||
+    normalized === 'output_limit_exceeded' ||
+    normalized === 'ole'
+  ) {
+    return isPartialScore ? 'partial' : 'runtime_error';
   }
 
   if (score !== undefined && maxScore !== undefined && maxScore > 0) {
@@ -266,7 +286,12 @@ export function mergeSetCookies(session: Map<string, string>, headers: Headers):
   }
 }
 
-export function validateOriginUrl(raw: string, platform: OjPlatform): string {
+export interface ValidatedEndpoint {
+  baseUrl: string;
+  origin: string;
+}
+
+export function resolveBaseUrl(raw: string, platform: OjPlatform): ValidatedEndpoint {
   let u: URL;
   try {
     u = new URL(raw);
@@ -287,7 +312,228 @@ export function validateOriginUrl(raw: string, platform: OjPlatform): string {
       { platform },
     );
   }
-  return u.href.replace(/\/+$/, '');
+  return {
+    baseUrl: u.href.replace(/\/+$/, ''),
+    origin: u.origin,
+  };
+}
+
+export function validateOriginUrl(raw: string, platform: OjPlatform): string {
+  return resolveBaseUrl(raw, platform).baseUrl;
+}
+
+export function safeParseJson(
+  text: string,
+  platform: OjPlatform,
+  context: string,
+  code: JudgeInfrastructureErrorCode = 'upstream_unavailable',
+): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw new JudgeInfrastructureError(code, `${platform} ${context} returned invalid JSON`, { platform });
+  }
+}
+
+export async function safeResponseJson(
+  response: Response,
+  platform: OjPlatform,
+  context: string,
+  code: JudgeInfrastructureErrorCode = 'upstream_unavailable',
+): Promise<unknown> {
+  let text: string;
+  try {
+    text = await response.text();
+  } catch {
+    throw new JudgeInfrastructureError(code, `${platform} ${context} response stream failed`, {
+      platform,
+      status: response.status,
+    });
+  }
+  return safeParseJson(text, platform, context, code);
+}
+
+export interface ResolvedAdapterTransport {
+  mode: 'cookie' | 'submitter';
+  handle: string;
+  cookie?: string;
+  executable?: string;
+  accountId?: string;
+  queueKey: string;
+}
+
+export interface AdapterTransportDeps {
+  accounts?: OjAccounts;
+  account?: OjAccount;
+  cookie?: string;
+  executable?: string;
+}
+
+const ENV_PREFIX_FOR_PLATFORM: Record<OjPlatform, string> = {
+  codeforces: 'CODEFORCES',
+  qoj: 'QOJ',
+  vjudge: 'VJUDGE',
+  hydro: 'HYDRO',
+};
+
+/**
+ * Shared transport resolver for all OJ adapters.
+ * Guarantees:
+ * - Origin & platform binding checked BEFORE any credential is read or released.
+ * - `deps.account` works for BOTH `'cookie'` and `'submitter'` accounts without silently falling back to env vars.
+ * - Environment cookie fallbacks (`CR_<PLATFORM>_COOKIE`) require `CR_<PLATFORM>_BASE_URL` approval for non-default origins.
+ * - Never swallows `OjAccountError` or `JudgeInfrastructureError`.
+ */
+export async function resolveAdapterTransport(input: {
+  platform: OjPlatform;
+  baseUrl: string;
+  origin: string;
+  configHandle?: string;
+  configAccountId?: string;
+  deps: AdapterTransportDeps;
+}): Promise<ResolvedAdapterTransport> {
+  const { platform, baseUrl, origin, configHandle, configAccountId, deps } = input;
+  const defaultOrigin = defaultOriginFor(platform);
+
+  // 1. Explicit pool-leased account takes precedence over raw env fallbacks
+  if (deps.account) {
+    const account = deps.account;
+    if (account.platform !== platform) {
+      throw new JudgeInfrastructureError(
+        'auth_expired',
+        `OJ account ${account.id} belongs to ${account.platform}, not ${platform}`,
+        { platform },
+      );
+    }
+    const boundOrigin = effectiveOriginFor(account);
+    if (!boundOrigin || boundOrigin !== origin) {
+      throw new JudgeInfrastructureError(
+        'auth_expired',
+        `OJ account ${account.id} origin does not match target ${platform} origin`,
+        { platform },
+      );
+    }
+    const handle = account.handle;
+    const queueKey = submissionQueueKey(platform, origin, handle);
+    if (account.transport === 'submitter') {
+      const executable = deps.executable ?? account.executable_path;
+      if (!executable) {
+        throw new JudgeInfrastructureError('submitter_failed', `${platform} submitter account missing executable_path`, {
+          platform,
+        });
+      }
+      return { mode: 'submitter', executable, handle, accountId: account.id, queueKey };
+    }
+    // Cookie transport on leased account: prefer explicit deps.cookie, else resolve from OjAccounts with origin binding.
+    if (deps.cookie) {
+      return { mode: 'cookie', cookie: deps.cookie, handle, accountId: account.id, queueKey };
+    }
+    if (!deps.accounts) {
+      throw new JudgeInfrastructureError(
+        'auth_expired',
+        `Cookie OJ account ${account.id} requires OjAccounts store to resolve secret`,
+        { platform },
+      );
+    }
+    try {
+      const secret = await deps.accounts.resolveSecret(account.id, { platform, origin });
+      return { mode: 'cookie', cookie: secret, handle, accountId: account.id, queueKey };
+    } catch (err) {
+      if (err instanceof OjAccountError) {
+        throw new JudgeInfrastructureError('auth_expired', err.message, { platform, status: err.status });
+      }
+      throw err;
+    }
+  }
+
+  // 2. Account ID resolved atomically from OjAccounts (single read + platform/origin binding)
+  if (configAccountId) {
+    if (!deps.accounts) {
+      throw new JudgeInfrastructureError(
+        'auth_expired',
+        `${platform} account_id "${configAccountId}" requires OjAccounts store`,
+        { platform },
+      );
+    }
+    try {
+      const resolved = await deps.accounts.resolveAccountTransport(configAccountId, { platform, origin });
+      const handle = resolved.account.handle;
+      const queueKey = submissionQueueKey(platform, origin, handle);
+      if (resolved.account.transport === 'submitter') {
+        const executable = deps.executable ?? resolved.executable_path;
+        if (!executable) {
+          throw new JudgeInfrastructureError('submitter_failed', `${platform} submitter account missing executable_path`, {
+            platform,
+          });
+        }
+        return { mode: 'submitter', executable, handle, accountId: resolved.account.id, queueKey };
+      }
+      return {
+        mode: 'cookie',
+        cookie: deps.cookie ?? resolved.secret!,
+        handle,
+        accountId: resolved.account.id,
+        queueKey,
+      };
+    } catch (err) {
+      if (err instanceof OjAccountError) {
+        throw new JudgeInfrastructureError(
+          err.status === 503 && err.message.includes('submitter') ? 'submitter_failed' : 'auth_expired',
+          err.message,
+          { platform, status: err.status },
+        );
+      }
+      throw err;
+    }
+  }
+
+  const handle = configHandle?.trim();
+  if (!handle) {
+    throw new JudgeInfrastructureError('auth_expired', `${platform} judge requires handle or account_id`, { platform });
+  }
+  const queueKey = submissionQueueKey(platform, origin, handle);
+
+  // 3. Direct injected executable or cookie (for tests / explicit caller wiring)
+  if (deps.executable) {
+    return { mode: 'submitter', executable: deps.executable, handle, queueKey };
+  }
+  if (deps.cookie) {
+    return { mode: 'cookie', cookie: deps.cookie, handle, queueKey };
+  }
+
+  // 4. Environment fallbacks with explicit origin approval for non-default origins
+  const envPrefix = ENV_PREFIX_FOR_PLATFORM[platform];
+  const envExec = process.env[`CR_${envPrefix}_SUBMITTER`]?.trim();
+  if (envExec) {
+    return { mode: 'submitter', executable: envExec, handle, queueKey };
+  }
+  const envCookie = process.env[`CR_${envPrefix}_COOKIE`]?.trim();
+  if (envCookie) {
+    const approvedEnvBase = process.env[`CR_${envPrefix}_BASE_URL`]?.trim();
+    const isDefaultOrigin = defaultOrigin !== undefined && origin === defaultOrigin;
+    if (!isDefaultOrigin) {
+      let approvedOrigin: string | undefined;
+      if (approvedEnvBase) {
+        try {
+          approvedOrigin = resolveBaseUrl(approvedEnvBase, platform).origin;
+        } catch {
+          approvedOrigin = undefined;
+        }
+      }
+      if (!approvedOrigin || approvedOrigin !== origin) {
+        throw new JudgeInfrastructureError(
+          'auth_expired',
+          `Approve ${baseUrl} via CR_${envPrefix}_BASE_URL before sending CR_${envPrefix}_COOKIE to a non-default origin`,
+          { platform },
+        );
+      }
+    }
+    return { mode: 'cookie', cookie: envCookie, handle, queueKey };
+  }
+
+  throw new JudgeInfrastructureError('auth_expired', `No ${platform} OJ account, cookie, or submitter configured`, {
+    platform,
+  });
 }
 
 const submitterOutputSchema = z.strictObject({
@@ -296,6 +542,22 @@ const submitterOutputSchema = z.strictObject({
     z.string().trim().min(1).max(128),
   ]),
 });
+
+const ALLOWLISTED_HOST_ENV_KEYS = ['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'NODE_ENV'] as const;
+
+function buildMinimalSubmitterEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of ALLOWLISTED_HOST_ENV_KEYS) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  if (extra) {
+    for (const [k, v] of Object.entries(extra)) {
+      env[k] = v;
+    }
+  }
+  return env;
+}
 
 export async function runExternalSubmitter(input: {
   platform: OjPlatform;
@@ -324,20 +586,19 @@ export async function runExternalSubmitter(input: {
       signal: input.signal,
       timeout: input.timeoutMs ?? 30_000,
       maxBuffer: 16_384,
-      env: {
-        ...process.env,
+      env: buildMinimalSubmitterEnv({
         CR_SOURCE_FILE: file,
         ...(input.env ?? {}),
-      },
+      }),
     });
     let parsed: unknown;
     try {
       parsed = JSON.parse(stdout);
-    } catch (cause) {
+    } catch {
       throw new JudgeInfrastructureError(
         'submitter_failed',
         `${input.platform} submitter returned invalid JSON`,
-        { platform: input.platform, cause },
+        { platform: input.platform },
       );
     }
     const result = submitterOutputSchema.safeParse(parsed);
@@ -351,10 +612,15 @@ export async function runExternalSubmitter(input: {
     return result.data.submission_id;
   } catch (err) {
     if (err instanceof JudgeInfrastructureError) throw err;
+    if (input.signal.aborted) throw err;
+    const rawErr = err as { code?: number | string | null; signal?: string | null };
+    const exitCode = typeof rawErr?.code === 'number' ? rawErr.code : null;
+    const sig = typeof rawErr?.signal === 'string' ? rawErr.signal : null;
+    // Never include err.message / stderr in error message or details (may contain credentials/source).
     throw new JudgeInfrastructureError(
       'submitter_failed',
-      `${input.platform} submitter failed: ${err instanceof Error ? err.message : String(err)}`,
-      { platform: input.platform, cause: err },
+      `${input.platform} external submitter failed`,
+      { platform: input.platform, exitCode, signal: sig },
     );
   } finally {
     await rm(dir, { recursive: true, force: true });

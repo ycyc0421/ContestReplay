@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { constants } from 'node:fs';
-import { access, link, lstat, mkdir, open, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { access, link, lstat, mkdir, open, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { z } from 'zod';
@@ -27,6 +27,30 @@ export const ojExecutablePath = z.string().trim().min(1).max(4096).refine(
 export const ojSecretSchema = z.string().trim().min(1).max(16_384).regex(/^[\x20-\x7e]+$/);
 
 const isoTimestamp = z.iso.datetime();
+
+export function defaultOriginFor(platform: OjPlatform): string | undefined {
+  switch (platform) {
+    case 'codeforces':
+      return 'https://codeforces.com';
+    case 'qoj':
+      return 'https://qoj.ac';
+    case 'vjudge':
+      return 'https://vjudge.net';
+    case 'hydro':
+      return undefined;
+  }
+}
+
+export function effectiveOriginFor(account: { platform: OjPlatform; base_url?: string; approved_origin?: string }): string | undefined {
+  if (account.approved_origin) return account.approved_origin;
+  if (account.base_url) return new URL(account.base_url).origin;
+  return defaultOriginFor(account.platform);
+}
+
+export function submissionQueueKey(platform: OjPlatform, origin: string, handle: string): string {
+  const normalizedOrigin = new URL(origin).origin;
+  return `${platform}:${normalizedOrigin}:${handle.trim().toLowerCase()}`;
+}
 
 const storedOjAccountSchema = z.strictObject({
   id: ojAccountId,
@@ -129,6 +153,17 @@ export type PatchOjAccountInput = z.infer<typeof patchOjAccountSchema>;
 export type RotateOjAccountInput = z.infer<typeof rotateOjAccountSchema>;
 export type OjAccount = z.infer<typeof ojAccountResponseSchema>;
 
+export interface ExpectedAccountBinding {
+  platform: OjPlatform;
+  origin: string;
+}
+
+export interface ResolvedAccountTransport {
+  account: OjAccount;
+  secret?: string;
+  executable_path?: string;
+}
+
 export class OjAccountError extends Error {
   constructor(message: string, readonly status = 400) {
     super(message);
@@ -154,6 +189,28 @@ function toPublic(value: StoredOjAccount, ready: boolean): OjAccount {
     created_at: value.created_at,
     updated_at: value.updated_at,
   };
+}
+
+function assertAccountBinding(value: StoredOjAccount, expected: ExpectedAccountBinding) {
+  if (value.platform !== expected.platform) {
+    throw new OjAccountError(
+      `OJ account ${value.id} belongs to platform "${value.platform}", expected "${expected.platform}"`,
+      409,
+    );
+  }
+  const boundOrigin = effectiveOriginFor(value);
+  let expectedOrigin: string;
+  try {
+    expectedOrigin = new URL(expected.origin).origin;
+  } catch {
+    throw new OjAccountError('Invalid expected origin for OJ account binding', 400);
+  }
+  if (!boundOrigin || boundOrigin !== expectedOrigin) {
+    throw new OjAccountError(
+      `OJ account ${value.id} is bound to a different origin; refusing to release credential`,
+      409,
+    );
+  }
 }
 
 function checkPublicMetadata(
@@ -321,9 +378,11 @@ export class OjAccounts {
     if (value.transport === 'submitter') {
       if (!value.executable_path) return false;
       try {
+        // Use stat() (following symlinks) so a symlink to a directory is rejected.
+        const info = await stat(value.executable_path);
+        if (!info.isFile()) return false;
         await access(value.executable_path, constants.X_OK);
-        const info = await lstat(value.executable_path);
-        return info.isFile() || info.isSymbolicLink();
+        return true;
       } catch {
         return false;
       }
@@ -391,8 +450,14 @@ export class OjAccounts {
     return all.filter(acc => acc.platform === platform && (pool === undefined || acc.pool === pool));
   }
 
-  async resolveSecret(id: string): Promise<string> {
+  /**
+   * Host-only secret lookup bound to the caller's target platform and origin.
+   * Reads the stored account record once and validates platform + approved origin
+   * before touching or returning the stored credential.
+   */
+  async resolveSecret(id: string, expected: ExpectedAccountBinding): Promise<string> {
     const value = await this.stored(id);
+    assertAccountBinding(value, expected);
     if (value.transport !== 'cookie') {
       throw new OjAccountError('OJ account uses submitter transport, not a stored cookie secret', 400);
     }
@@ -402,6 +467,30 @@ export class OjAccounts {
       if (error instanceof OjAccountError && error.status === 400) throw error;
       throw new OjAccountError('OJ account credential unavailable; rotate it to restore access', 503);
     }
+  }
+
+  /**
+   * Atomically read an OJ account record once, validate its platform and origin
+   * binding, and resolve either its cookie secret or executable submitter path.
+   */
+  async resolveAccountTransport(id: string, expected: ExpectedAccountBinding): Promise<ResolvedAccountTransport> {
+    const value = await this.stored(id);
+    assertAccountBinding(value, expected);
+    if (value.transport === 'cookie') {
+      let secret: string;
+      try {
+        secret = await this.readSecret(value);
+      } catch (error) {
+        if (error instanceof OjAccountError && error.status === 400) throw error;
+        throw new OjAccountError('OJ account credential unavailable; rotate it to restore access', 503);
+      }
+      return { account: toPublic(value, true), secret };
+    }
+    const ready = await this.checkReady(value);
+    if (!ready || !value.executable_path) {
+      throw new OjAccountError('OJ account submitter executable is not accessible', 503);
+    }
+    return { account: toPublic(value, true), executable_path: value.executable_path };
   }
 
   create(rawInput: CreateOjAccountInput): Promise<OjAccount> {
@@ -569,6 +658,8 @@ export interface OjAccountPoolStatus {
 interface PoolWaiter {
   platform: OjPlatform;
   selector: OjAccountSelector;
+  signal?: AbortSignal;
+  settled: boolean;
   resolve: (lease: OjAccountLease) => void;
   reject: (err: unknown) => void;
   cleanup: () => void;
@@ -586,9 +677,10 @@ function abortError(signal: AbortSignal): Error {
  * Resource pool and per-account submission serializer for OJ accounts.
  *
  * - `acquire` leases an exclusive account from a platform/pool (or explicit IDs),
- *   queuing callers until one becomes available or `signal` aborts.
- * - `enqueueSubmission` strictly serializes submission writes per account ID so
- *   concurrent operations sharing an account never race on submission ID correlation.
+ *   queuing callers in FIFO order until one becomes available or `signal` aborts.
+ * - `enqueueSubmission` strictly serializes submission writes per serialization key
+ *   (account ID or canonical `platform:origin:handle`) so concurrent operations
+ *   never race on submission ID correlation.
  */
 export class OjAccountPool {
   private readonly busyIds = new Set<string>();
@@ -596,6 +688,8 @@ export class OjAccountPool {
   private readonly submissionChains = new Map<string, Promise<void>>();
   private readonly store?: OjAccounts;
   private readonly staticAccounts?: OjAccount[];
+  private dispatching = false;
+  private drainNeeded = false;
 
   constructor(source: OjAccounts | OjAccount[]) {
     if (Array.isArray(source)) {
@@ -616,6 +710,11 @@ export class OjAccountPool {
     });
   }
 
+  private removeWaiter(waiter: PoolWaiter): void {
+    const idx = this.waiters.indexOf(waiter);
+    if (idx !== -1) this.waiters.splice(idx, 1);
+  }
+
   private makeLease(account: OjAccount): OjAccountLease {
     let released = false;
     return {
@@ -624,34 +723,89 @@ export class OjAccountPool {
         if (released) return;
         released = true;
         this.busyIds.delete(account.id);
-        void this.dispatchWaiters();
+        this.scheduleDispatch();
       },
     };
   }
 
-  private async dispatchWaiters(): Promise<void> {
-    if (!this.waiters.length) return;
-    // Snapshot and try to satisfy waiters in FIFO order.
-    let i = 0;
-    while (i < this.waiters.length) {
-      const waiter = this.waiters[i]!;
+  private scheduleDispatch(): void {
+    if (this.dispatching) {
+      this.drainNeeded = true;
+      return;
+    }
+    this.dispatching = true;
+    void (async () => {
+      try {
+        do {
+          this.drainNeeded = false;
+          await this.drainWaitersOnce();
+        } while (this.drainNeeded);
+      } finally {
+        this.dispatching = false;
+      }
+    })();
+  }
+
+  private async drainWaitersOnce(): Promise<void> {
+    const snapshot = [...this.waiters];
+    for (const waiter of snapshot) {
+      if (waiter.settled) {
+        this.removeWaiter(waiter);
+        continue;
+      }
+      if (waiter.signal?.aborted) {
+        waiter.settled = true;
+        this.removeWaiter(waiter);
+        waiter.cleanup();
+        waiter.reject(abortError(waiter.signal));
+        continue;
+      }
+
       let candidates: OjAccount[];
       try {
         candidates = await this.resolveCandidates(waiter.platform, waiter.selector);
       } catch (err) {
-        this.waiters.splice(i, 1);
+        if (waiter.settled) continue;
+        waiter.settled = true;
+        this.removeWaiter(waiter);
         waiter.cleanup();
         waiter.reject(err);
         continue;
       }
+
+      // Re-check settled & abort status after async await to prevent lease leaks.
+      if (waiter.settled) {
+        this.removeWaiter(waiter);
+        continue;
+      }
+      if (waiter.signal?.aborted) {
+        waiter.settled = true;
+        this.removeWaiter(waiter);
+        waiter.cleanup();
+        waiter.reject(abortError(waiter.signal));
+        continue;
+      }
+
+      if (!candidates.length) {
+        waiter.settled = true;
+        this.removeWaiter(waiter);
+        waiter.cleanup();
+        waiter.reject(
+          new OjAccountError(
+            `No ready ${waiter.platform} OJ accounts available${waiter.selector.pool ? ` in pool "${waiter.selector.pool}"` : ''}`,
+            503,
+          ),
+        );
+        continue;
+      }
+
       const free = candidates.find(acc => !this.busyIds.has(acc.id));
       if (free) {
-        this.waiters.splice(i, 1);
+        waiter.settled = true;
+        this.removeWaiter(waiter);
         waiter.cleanup();
         this.busyIds.add(free.id);
         waiter.resolve(this.makeLease(free));
-      } else {
-        i++;
       }
     }
   }
@@ -664,6 +818,8 @@ export class OjAccountPool {
     if (signal?.aborted) throw abortError(signal);
 
     const candidates = await this.resolveCandidates(platform, selector);
+    if (signal?.aborted) throw abortError(signal);
+
     if (!candidates.length) {
       throw new OjAccountError(
         `No ready ${platform} OJ accounts available${selector.pool ? ` in pool "${selector.pool}"` : ''}`,
@@ -671,21 +827,27 @@ export class OjAccountPool {
       );
     }
 
+    // Only allow fast-path acquisition when no existing waiters are queued and no drain is running,
+    // preserving strict FIFO fairness and preventing lease starvation.
     const free = candidates.find(acc => !this.busyIds.has(acc.id));
-    if (free) {
+    if (free && this.waiters.length === 0 && !this.dispatching) {
       this.busyIds.add(free.id);
       return this.makeLease(free);
     }
 
     return new Promise<OjAccountLease>((resolvePromise, rejectPromise) => {
       const onAbort = () => {
-        const idx = this.waiters.indexOf(waiter);
-        if (idx !== -1) this.waiters.splice(idx, 1);
+        if (waiter.settled) return;
+        waiter.settled = true;
+        this.removeWaiter(waiter);
+        waiter.cleanup();
         rejectPromise(abortError(signal!));
       };
       const waiter: PoolWaiter = {
         platform,
         selector,
+        signal,
+        settled: false,
         resolve: resolvePromise,
         reject: rejectPromise,
         cleanup: () => {
@@ -694,39 +856,43 @@ export class OjAccountPool {
       };
       if (signal) {
         if (signal.aborted) {
+          waiter.settled = true;
           rejectPromise(abortError(signal));
           return;
         }
         signal.addEventListener('abort', onAbort, { once: true });
       }
       this.waiters.push(waiter);
+      if (free || !this.dispatching) {
+        this.scheduleDispatch();
+      }
     });
   }
 
   /**
-   * Strictly serialize submission writes per account ID.
-   * If `signal` aborts while waiting in line, the caller rejects immediately
+   * Strictly serialize submission writes per key (e.g. `submissionQueueKey(platform, origin, handle)`
+   * or account ID). If `signal` aborts while waiting in line, the caller rejects immediately
    * without invoking `fn`, and later callers in the chain continue cleanly.
    */
   enqueueSubmission<T>(
-    accountId: string,
+    key: string,
     fn: (signal?: AbortSignal) => Promise<T>,
     signal?: AbortSignal,
   ): Promise<T> {
     if (signal?.aborted) return Promise.reject(abortError(signal));
 
-    const prev = this.submissionChains.get(accountId) ?? Promise.resolve();
+    const prev = this.submissionChains.get(key) ?? Promise.resolve();
     let releaseTurn!: () => void;
     const currentTurn = new Promise<void>(resolveTurn => {
       releaseTurn = resolveTurn;
     });
     const nextChain = prev.then(() => currentTurn);
-    this.submissionChains.set(accountId, nextChain);
+    this.submissionChains.set(key, nextChain);
 
     const cleanupChain = () => {
       releaseTurn();
-      if (this.submissionChains.get(accountId) === nextChain) {
-        this.submissionChains.delete(accountId);
+      if (this.submissionChains.get(key) === nextChain) {
+        this.submissionChains.delete(key);
       }
     };
 
@@ -779,9 +945,15 @@ export class OjAccountPool {
     for (const id of this.busyIds) {
       if (matchingIds.has(id)) busy++;
     }
-    const queued = this.waiters.filter(
-      w => (platform === undefined || w.platform === platform) && (pool === undefined || w.selector.pool === pool),
-    ).length;
+    const queued = this.waiters.filter(w => {
+      if (w.settled) return false;
+      if (platform !== undefined && w.platform !== platform) return false;
+      if (pool === undefined) return true;
+      if (w.selector.accountIds) {
+        return w.selector.accountIds.some(id => matchingIds.has(id));
+      }
+      return w.selector.pool === undefined || w.selector.pool === pool;
+    }).length;
     return {
       total: matching.length,
       busy,

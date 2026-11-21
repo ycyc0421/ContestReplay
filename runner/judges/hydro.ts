@@ -14,9 +14,11 @@ import {
   mergeSetCookies,
   normalizeVerdict,
   parseCookieHeader,
+  resolveAdapterTransport,
+  resolveBaseUrl,
   runExternalSubmitter,
+  safeResponseJson,
   serializeCookieHeader,
-  validateOriginUrl,
 } from './types.js';
 
 export const HYDRO_DEFAULT_SETTLEMENT_MS = 120_000;
@@ -43,7 +45,7 @@ export const HYDRO_LANGUAGE_PRESETS: LanguagePreset[] = [
  *   7: STATUS_COMPILE_ERROR
  *   8: STATUS_SYSTEM_ERROR
  *   9: STATUS_CANCELED
- *  10: STATUS_ETC
+ *  10: STATUS_ETC / Unknown Error
  *  11: STATUS_HACKED
  *  20: STATUS_JUDGING
  *  21: STATUS_COMPILING
@@ -91,6 +93,9 @@ export function mapHydroStatus(
     case HYDRO_STATUS.FETCHED:
       return { verdict: 'pending', raw: 'FETCHED' };
     case HYDRO_STATUS.ACCEPTED:
+      if (score !== undefined && maxScore !== undefined && maxScore > 0 && score < maxScore) {
+        return { verdict: score > 0 ? 'partial' : 'wrong_answer', raw: 'ACCEPTED' };
+      }
       return { verdict: 'accepted', raw: 'ACCEPTED' };
     case HYDRO_STATUS.WRONG_ANSWER:
       return { verdict: hasPartialScore ? 'partial' : 'wrong_answer', raw: 'WRONG_ANSWER' };
@@ -108,12 +113,15 @@ export function mapHydroStatus(
       return { verdict: 'judge_error', raw: 'SYSTEM_ERROR', infraError: true };
     case HYDRO_STATUS.CANCELED:
       return { verdict: 'judge_error', raw: 'CANCELED', infraError: true };
+    case HYDRO_STATUS.ETC:
+      // Hydro status 10 ("Unknown Error") is a judge/infrastructure failure, never a valid contestant verdict.
+      return { verdict: 'judge_error', raw: 'UNKNOWN_ERROR', infraError: true };
     case HYDRO_STATUS.HACKED:
       return { verdict: 'wrong_answer', raw: 'HACKED' };
     case HYDRO_STATUS.IGNORED:
       return { verdict: 'other', raw: 'IGNORED' };
     default:
-      return { verdict: hasPartialScore ? 'partial' : 'other', raw: `STATUS_${status}` };
+      return { verdict: 'judge_error', raw: `STATUS_${status}`, infraError: true };
   }
 }
 
@@ -157,7 +165,13 @@ const hydroRecordSchema = z.object({
 const hydroRecordEnvelopeSchema = z.object({
   rdoc: hydroRecordSchema.optional(),
   record: hydroRecordSchema.optional(),
-  pdoc: z.object({ pid: z.union([z.string(), z.number()]).optional(), docId: z.union([z.string(), z.number()]).optional(), maxScore: z.number().optional() }).optional(),
+  pdoc: z
+    .object({
+      pid: z.union([z.string(), z.number()]).optional(),
+      docId: z.union([z.string(), z.number()]).optional(),
+      maxScore: z.number().optional(),
+    })
+    .optional(),
   udoc: z.object({ uname: z.string().optional() }).optional(),
   error: z.object({ message: z.string().optional(), name: z.string().optional() }).optional(),
 });
@@ -194,7 +208,7 @@ export async function previewHydroContest(
   contestId: string,
   opts: { baseUrl: string; domain?: string; cookie?: string; fetchImpl?: FetchLike; signal?: AbortSignal },
 ): Promise<ContestPreview> {
-  const origin = validateOriginUrl(opts.baseUrl, 'hydro');
+  const { baseUrl } = resolveBaseUrl(opts.baseUrl, 'hydro');
   const fetchImpl = opts.fetchImpl ?? fetch;
   const signal = AbortSignal.any([AbortSignal.timeout(15_000), ...(opts.signal ? [opts.signal] : [])]);
   const headers: Record<string, string> = { accept: 'application/json' };
@@ -202,20 +216,30 @@ export async function previewHydroContest(
     headers.cookie = serializeCookieHeader(parseCookieHeader(opts.cookie, 'hydro'));
   }
 
-  const url = `${origin}${domainPrefix(opts.domain)}/contest/${encodeURIComponent(contestId)}`;
+  const url = `${baseUrl}${domainPrefix(opts.domain)}/contest/${encodeURIComponent(contestId)}`;
   let response: Response;
   try {
     response = await fetchImpl(url, { headers, redirect: 'manual', signal });
-  } catch (cause) {
-    if (opts.signal?.aborted) throw cause;
+  } catch (err) {
+    if (opts.signal?.aborted) throw err;
     throw new JudgeInfrastructureError('upstream_unavailable', 'Hydro contest preview request failed', {
       platform: 'hydro',
-      cause,
     });
   }
-  if (!response.ok) throw classifyHttpError(response.status, 'contest preview');
+  if (response.status >= 300 && response.status < 400) {
+    await response.body?.cancel();
+    throw new JudgeInfrastructureError('auth_expired', 'Hydro redirected contest preview request', {
+      platform: 'hydro',
+      status: response.status,
+    });
+  }
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw classifyHttpError(response.status, 'contest preview');
+  }
 
-  const parsed = hydroContestPreviewSchema.safeParse(await response.json());
+  const rawJson = await safeResponseJson(response, 'hydro', 'contest preview');
+  const parsed = hydroContestPreviewSchema.safeParse(rawJson);
   if (!parsed.success) {
     throw new JudgeInfrastructureError('upstream_unavailable', 'Unexpected Hydro contest JSON payload', {
       platform: 'hydro',
@@ -259,7 +283,12 @@ export interface HydroJudgeConfig {
   base_url: string;
   domain?: string;
   contest_id?: string;
-  handle: string;
+  /**
+   * Replay defaults to Hydro practice submission (`/p/<pid>/submit`).
+   * Set `live_contest: true` with `contest_id` only when submitting inside an active Hydro contest (`?tid=<contest_id>`).
+   */
+  live_contest?: boolean;
+  handle?: string;
   languages: Record<string, string>;
   problem_map?: Record<string, string>;
   account_id?: string;
@@ -277,7 +306,7 @@ export interface HydroJudgeDeps {
 }
 
 export function createHydroJudge(config: HydroJudgeConfig, deps: HydroJudgeDeps = {}): ProgramJudge {
-  const origin = validateOriginUrl(config.base_url, 'hydro');
+  const { baseUrl, origin } = resolveBaseUrl(config.base_url, 'hydro');
   const fetchImpl = deps.fetchImpl ?? fetch;
   const settlementMs = config.settlement_ms ?? HYDRO_DEFAULT_SETTLEMENT_MS;
   const prefix = domainPrefix(config.domain);
@@ -285,57 +314,14 @@ export function createHydroJudge(config: HydroJudgeConfig, deps: HydroJudgeDeps 
   const targetFor = (problem: string) =>
     Object.hasOwn(config.problem_map ?? {}, problem) ? config.problem_map![problem]! : problem;
 
-  async function resolveTransport(): Promise<
-    { mode: 'submitter'; executable: string; handle: string; accountId?: string } |
-    { mode: 'cookie'; cookie: string; handle: string; accountId?: string }
-  > {
-    if (deps.executable) {
-      return { mode: 'submitter', executable: deps.executable, handle: config.handle, accountId: config.account_id };
-    }
-    if (deps.cookie) {
-      return { mode: 'cookie', cookie: deps.cookie, handle: config.handle, accountId: config.account_id };
-    }
-    if (config.account_id && deps.accounts) {
-      const account = await deps.accounts.get(config.account_id);
-      if (account.platform !== 'hydro') {
-        throw new JudgeInfrastructureError('auth_expired', `OJ account ${account.id} is not a Hydro account`, {
-          platform: 'hydro',
-        });
-      }
-      if (account.base_url && new URL(account.base_url).origin !== new URL(origin).origin) {
-        throw new JudgeInfrastructureError('auth_expired', 'Hydro account origin does not match judge base_url', {
-          platform: 'hydro',
-        });
-      }
-      if (account.transport === 'submitter') {
-        if (!account.executable_path) {
-          throw new JudgeInfrastructureError('submitter_failed', 'Hydro submitter account has no executable_path', {
-            platform: 'hydro',
-          });
-        }
-        return { mode: 'submitter', executable: account.executable_path, handle: account.handle, accountId: account.id };
-      }
-      const secret = await deps.accounts.resolveSecret(account.id);
-      return { mode: 'cookie', cookie: secret, handle: account.handle, accountId: account.id };
-    }
-    if (deps.account?.transport === 'submitter' && deps.account.executable_path) {
-      return {
-        mode: 'submitter',
-        executable: deps.account.executable_path,
-        handle: deps.account.handle,
-        accountId: deps.account.id,
-      };
-    }
-    const envExec = process.env.CR_HYDRO_SUBMITTER?.trim();
-    if (envExec) {
-      return { mode: 'submitter', executable: envExec, handle: config.handle, accountId: config.account_id };
-    }
-    const envCookie = process.env.CR_HYDRO_COOKIE?.trim();
-    if (envCookie) {
-      return { mode: 'cookie', cookie: envCookie, handle: config.handle, accountId: config.account_id };
-    }
-    throw new JudgeInfrastructureError('auth_expired', 'No Hydro OJ account, cookie, or submitter configured', {
+  function resolveTransport() {
+    return resolveAdapterTransport({
       platform: 'hydro',
+      baseUrl,
+      origin,
+      configHandle: config.handle,
+      configAccountId: config.account_id,
+      deps,
     });
   }
 
@@ -348,9 +334,12 @@ export function createHydroJudge(config: HydroJudgeConfig, deps: HydroJudgeDeps 
   ): Promise<string> {
     const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(30_000)]);
     const session = parseCookieHeader(cookie, 'hydro');
-    const submitUrl = config.contest_id
-      ? `${origin}${prefix}/contest/${encodeURIComponent(config.contest_id)}/p/${encodeURIComponent(remoteProblemId)}/submit`
-      : `${origin}${prefix}/p/${encodeURIComponent(remoteProblemId)}/submit`;
+    // Real Hydro submit endpoint: /p/<pid>/submit (practice by default; attach ?tid=<contest_id> only for explicit live contests).
+    const baseSubmitPath = `${baseUrl}${prefix}/p/${encodeURIComponent(remoteProblemId)}/submit`;
+    const submitUrl =
+      config.live_contest && config.contest_id
+        ? `${baseSubmitPath}?tid=${encodeURIComponent(config.contest_id)}`
+        : baseSubmitPath;
 
     let response: Response;
     try {
@@ -367,17 +356,16 @@ export function createHydroJudge(config: HydroJudgeConfig, deps: HydroJudgeDeps 
         redirect: 'manual',
         signal: requestSignal,
       });
-    } catch (cause) {
-      if (signal.aborted) throw cause;
+    } catch (err) {
+      if (signal.aborted) throw err;
       throw new JudgeInfrastructureError('submission_unconfirmed', 'Hydro submit POST failed; will not retry', {
         platform: 'hydro',
-        cause,
       });
     }
 
     const location = response.headers.get('location');
     if (location && response.status >= 300 && response.status < 400) {
-      const targetUrl = new URL(location, origin);
+      const targetUrl = new URL(location, submitUrl);
       if (targetUrl.origin === origin) {
         const ridMatch = targetUrl.pathname.match(/\/record\/([A-Za-z0-9_-]+)\/?$/);
         if (ridMatch?.[1]) {
@@ -386,27 +374,43 @@ export function createHydroJudge(config: HydroJudgeConfig, deps: HydroJudgeDeps 
         }
       }
       await response.body?.cancel();
-      throw new JudgeInfrastructureError('auth_expired', `Unexpected Hydro submit redirect: ${location}`, {
+      throw new JudgeInfrastructureError('auth_expired', 'Unexpected Hydro submit redirect', {
         platform: 'hydro',
         status: response.status,
       });
     }
 
-    if (!response.ok) throw classifyHttpError(response.status, 'submit');
+    if (response.status === 401 || response.status === 403 || response.status === 429) {
+      await response.body?.cancel();
+      throw classifyHttpError(response.status, 'submit');
+    }
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new JudgeInfrastructureError(
+        'submission_unconfirmed',
+        `Hydro submit POST returned HTTP ${response.status}; will not retry`,
+        { platform: 'hydro', status: response.status },
+      );
+    }
     mergeSetCookies(session, response.headers);
 
-    const parsed = hydroSubmitResponseSchema.safeParse(await response.json());
+    const rawJson = await safeResponseJson(response, 'hydro', 'submit response', 'submission_unconfirmed');
+    const parsed = hydroSubmitResponseSchema.safeParse(rawJson);
     if (!parsed.success) {
       throw new JudgeInfrastructureError('submission_unconfirmed', 'Hydro submit returned invalid JSON payload', {
         platform: 'hydro',
       });
     }
     if (parsed.data.error) {
-      const msg = parsed.data.error.message ?? parsed.data.error.name ?? 'unknown error';
+      const msg = parsed.data.error.message ?? parsed.data.error.name ?? '';
       if (/login|permission|privilege|unauthorized/i.test(msg)) {
-        throw new JudgeInfrastructureError('auth_expired', `Hydro submit auth error: ${msg}`, { platform: 'hydro' });
+        throw new JudgeInfrastructureError('auth_expired', 'Hydro submit rejected due to authentication/permissions', {
+          platform: 'hydro',
+        });
       }
-      throw new JudgeInfrastructureError('submission_unconfirmed', `Hydro submit error: ${msg}`, { platform: 'hydro' });
+      throw new JudgeInfrastructureError('submission_unconfirmed', 'Hydro submit rejected', {
+        platform: 'hydro',
+      });
     }
     const rid = parsed.data.rid ?? parsed.data.id;
     if (rid !== undefined) return String(rid);
@@ -435,11 +439,11 @@ export function createHydroJudge(config: HydroJudgeConfig, deps: HydroJudgeDeps 
         if (transport.mode === 'submitter') {
           return runExternalSubmitter({
             platform: 'hydro',
-            executable: transport.executable,
+            executable: transport.executable!,
             args: [
-              origin,
+              baseUrl,
               config.domain ?? 'system',
-              config.contest_id ?? 'none',
+              config.live_contest && config.contest_id ? config.contest_id : 'none',
               remoteProblemId,
               remoteLang,
               '__SOURCE_FILE__',
@@ -448,9 +452,9 @@ export function createHydroJudge(config: HydroJudgeConfig, deps: HydroJudgeDeps 
             source,
             env: {
               CR_OJ_PLATFORM: 'hydro',
-              CR_HYDRO_BASE_URL: origin,
+              CR_HYDRO_BASE_URL: baseUrl,
               CR_HYDRO_DOMAIN: config.domain ?? 'system',
-              CR_HYDRO_CONTEST_ID: config.contest_id ?? '',
+              CR_HYDRO_CONTEST_ID: config.live_contest && config.contest_id ? config.contest_id : '',
               CR_HYDRO_PROBLEM: remoteProblemId,
               CR_HYDRO_LANGUAGE: remoteLang,
               CR_HYDRO_HANDLE: transport.handle,
@@ -459,95 +463,111 @@ export function createHydroJudge(config: HydroJudgeConfig, deps: HydroJudgeDeps 
             execImpl: deps.execImpl,
           });
         }
-        return submitViaCookie(remoteProblemId, remoteLang, source, transport.cookie, signal);
+        return submitViaCookie(remoteProblemId, remoteLang, source, transport.cookie!, signal);
       };
 
-      const serializationKey = transport.accountId ?? `hydro:${origin}:${transport.handle.toLowerCase()}`;
       if (deps.pool) {
-        return deps.pool.enqueueSubmission(serializationKey, execute, signal);
+        return deps.pool.enqueueSubmission(transport.queueKey, execute, signal);
       }
       return execute();
     },
 
     async verdicts(ids, problems, signal) {
       if (!ids.length) return new Map();
-      const transport = await resolveTransport().catch(() => undefined);
+      const transport = await resolveTransport();
       const headers: Record<string, string> = { accept: 'application/json' };
-      if (transport?.mode === 'cookie') {
-        headers.cookie = serializeCookieHeader(parseCookieHeader(transport.cookie, 'hydro'));
+      if (transport.mode === 'cookie') {
+        headers.cookie = serializeCookieHeader(parseCookieHeader(transport.cookie!, 'hydro'));
       }
-      const handle = transport?.handle ?? config.handle;
+      const handle = transport.handle;
       const result = new Map<string, JudgeVerdict>();
 
       for (const id of ids) {
         const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(15_000)]);
-        const url = `${origin}${prefix}/record/${encodeURIComponent(id)}`;
+        const url = `${baseUrl}${prefix}/record/${encodeURIComponent(id)}`;
         let resp: Response;
         try {
           resp = await fetchImpl(url, { headers, redirect: 'manual', signal: requestSignal });
-        } catch (cause) {
-          if (signal.aborted) throw cause;
+        } catch (err) {
+          if (signal.aborted) throw err;
           throw new JudgeInfrastructureError('upstream_unavailable', `Hydro record fetch failed for ${id}`, {
             platform: 'hydro',
-            cause,
           });
         }
         if (resp.status >= 300 && resp.status < 400) {
+          await resp.body?.cancel();
           throw new JudgeInfrastructureError('auth_expired', `Hydro redirected record fetch for ${id}`, {
             platform: 'hydro',
             status: resp.status,
           });
         }
-        if (!resp.ok) throw classifyHttpError(resp.status, `record ${id}`);
+        if (!resp.ok) {
+          await resp.body?.cancel();
+          throw classifyHttpError(resp.status, `record ${id}`);
+        }
 
-        const rawJson = await resp.json();
+        const rawJson = await safeResponseJson(resp, 'hydro', `record ${id}`);
         const envelope = hydroRecordEnvelopeSchema.safeParse(rawJson);
-        const directRecord = envelope.success && (envelope.data.rdoc || envelope.data.record)
-          ? (envelope.data.rdoc ?? envelope.data.record)!
-          : hydroRecordSchema.safeParse(rawJson).data;
-
         if (envelope.success && envelope.data.error) {
-          const msg = envelope.data.error.message ?? envelope.data.error.name ?? 'unknown error';
-          throw new JudgeInfrastructureError('upstream_unavailable', `Hydro record error for ${id}: ${msg}`, {
+          throw new JudgeInfrastructureError('upstream_unavailable', `Hydro record lookup error for ${id}`, {
             platform: 'hydro',
           });
         }
+        const directRecord =
+          envelope.success && (envelope.data.rdoc || envelope.data.record)
+            ? (envelope.data.rdoc ?? envelope.data.record)!
+            : hydroRecordSchema.safeParse(rawJson).data;
+
         if (!directRecord) {
           throw new JudgeInfrastructureError('upstream_unavailable', `Invalid Hydro record payload for ${id}`, {
             platform: 'hydro',
           });
         }
 
+        // Fail closed: verify record ID, submitter username, and target problem (public pid or numeric docId).
+        const returnedId = directRecord._id ?? directRecord.id;
+        if (returnedId === undefined || String(returnedId) !== id) {
+          throw new JudgeInfrastructureError('identity_mismatch', `Hydro record ID mismatch for ${id}`, {
+            platform: 'hydro',
+          });
+        }
+
         const remoteUser = directRecord.uname ?? (envelope.success ? envelope.data.udoc?.uname : undefined);
-        if (remoteUser && remoteUser.toLowerCase() !== handle.toLowerCase()) {
-          throw new JudgeInfrastructureError('identity_mismatch', `Hydro record ${id} submitter mismatch`, {
+        if (!remoteUser || remoteUser.toLowerCase() !== handle.toLowerCase()) {
+          throw new JudgeInfrastructureError('identity_mismatch', `Hydro record ${id} missing or mismatched submitter`, {
             platform: 'hydro',
           });
         }
 
         const localProblem = problems.get(id);
-        const remotePid =
-          directRecord.pid !== undefined
-            ? String(directRecord.pid)
-            : envelope.success && envelope.data.pdoc?.pid !== undefined
-              ? String(envelope.data.pdoc.pid)
-              : undefined;
-        if (localProblem && remotePid && remotePid !== targetFor(localProblem)) {
-          throw new JudgeInfrastructureError('identity_mismatch', `Hydro record ${id} problem mismatch`, {
-            platform: 'hydro',
-          });
+        if (localProblem) {
+          const expected = targetFor(localProblem);
+          const candidatePids = new Set<string>();
+          if (envelope.success && envelope.data.pdoc?.pid !== undefined) {
+            candidatePids.add(String(envelope.data.pdoc.pid));
+          }
+          if (envelope.success && envelope.data.pdoc?.docId !== undefined) {
+            candidatePids.add(String(envelope.data.pdoc.docId));
+          }
+          if (directRecord.pid !== undefined) {
+            candidatePids.add(String(directRecord.pid));
+          }
+          if (!candidatePids.size || !candidatePids.has(expected)) {
+            throw new JudgeInfrastructureError('identity_mismatch', `Hydro record ${id} missing or mismatched problem`, {
+              platform: 'hydro',
+            });
+          }
         }
 
         const score = directRecord.score;
-        const maxScore = directRecord.maxScore ?? (envelope.success ? envelope.data.pdoc?.maxScore : undefined) ?? 100;
+        // Never fabricate a hardcoded 100 cap when Hydro omits maxScore (IOI tasks can exceed 100 points).
+        const maxScore = directRecord.maxScore ?? (envelope.success ? envelope.data.pdoc?.maxScore : undefined);
         const mapped = mapHydroStatus(directRecord.status, score, maxScore);
 
         if (mapped.infraError) {
-          throw new JudgeInfrastructureError(
-            'upstream_unavailable',
-            `Hydro reported ${mapped.raw} for record ${id}`,
-            { platform: 'hydro' },
-          );
+          throw new JudgeInfrastructureError('upstream_unavailable', `Hydro reported ${mapped.raw} for record ${id}`, {
+            platform: 'hydro',
+          });
         }
 
         if (isFinalVerdict(mapped.verdict)) {
@@ -556,7 +576,7 @@ export function createHydroJudge(config: HydroJudgeConfig, deps: HydroJudgeDeps 
             verdict: mapped.verdict,
             raw_verdict: mapped.raw,
             ...(score !== undefined ? { score } : {}),
-            ...(score !== undefined ? { max_score: maxScore } : {}),
+            ...(maxScore !== undefined ? { max_score: maxScore } : {}),
             ...(directRecord.time !== undefined ? { time_ms: Math.round(directRecord.time) } : {}),
             ...(directRecord.memory !== undefined ? { memory_kb: Math.round(directRecord.memory) } : {}),
             final: true,

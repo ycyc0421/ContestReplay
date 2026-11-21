@@ -16,9 +16,11 @@ import {
   normalizeVerdict,
   parseCookieHeader,
   parseHtmlNodes,
+  resolveAdapterTransport,
+  resolveBaseUrl,
   runExternalSubmitter,
+  safeParseJson,
   serializeCookieHeader,
-  validateOriginUrl,
 } from './types.js';
 
 export const VJUDGE_DEFAULT_ORIGIN = 'https://vjudge.net';
@@ -38,15 +40,33 @@ export interface UpstreamProblemRef {
   probNum: string;
 }
 
+const KNOWN_HYPHENATED_OJS = [
+  'E-Olymp',
+  '2050-OJ',
+  'Hiho-Coder',
+  'Open-Judge',
+  'AC-Coder',
+];
+
 /**
  * Parse an upstream problem reference like "CodeForces-1234A", "QOJ-1420",
- * "AtCoder-abc300_a", or "SPOJ-TEST".
+ * "AtCoder-abc300_a", "Kattis-two-sum", or hyphenated OJ names like "E-Olymp-1234".
  */
 export function parseUpstreamProblemRef(ref: string): UpstreamProblemRef {
   const trimmed = ref.trim();
+  const lower = trimmed.toLowerCase();
+  for (const ojName of KNOWN_HYPHENATED_OJS) {
+    const prefix = `${ojName.toLowerCase()}-`;
+    if (lower.startsWith(prefix) && trimmed.length > prefix.length) {
+      return {
+        oj: trimmed.slice(0, ojName.length),
+        probNum: trimmed.slice(ojName.length + 1).trim(),
+      };
+    }
+  }
   const dash = trimmed.indexOf('-');
   if (dash <= 0 || dash === trimmed.length - 1) {
-    throw new Error(`Invalid VJudge upstream problem reference "${ref}" (expected "<OJ>-<ProblemID>")`);
+    throw new Error(`Invalid VJudge upstream problem reference (expected "<OJ>-<ProblemID>")`);
   }
   return {
     oj: trimmed.slice(0, dash).trim(),
@@ -76,29 +96,29 @@ function classifyHttpError(status: number, context: string): JudgeInfrastructure
 function detectVjudgeInfraFault(message: string, statusCode?: number): JudgeInfrastructureError | null {
   const lower = message.toLowerCase();
   if (/captcha|recaptcha|turnstile|verification code|verify you are human/.test(lower)) {
-    return new JudgeInfrastructureError('captcha_required', `VJudge requires captcha: ${message}`, {
+    return new JudgeInfrastructureError('captcha_required', 'VJudge requires captcha verification', {
       platform: 'vjudge',
       status: statusCode,
     });
   }
   if (/not logged in|please login|login required|session expired|unauthorized|sign in/.test(lower)) {
-    return new JudgeInfrastructureError('auth_expired', `VJudge authentication required: ${message}`, {
+    return new JudgeInfrastructureError('auth_expired', 'VJudge authentication required or session expired', {
       platform: 'vjudge',
       status: statusCode,
     });
   }
   if (/too frequent|rate limit|try again later|too many/.test(lower)) {
-    return new JudgeInfrastructureError('rate_limited', `VJudge rate limited: ${message}`, {
+    return new JudgeInfrastructureError('rate_limited', 'VJudge rate limit exceeded', {
       platform: 'vjudge',
       status: statusCode,
     });
   }
   if (
-    /submit failed|remote oj unavailable|sync error|upstream unavailable|cannot connect to remote|judge error|system error|judgement failed/.test(
+    /submit failed|remote oj unavailable|sync error|upstream unavailable|cannot connect to remote|judge error|judge failed|judgement failed|judgment failed|crawling failed|system error|unknown error|denial of/.test(
       lower,
     )
   ) {
-    return new JudgeInfrastructureError('upstream_unavailable', `VJudge infrastructure fault: ${message}`, {
+    return new JudgeInfrastructureError('upstream_unavailable', 'VJudge reported an upstream infrastructure fault', {
       platform: 'vjudge',
       status: statusCode,
     });
@@ -127,6 +147,7 @@ const vjudgeSolutionResponseSchema = z.object({
   username: z.string().optional(),
   oj: z.string().optional(),
   probNum: z.string().optional(),
+  contestId: z.union([z.number().int(), z.string()]).optional(),
   contestNum: z.string().optional(),
   error: z.string().optional(),
   captcha: z.boolean().optional(),
@@ -148,30 +169,65 @@ const vjudgeContestJsonSchema = z.object({
   ),
 });
 
+function normalizeEpochMs(ts: number): number {
+  // Handle Unix seconds (< 1e12) vs milliseconds (>= 1e12)
+  return ts < 1_000_000_000_000 ? ts * 1000 : ts;
+}
+
+async function fetchSameOriginManual(
+  url: string,
+  origin: string,
+  fetchImpl: FetchLike,
+  signal: AbortSignal,
+): Promise<Response> {
+  let current = url;
+  for (let hops = 0; hops < 3; hops++) {
+    let response: Response;
+    try {
+      response = await fetchImpl(current, { redirect: 'manual', signal });
+    } catch (err) {
+      if (signal.aborted) throw err;
+      throw new JudgeInfrastructureError('upstream_unavailable', 'VJudge HTTP request failed', { platform: 'vjudge' });
+    }
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      await response.body?.cancel();
+      if (!location) {
+        throw new JudgeInfrastructureError('upstream_unavailable', 'VJudge redirect missing location header', {
+          platform: 'vjudge',
+          status: response.status,
+        });
+      }
+      const next = new URL(location, current);
+      if (next.origin !== origin) {
+        throw new JudgeInfrastructureError('upstream_unavailable', 'VJudge redirected across origins', {
+          platform: 'vjudge',
+          status: response.status,
+        });
+      }
+      current = next.href;
+      continue;
+    }
+    return response;
+  }
+  throw new JudgeInfrastructureError('upstream_unavailable', 'VJudge exceeded redirect limit', { platform: 'vjudge' });
+}
+
 export async function previewVjudgeContest(
   contestId: number | string,
   opts?: { baseUrl?: string; fetchImpl?: FetchLike; signal?: AbortSignal },
 ): Promise<ContestPreview> {
   const cleanId = String(contestId).replace(/^vjudge:/i, '').trim();
   if (!/^\d+$/.test(cleanId)) {
-    throw new JudgeInfrastructureError('upstream_unavailable', `Invalid VJudge contest ID: ${contestId}`, {
+    throw new JudgeInfrastructureError('upstream_unavailable', 'Invalid VJudge contest ID', {
       platform: 'vjudge',
     });
   }
-  const origin = validateOriginUrl(opts?.baseUrl ?? VJUDGE_DEFAULT_ORIGIN, 'vjudge');
+  const { baseUrl, origin } = resolveBaseUrl(opts?.baseUrl ?? VJUDGE_DEFAULT_ORIGIN, 'vjudge');
   const fetchImpl = opts?.fetchImpl ?? fetch;
   const signal = AbortSignal.any([AbortSignal.timeout(15_000), ...(opts?.signal ? [opts.signal] : [])]);
 
-  let response: Response;
-  try {
-    response = await fetchImpl(`${origin}/contest/${cleanId}`, { redirect: 'follow', signal });
-  } catch (cause) {
-    if (opts?.signal?.aborted) throw cause;
-    throw new JudgeInfrastructureError('upstream_unavailable', 'VJudge contest preview request failed', {
-      platform: 'vjudge',
-      cause,
-    });
-  }
+  const response = await fetchSameOriginManual(`${baseUrl}/contest/${encodeURIComponent(cleanId)}`, origin, fetchImpl, signal);
   if (!response.ok) throw classifyHttpError(response.status, 'contest preview');
 
   const body = await response.text();
@@ -179,15 +235,14 @@ export async function previewVjudgeContest(
   let jsonCandidate: unknown;
 
   if (contentType.includes('application/json') || body.trim().startsWith('{')) {
-    jsonCandidate = JSON.parse(body);
+    jsonCandidate = safeParseJson(body, 'vjudge', 'contest preview');
   } else {
-    // VJudge embeds contest JSON inside <textarea name="dataJson">...</textarea>
     const nodes = parseHtmlNodes(body);
     const dataTextarea = nodes.find(
       n => n.tagName === 'textarea' && (htmlAttr(n, 'name') === 'dataJson' || htmlAttr(n, 'id') === 'dataJson'),
     );
     if (dataTextarea) {
-      jsonCandidate = JSON.parse(htmlText(dataTextarea));
+      jsonCandidate = safeParseJson(htmlText(dataTextarea), 'vjudge', 'contest dataJson');
     }
   }
 
@@ -202,8 +257,10 @@ export async function previewVjudgeContest(
   const now = Date.now();
   let status: ContestPreview['status'] = 'unknown';
   if (data.end !== undefined) {
-    if (now > data.end) status = 'finished';
-    else if (data.begin === undefined || now >= data.begin) status = 'active';
+    const endMs = normalizeEpochMs(data.end);
+    const beginMs = data.begin !== undefined ? normalizeEpochMs(data.begin) : undefined;
+    if (now > endMs) status = 'finished';
+    else if (beginMs === undefined || now >= beginMs) status = 'active';
   }
 
   const problems: ContestPreviewProblem[] = data.problems.map(p => ({
@@ -227,7 +284,7 @@ export async function previewVjudgeContest(
 export interface VjudgeJudgeConfig {
   /** Present for VJudge Contest mode; omit for direct/mixed upstream problem mode. */
   contest_id?: number | string;
-  handle: string;
+  handle?: string;
   languages: Record<string, string>;
   /**
    * In contest mode: maps local problem ID -> contest index (e.g. "A", "B").
@@ -237,8 +294,6 @@ export interface VjudgeJudgeConfig {
   account_id?: string;
   base_url?: string;
   settlement_ms?: number;
-  /** Optional contest password if required by a private VJudge contest. */
-  contest_password?: string;
 }
 
 export interface VjudgeJudgeDeps {
@@ -252,59 +307,23 @@ export interface VjudgeJudgeDeps {
 }
 
 export function createVjudgeJudge(config: VjudgeJudgeConfig, deps: VjudgeJudgeDeps = {}): ProgramJudge {
-  const origin = validateOriginUrl(config.base_url ?? VJUDGE_DEFAULT_ORIGIN, 'vjudge');
+  const { baseUrl, origin } = resolveBaseUrl(config.base_url ?? VJUDGE_DEFAULT_ORIGIN, 'vjudge');
   const fetchImpl = deps.fetchImpl ?? fetch;
   const settlementMs = config.settlement_ms ?? VJUDGE_DEFAULT_SETTLEMENT_MS;
+  const normalizedContestId =
+    config.contest_id !== undefined ? String(config.contest_id).replace(/^vjudge:/i, '').trim() : undefined;
 
   const targetFor = (problem: string) =>
     Object.hasOwn(config.problem_map ?? {}, problem) ? config.problem_map![problem]! : problem;
 
-  async function resolveTransport(): Promise<
-    { mode: 'submitter'; executable: string; handle: string; accountId?: string } |
-    { mode: 'cookie'; cookie: string; handle: string; accountId?: string }
-  > {
-    if (deps.executable) {
-      return { mode: 'submitter', executable: deps.executable, handle: config.handle, accountId: config.account_id };
-    }
-    if (deps.cookie) {
-      return { mode: 'cookie', cookie: deps.cookie, handle: config.handle, accountId: config.account_id };
-    }
-    if (config.account_id && deps.accounts) {
-      const account = await deps.accounts.get(config.account_id);
-      if (account.platform !== 'vjudge') {
-        throw new JudgeInfrastructureError('auth_expired', `OJ account ${account.id} is not a VJudge account`, {
-          platform: 'vjudge',
-        });
-      }
-      if (account.transport === 'submitter') {
-        if (!account.executable_path) {
-          throw new JudgeInfrastructureError('submitter_failed', 'VJudge submitter account has no executable_path', {
-            platform: 'vjudge',
-          });
-        }
-        return { mode: 'submitter', executable: account.executable_path, handle: account.handle, accountId: account.id };
-      }
-      const secret = await deps.accounts.resolveSecret(account.id);
-      return { mode: 'cookie', cookie: secret, handle: account.handle, accountId: account.id };
-    }
-    if (deps.account?.transport === 'submitter' && deps.account.executable_path) {
-      return {
-        mode: 'submitter',
-        executable: deps.account.executable_path,
-        handle: deps.account.handle,
-        accountId: deps.account.id,
-      };
-    }
-    const envExec = process.env.CR_VJUDGE_SUBMITTER?.trim();
-    if (envExec) {
-      return { mode: 'submitter', executable: envExec, handle: config.handle, accountId: config.account_id };
-    }
-    const envCookie = process.env.CR_VJUDGE_COOKIE?.trim();
-    if (envCookie) {
-      return { mode: 'cookie', cookie: envCookie, handle: config.handle, accountId: config.account_id };
-    }
-    throw new JudgeInfrastructureError('auth_expired', 'No VJudge OJ account, cookie, or submitter configured', {
+  function resolveTransport() {
+    return resolveAdapterTransport({
       platform: 'vjudge',
+      baseUrl,
+      origin,
+      configHandle: config.handle,
+      configAccountId: config.account_id,
+      deps,
     });
   }
 
@@ -319,15 +338,15 @@ export function createVjudgeJudge(config: VjudgeJudgeConfig, deps: VjudgeJudgeDe
     const session = parseCookieHeader(cookie, 'vjudge');
     const cookieHeader = () => ({ cookie: serializeCookieHeader(session) });
 
-    const isContest = config.contest_id !== undefined;
-    const endpointUrl = isContest ? `${origin}/contest/submit` : `${origin}/problem/submit`;
+    const isContest = normalizedContestId !== undefined;
+    const endpointUrl = isContest ? `${baseUrl}/contest/submit` : `${baseUrl}/problem/submit`;
     const body = new URLSearchParams();
     body.set('method', '0');
     body.set('language', remoteLang);
     body.set('open', '0');
     body.set('source', Buffer.from(source, 'utf8').toString('base64'));
     if (isContest) {
-      body.set('contestId', String(config.contest_id));
+      body.set('contestId', normalizedContestId);
       body.set('num', target);
     } else {
       const upstream = parseUpstreamProblemRef(target);
@@ -342,7 +361,7 @@ export function createVjudgeJudge(config: VjudgeJudgeConfig, deps: VjudgeJudgeDe
         headers: {
           ...cookieHeader(),
           origin,
-          referer: isContest ? `${origin}/contest/${config.contest_id}` : `${origin}/problem/${target}`,
+          referer: isContest ? `${baseUrl}/contest/${encodeURIComponent(normalizedContestId)}` : `${baseUrl}/problem/${encodeURIComponent(target)}`,
           'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
           'x-requested-with': 'XMLHttpRequest',
         },
@@ -350,53 +369,75 @@ export function createVjudgeJudge(config: VjudgeJudgeConfig, deps: VjudgeJudgeDe
         redirect: 'manual',
         signal: requestSignal,
       });
-    } catch (cause) {
-      if (signal.aborted) throw cause;
+    } catch (err) {
+      if (signal.aborted) throw err;
       throw new JudgeInfrastructureError('submission_unconfirmed', 'VJudge submit request failed; will not retry', {
         platform: 'vjudge',
-        cause,
       });
     }
 
     if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel();
       throw new JudgeInfrastructureError('auth_expired', 'VJudge redirected submit request (login required)', {
         platform: 'vjudge',
         status: response.status,
       });
     }
-    if (!response.ok) throw classifyHttpError(response.status, 'submit');
+    if (response.status === 401 || response.status === 403 || response.status === 429) {
+      await response.body?.cancel();
+      throw classifyHttpError(response.status, 'submit');
+    }
+    if (!response.ok) {
+      // Post-write 5xx / non-ok status is ambiguous and must NOT be retried as a preflight failure.
+      await response.body?.cancel();
+      throw new JudgeInfrastructureError(
+        'submission_unconfirmed',
+        `VJudge submit POST returned HTTP ${response.status}; will not retry`,
+        { platform: 'vjudge', status: response.status },
+      );
+    }
     mergeSetCookies(session, response.headers);
 
     const rawText = await response.text();
-    const textFault = detectVjudgeInfraFault(rawText, response.status);
-    let parsedJson: z.infer<typeof vjudgeSubmitResponseSchema> | undefined;
+    let rawParsed: unknown;
     try {
-      parsedJson = vjudgeSubmitResponseSchema.parse(JSON.parse(rawText));
+      rawParsed = JSON.parse(rawText);
     } catch {
-      if (textFault) throw textFault;
-      throw new JudgeInfrastructureError('submission_unconfirmed', 'VJudge submit returned non-JSON response', {
+      const textFault = detectVjudgeInfraFault(rawText, response.status);
+      if (textFault && (textFault.code === 'captcha_required' || textFault.code === 'auth_expired' || textFault.code === 'rate_limited')) {
+        throw textFault;
+      }
+      throw new JudgeInfrastructureError('submission_unconfirmed', 'VJudge submit returned truncated or non-JSON response', {
+        platform: 'vjudge',
+        status: response.status,
+      });
+    }
+
+    const parsed = vjudgeSubmitResponseSchema.safeParse(rawParsed);
+    if (!parsed.success) {
+      throw new JudgeInfrastructureError('submission_unconfirmed', 'VJudge submit returned unexpected JSON schema', {
         platform: 'vjudge',
       });
     }
 
-    if (parsedJson.captcha) {
+    if (parsed.data.captcha) {
       throw new JudgeInfrastructureError('captcha_required', 'VJudge requires captcha verification before submitting', {
         platform: 'vjudge',
       });
     }
-    if (parsedJson.error) {
-      const fault = detectVjudgeInfraFault(parsedJson.error, response.status);
+    if (parsed.data.error) {
+      const fault = detectVjudgeInfraFault(parsed.data.error, response.status);
       if (fault) throw fault;
-      throw new JudgeInfrastructureError('submission_unconfirmed', `VJudge submit rejected: ${parsedJson.error}`, {
+      throw new JudgeInfrastructureError('submission_unconfirmed', 'VJudge rejected submission', {
         platform: 'vjudge',
       });
     }
-    if (parsedJson.runId === undefined) {
+    if (parsed.data.runId === undefined) {
       throw new JudgeInfrastructureError('submission_unconfirmed', 'VJudge submit response missing runId', {
         platform: 'vjudge',
       });
     }
-    return String(parsedJson.runId);
+    return String(parsed.data.runId);
   }
 
   return {
@@ -413,12 +454,12 @@ export function createVjudgeJudge(config: VjudgeJudgeConfig, deps: VjudgeJudgeDe
 
       const execute = async () => {
         if (transport.mode === 'submitter') {
-          const isContest = config.contest_id !== undefined;
+          const isContest = normalizedContestId !== undefined;
           return runExternalSubmitter({
             platform: 'vjudge',
-            executable: transport.executable,
+            executable: transport.executable!,
             args: [
-              isContest ? `contest:${config.contest_id}` : 'direct',
+              isContest ? `contest:${normalizedContestId}` : 'direct',
               target,
               remoteLang,
               '__SOURCE_FILE__',
@@ -427,8 +468,8 @@ export function createVjudgeJudge(config: VjudgeJudgeConfig, deps: VjudgeJudgeDe
             source,
             env: {
               CR_OJ_PLATFORM: 'vjudge',
-              CR_VJUDGE_BASE_URL: origin,
-              CR_VJUDGE_CONTEST_ID: config.contest_id !== undefined ? String(config.contest_id) : '',
+              CR_VJUDGE_BASE_URL: baseUrl,
+              CR_VJUDGE_CONTEST_ID: normalizedContestId ?? '',
               CR_VJUDGE_TARGET: target,
               CR_VJUDGE_LANGUAGE: remoteLang,
               CR_VJUDGE_HANDLE: transport.handle,
@@ -437,62 +478,70 @@ export function createVjudgeJudge(config: VjudgeJudgeConfig, deps: VjudgeJudgeDe
             execImpl: deps.execImpl,
           });
         }
-        return submitViaCookie(target, remoteLang, source, transport.cookie, signal);
+        return submitViaCookie(target, remoteLang, source, transport.cookie!, signal);
       };
 
-      const serializationKey = transport.accountId ?? `vjudge:${transport.handle.toLowerCase()}`;
       if (deps.pool) {
-        return deps.pool.enqueueSubmission(serializationKey, execute, signal);
+        return deps.pool.enqueueSubmission(transport.queueKey, execute, signal);
       }
       return execute();
     },
 
     async verdicts(ids, problems, signal) {
       if (!ids.length) return new Map();
-      const transport = await resolveTransport().catch(() => undefined);
+      const transport = await resolveTransport();
       const headers: Record<string, string> = { 'x-requested-with': 'XMLHttpRequest' };
-      if (transport?.mode === 'cookie') {
-        headers.cookie = serializeCookieHeader(parseCookieHeader(transport.cookie, 'vjudge'));
+      if (transport.mode === 'cookie') {
+        headers.cookie = serializeCookieHeader(parseCookieHeader(transport.cookie!, 'vjudge'));
       }
-      const handle = transport?.handle ?? config.handle;
+      const handle = transport.handle;
       const result = new Map<string, JudgeVerdict>();
 
       for (const id of ids) {
         const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(15_000)]);
         let resp: Response;
         try {
-          resp = await fetchImpl(`${origin}/solution/data/${encodeURIComponent(id)}`, {
+          resp = await fetchImpl(`${baseUrl}/solution/data/${encodeURIComponent(id)}`, {
             headers,
             redirect: 'manual',
             signal: requestSignal,
           });
-        } catch (cause) {
-          if (signal.aborted) throw cause;
+        } catch (err) {
+          if (signal.aborted) throw err;
           throw new JudgeInfrastructureError('upstream_unavailable', `VJudge verdict poll failed for #${id}`, {
             platform: 'vjudge',
-            cause,
           });
         }
         if (resp.status >= 300 && resp.status < 400) {
+          await resp.body?.cancel();
           throw new JudgeInfrastructureError('auth_expired', `VJudge redirected while polling #${id}`, {
             platform: 'vjudge',
             status: resp.status,
           });
         }
-        if (!resp.ok) throw classifyHttpError(resp.status, `solution #${id}`);
+        if (!resp.ok) {
+          await resp.body?.cancel();
+          throw classifyHttpError(resp.status, `solution #${id}`);
+        }
 
         const rawText = await resp.text();
-        let data: z.infer<typeof vjudgeSolutionResponseSchema>;
+        let rawJson: unknown;
         try {
-          data = vjudgeSolutionResponseSchema.parse(JSON.parse(rawText));
-        } catch (cause) {
+          rawJson = JSON.parse(rawText);
+        } catch {
           const fault = detectVjudgeInfraFault(rawText, resp.status);
           if (fault) throw fault;
           throw new JudgeInfrastructureError('upstream_unavailable', `VJudge returned invalid JSON for #${id}`, {
             platform: 'vjudge',
-            cause,
           });
         }
+        const parsed = vjudgeSolutionResponseSchema.safeParse(rawJson);
+        if (!parsed.success) {
+          throw new JudgeInfrastructureError('upstream_unavailable', `VJudge returned unexpected JSON schema for #${id}`, {
+            platform: 'vjudge',
+          });
+        }
+        const data = parsed.data;
 
         if (data.captcha) {
           throw new JudgeInfrastructureError('captcha_required', `VJudge captcha triggered polling #${id}`, {
@@ -502,40 +551,70 @@ export function createVjudgeJudge(config: VjudgeJudgeConfig, deps: VjudgeJudgeDe
         if (data.error) {
           const fault = detectVjudgeInfraFault(data.error, resp.status);
           if (fault) throw fault;
-          throw new JudgeInfrastructureError('upstream_unavailable', `VJudge poll error for #${id}: ${data.error}`, {
+          throw new JudgeInfrastructureError('upstream_unavailable', `VJudge poll error for #${id}`, {
             platform: 'vjudge',
           });
         }
 
+        // Strict fail-closed identity verification: runId, handle, and target problem/contest MUST match.
+        if (data.runId === undefined || String(data.runId) !== id) {
+          throw new JudgeInfrastructureError('identity_mismatch', `VJudge submission ID mismatch for #${id}`, {
+            platform: 'vjudge',
+          });
+        }
         const remoteAuthor = data.author ?? data.username;
-        if (remoteAuthor && remoteAuthor.toLowerCase() !== handle.toLowerCase()) {
-          throw new JudgeInfrastructureError('identity_mismatch', `VJudge submission #${id} handle mismatch`, {
+        if (!remoteAuthor || remoteAuthor.toLowerCase() !== handle.toLowerCase()) {
+          throw new JudgeInfrastructureError('identity_mismatch', `VJudge submission #${id} missing or mismatched handle`, {
             platform: 'vjudge',
           });
         }
 
-        // Verify target problem when metadata is present
         const localProblem = problems.get(id);
         if (localProblem) {
           const expected = targetFor(localProblem);
-          if (config.contest_id !== undefined) {
-            if (data.contestNum && data.contestNum !== expected) {
-              throw new JudgeInfrastructureError('identity_mismatch', `VJudge submission #${id} contest problem mismatch`, {
+          if (normalizedContestId !== undefined) {
+            if (data.contestId !== undefined && String(data.contestId) !== normalizedContestId) {
+              throw new JudgeInfrastructureError('identity_mismatch', `VJudge submission #${id} contest mismatch`, {
                 platform: 'vjudge',
               });
             }
-          } else if (data.oj && data.probNum) {
+            if (!data.contestNum || data.contestNum !== expected) {
+              throw new JudgeInfrastructureError(
+                'identity_mismatch',
+                `VJudge submission #${id} missing or mismatched contest problem index`,
+                { platform: 'vjudge' },
+              );
+            }
+          } else {
             const upstream = parseUpstreamProblemRef(expected);
-            if (data.oj.toLowerCase() !== upstream.oj.toLowerCase() || data.probNum !== upstream.probNum) {
-              throw new JudgeInfrastructureError('identity_mismatch', `VJudge submission #${id} upstream problem mismatch`, {
-                platform: 'vjudge',
-              });
+            if (
+              !data.oj ||
+              !data.probNum ||
+              data.oj.toLowerCase() !== upstream.oj.toLowerCase() ||
+              data.probNum !== upstream.probNum
+            ) {
+              throw new JudgeInfrastructureError(
+                'identity_mismatch',
+                `VJudge submission #${id} missing or mismatched upstream problem`,
+                { platform: 'vjudge' },
+              );
             }
           }
         }
 
+        // Prioritize VJudge infrastructure fault detection (statusType === 2, statusCanonical === 'FAILED', text faults)
         const rawVerdict = data.status ?? data.statusCanonical ?? 'Pending';
-        const statusFault = detectVjudgeInfraFault(rawVerdict, resp.status);
+        const canonicalUpper = data.statusCanonical?.trim().toUpperCase();
+        if (data.statusType === 2 || canonicalUpper === 'FAILED') {
+          throw new JudgeInfrastructureError(
+            'upstream_unavailable',
+            `VJudge reported submission/judge failure for #${id}`,
+            { platform: 'vjudge' },
+          );
+        }
+        const statusFault =
+          detectVjudgeInfraFault(rawVerdict, resp.status) ??
+          (data.statusCanonical ? detectVjudgeInfraFault(data.statusCanonical, resp.status) : null);
         if (statusFault) throw statusFault;
 
         if (data.processing === true) continue;
@@ -546,7 +625,7 @@ export function createVjudgeJudge(config: VjudgeJudgeConfig, deps: VjudgeJudgeDe
         if (normalized === 'judge_error') {
           throw new JudgeInfrastructureError(
             'upstream_unavailable',
-            `VJudge reported infrastructure verdict "${rawVerdict}" for #${id}`,
+            `VJudge reported infrastructure verdict for #${id}`,
             { platform: 'vjudge' },
           );
         }

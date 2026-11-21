@@ -17,9 +17,11 @@ import {
   normalizeVerdict,
   parseCookieHeader,
   parseHtmlNodes,
+  resolveAdapterTransport,
+  resolveBaseUrl,
   runExternalSubmitter,
+  safeParseJson,
   serializeCookieHeader,
-  validateOriginUrl,
   walkHtml,
 } from './types.js';
 
@@ -47,6 +49,10 @@ export interface QojSubmissionRow {
   memory_kb?: number;
 }
 
+function stripQojPrefix(raw: number | string): string {
+  return String(raw).replace(/^qoj:/i, '').trim();
+}
+
 function classifyHttpError(status: number, context: string): JudgeInfrastructureError {
   if (status === 401 || status === 403) {
     return new JudgeInfrastructureError('auth_expired', `QOJ ${context}: HTTP ${status}`, {
@@ -68,10 +74,13 @@ function classifyHttpError(status: number, context: string): JudgeInfrastructure
 
 function detectCaptchaOrLogin(markup: string): 'captcha' | 'login' | null {
   if (/cf-turnstile|g-recaptcha|h-captcha|verify you are human/i.test(markup)) return 'captcha';
-  if (/<form[^>]+action=["'][^"']*\/login/i.test(markup) && !/name=["']_token["'][\s\S]*name=["']answer_answer_code["']/i.test(markup)) {
-    return 'login';
-  }
-  return null;
+  const nodes = parseHtmlNodes(markup);
+  const hasSubmitForm = nodes.some(
+    n => n.tagName === 'form' && walkHtml(n).some(c => htmlAttr(c, 'name') === 'answer_answer_editor'),
+  );
+  if (hasSubmitForm) return null;
+  const hasLoginForm = nodes.some(n => n.tagName === 'form' && /\/login\b/i.test(htmlAttr(n, 'action') ?? ''));
+  return hasLoginForm ? 'login' : null;
 }
 
 export function extractQojCsrfToken(markup: string): string | undefined {
@@ -97,32 +106,61 @@ function parseNumberUnit(text: string): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
-function parseScoreText(text: string): { score?: number; max_score?: number } {
+function parseScoreText(text: string): { score?: number; max_score?: number; explicitRatio: boolean } {
   const ratio = text.match(/(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)/);
   if (ratio?.[1] && ratio[2]) {
-    return { score: Number(ratio[1]), max_score: Number(ratio[2]) };
+    return { score: Number(ratio[1]), max_score: Number(ratio[2]), explicitRatio: true };
   }
   const bare = text.trim().match(/^(\d+(?:\.\d+)?)$/);
   if (bare?.[1]) {
-    return { score: Number(bare[1]), max_score: 100 };
+    return { score: Number(bare[1]), max_score: 100, explicitRatio: false };
   }
-  return {};
+  return { explicitRatio: false };
+}
+
+function collectAnchors(node: HtmlNode): HtmlNode[] {
+  return walkHtml(node).filter(cur => cur.tagName === 'a');
+}
+
+function extractExactSubmissionIdFromCell(td: HtmlNode): string | undefined {
+  for (const a of collectAnchors(td)) {
+    const href = htmlAttr(a, 'href') ?? '';
+    const m = href.match(/\/submission\/(\d+)(?:$|[/?#])/);
+    if (m?.[1]) return m[1];
+  }
+  const txt = htmlText(td).trim();
+  const bare = txt.match(/^#?(\d+)$/);
+  return bare?.[1];
 }
 
 /**
  * Parse a QOJ/UOJ submission detail HTML page (`/submission/<id>`) or JSON response.
+ * Strictly reads ONLY the summary table row whose submission ID matches `expectedId`
+ * (never scans test case detail rows or user `<pre><code>` source blocks).
  */
-export function parseQojSubmissionPage(id: string, body: string): QojSubmissionRow {
+export function parseQojSubmissionPage(expectedId: string, body: string): QojSubmissionRow | undefined {
   const trimmed = body.trim();
   if (trimmed.startsWith('{')) {
-    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+    const parsed = safeParseJson(trimmed, 'qoj', 'submission status') as Record<string, unknown>;
+    const rawId = parsed.id ?? parsed.submission_id;
+    if (rawId === undefined || rawId === null || String(rawId).trim() === '') return undefined;
     const rawVerdict = String(parsed.verdict ?? parsed.status ?? parsed.result ?? 'Waiting');
     const score = typeof parsed.score === 'number' ? parsed.score : undefined;
     const maxScore = typeof parsed.max_score === 'number' ? parsed.max_score : undefined;
-    const timeMs = typeof parsed.time_ms === 'number' ? parsed.time_ms : typeof parsed.used_time === 'number' ? parsed.used_time : undefined;
-    const memoryKb = typeof parsed.memory_kb === 'number' ? parsed.memory_kb : typeof parsed.used_memory === 'number' ? parsed.used_memory : undefined;
+    const timeMs =
+      typeof parsed.time_ms === 'number'
+        ? parsed.time_ms
+        : typeof parsed.used_time === 'number'
+          ? parsed.used_time
+          : undefined;
+    const memoryKb =
+      typeof parsed.memory_kb === 'number'
+        ? parsed.memory_kb
+        : typeof parsed.used_memory === 'number'
+          ? parsed.used_memory
+          : undefined;
     return {
-      id: String(parsed.id ?? id),
+      id: String(rawId),
       ...(parsed.problem_id !== undefined ? { problem_id: String(parsed.problem_id) } : {}),
       ...(typeof parsed.submitter === 'string' ? { submitter: parsed.submitter } : {}),
       raw_verdict: rawVerdict,
@@ -134,46 +172,57 @@ export function parseQojSubmissionPage(id: string, body: string): QojSubmissionR
   }
 
   const nodes = parseHtmlNodes(body);
-  // Look for the first data row in a UOJ/QOJ submission table (<tr> with <td>s)
   const trNodes = nodes.filter(n => n.tagName === 'tr');
-  let rawVerdict = 'Waiting';
-  let score: number | undefined;
-  let maxScore: number | undefined;
-  let timeMs: number | undefined;
-  let memoryKb: number | undefined;
-  let problemId: string | undefined;
-  let submitter: string | undefined;
 
   for (const tr of trNodes) {
     const tds = (tr.childNodes ?? []).filter(c => c.tagName === 'td');
     if (tds.length < 4) continue;
+    const rowId = extractExactSubmissionIdFromCell(tds[0]!);
+    if (!rowId) continue;
+    if (rowId !== expectedId) {
+      // If the page returned a summary row for a different submission ID, surface that ID so
+      // verdicts() fails closed with identity_mismatch instead of silently treating it as expectedId.
+      return {
+        id: rowId,
+        raw_verdict: 'IdentityMismatch',
+      };
+    }
+
     const cells = tds.map(td => htmlText(td).replace(/\s+/g, ' ').trim());
-    const idCell = cells[0] ?? '';
-    if (!idCell.includes(id) && !idCell.startsWith('#')) continue;
+    let problemId: string | undefined;
+    let submitter: string | undefined;
 
     for (const td of tds) {
-      const links = collectAnchors(td);
-      for (const link of links) {
+      for (const link of collectAnchors(td)) {
         const href = htmlAttr(link, 'href') ?? '';
-        const probMatch = href.match(/\/problem\/(\d+)/);
+        const probMatch = href.match(/\/problem\/(\d+)(?:$|[/?#])/);
         if (probMatch?.[1] && !problemId) problemId = probMatch[1];
         const userMatch = href.match(/\/user\/profile\/([^/?#]+)/);
         if (userMatch?.[1] && !submitter) submitter = decodeURIComponent(userMatch[1]);
       }
     }
 
-    // Standard UOJ/QOJ table columns: ID | Problem | Submitter | Result/Score | Time | Memory | Language | File Size | Submit Time
+    // Standard UOJ/QOJ summary row: ID | Problem | Submitter | Result/Score | Time | Memory | ...
+    const resultTd = tds[3]!;
     const resultCell = cells[3] ?? '';
-    const parsedScore = parseScoreText(resultCell);
+    const scoreNode = walkHtml(resultTd).find(n => (htmlAttr(n, 'class') ?? '').includes('uoj-score'));
+    const scoreSource = scoreNode ? htmlText(scoreNode).trim() : resultCell;
+    const parsedScore = parseScoreText(scoreSource);
+
+    let score: number | undefined;
+    let maxScore: number | undefined;
+    let rawVerdict = 'Waiting';
+
+    // Check explicit text verdict ONLY inside the summary result cell (never full HTML / source code!)
+    const cellVerdictMatch = resultCell.match(
+      /\b(Judgement Failed|Judgment Failed|Compile Error|Compilation Error|Accepted|Wrong Answer|Time Limit Exceeded|Memory Limit Exceeded|Runtime Error|Dangerous Syscalls|Output Limit Exceeded|Waiting|Judging|Pending|Compiling)\b/i,
+    );
+
     if (parsedScore.score !== undefined) {
       score = parsedScore.score;
       maxScore = parsedScore.max_score;
-      // UOJ often renders score number ("65" or "100") as the main text and verdict inside badge/title or test details
-      const extraVerdict = body.match(
-        /\b(Judgement Failed|Compile Error|Compilation Error|Accepted|Wrong Answer|Time Limit Exceeded|Memory Limit Exceeded|Runtime Error|Dangerous Syscalls|Output Limit Exceeded|Waiting|Judging)\b/i,
-      );
-      if (extraVerdict?.[1]) {
-        rawVerdict = extraVerdict[1];
+      if (cellVerdictMatch?.[1]) {
+        rawVerdict = cellVerdictMatch[1];
       } else if (maxScore !== undefined && score >= maxScore) {
         rawVerdict = 'Accepted';
       } else if (score > 0) {
@@ -181,10 +230,14 @@ export function parseQojSubmissionPage(id: string, body: string): QojSubmissionR
       } else {
         rawVerdict = 'Wrong Answer';
       }
+    } else if (cellVerdictMatch?.[1]) {
+      rawVerdict = cellVerdictMatch[1];
     } else if (resultCell) {
       rawVerdict = resultCell;
     }
 
+    let timeMs: number | undefined;
+    let memoryKb: number | undefined;
     if (cells[4]) {
       const t = parseNumberUnit(cells[4]);
       if (t !== undefined) timeMs = Math.round(t);
@@ -195,37 +248,20 @@ export function parseQojSubmissionPage(id: string, body: string): QojSubmissionR
         memoryKb = /mb/i.test(cells[5]) ? Math.round(m * 1024) : Math.round(m);
       }
     }
-    break;
+
+    return {
+      id: rowId,
+      ...(problemId ? { problem_id: problemId } : {}),
+      ...(submitter ? { submitter } : {}),
+      raw_verdict: rawVerdict,
+      ...(score !== undefined ? { score } : {}),
+      ...(maxScore !== undefined ? { max_score: maxScore } : {}),
+      ...(timeMs !== undefined ? { time_ms: timeMs } : {}),
+      ...(memoryKb !== undefined ? { memory_kb: memoryKb } : {}),
+    };
   }
 
-  // Fallback: inspect data attributes or status badges if table layout differs
-  if (rawVerdict === 'Waiting' && score === undefined) {
-    const scoreNode = nodes.find(n => (htmlAttr(n, 'class') ?? '').includes('uoj-score'));
-    if (scoreNode) {
-      const parsedScore = parseScoreText(htmlText(scoreNode));
-      score = parsedScore.score;
-      maxScore = parsedScore.max_score;
-    }
-    const statusMatch = body.match(
-      /\b(Judgement Failed|Compile Error|Compilation Error|Accepted|Wrong Answer|Time Limit Exceeded|Memory Limit Exceeded|Runtime Error|Waiting|Judging)\b/i,
-    );
-    if (statusMatch?.[1]) rawVerdict = statusMatch[1];
-  }
-
-  return {
-    id,
-    ...(problemId ? { problem_id: problemId } : {}),
-    ...(submitter ? { submitter } : {}),
-    raw_verdict: rawVerdict,
-    ...(score !== undefined ? { score } : {}),
-    ...(maxScore !== undefined ? { max_score: maxScore } : {}),
-    ...(timeMs !== undefined ? { time_ms: timeMs } : {}),
-    ...(memoryKb !== undefined ? { memory_kb: memoryKb } : {}),
-  };
-}
-
-function collectAnchors(node: HtmlNode): HtmlNode[] {
-  return walkHtml(node).filter(cur => cur.tagName === 'a');
+  return undefined;
 }
 
 export function parseQojSubmissionList(markup: string): Array<{ id: string; problem_id?: string; submitter?: string }> {
@@ -240,9 +276,9 @@ export function parseQojSubmissionList(markup: string): Array<{ id: string; prob
     let submitter: string | undefined;
     for (const a of anchors) {
       const href = htmlAttr(a, 'href') ?? '';
-      const s = href.match(/\/submission\/(\d+)/);
+      const s = href.match(/\/submission\/(\d+)(?:$|[/?#])/);
       if (s?.[1] && !subId) subId = s[1];
-      const p = href.match(/\/problem\/(\d+)/);
+      const p = href.match(/\/problem\/(\d+)(?:$|[/?#])/);
       if (p?.[1] && !problemId) problemId = p[1];
       const u = href.match(/\/user\/profile\/([^/?#]+)/);
       if (u?.[1] && !submitter) submitter = decodeURIComponent(u[1]);
@@ -255,35 +291,72 @@ export function parseQojSubmissionList(markup: string): Array<{ id: string; prob
   return rows;
 }
 
+async function fetchSameOriginManual(
+  url: string,
+  origin: string,
+  fetchImpl: FetchLike,
+  signal: AbortSignal,
+  headers?: Record<string, string>,
+): Promise<Response> {
+  let current = url;
+  for (let hops = 0; hops < 3; hops++) {
+    let response: Response;
+    try {
+      response = await fetchImpl(current, { headers, redirect: 'manual', signal });
+    } catch (err) {
+      if (signal.aborted) throw err;
+      throw new JudgeInfrastructureError('upstream_unavailable', 'QOJ HTTP request failed', { platform: 'qoj' });
+    }
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      await response.body?.cancel();
+      if (!location) {
+        throw new JudgeInfrastructureError('upstream_unavailable', 'QOJ redirect missing location header', {
+          platform: 'qoj',
+          status: response.status,
+        });
+      }
+      const next = new URL(location, current);
+      if (next.origin !== origin) {
+        throw new JudgeInfrastructureError('upstream_unavailable', 'QOJ redirected across origins', {
+          platform: 'qoj',
+          status: response.status,
+        });
+      }
+      if (/\/login\b/i.test(next.pathname)) {
+        throw new JudgeInfrastructureError('auth_expired', 'QOJ redirected to login page', {
+          platform: 'qoj',
+          status: response.status,
+        });
+      }
+      current = next.href;
+      continue;
+    }
+    return response;
+  }
+  throw new JudgeInfrastructureError('upstream_unavailable', 'QOJ exceeded redirect limit', { platform: 'qoj' });
+}
+
 export async function previewQojContest(
   contestId: number | string,
   opts?: { baseUrl?: string; fetchImpl?: FetchLike; signal?: AbortSignal },
 ): Promise<ContestPreview> {
-  const cleanId = String(contestId).replace(/^qoj:/i, '').trim();
+  const cleanId = stripQojPrefix(contestId);
   if (!/^\d+$/.test(cleanId)) {
-    throw new JudgeInfrastructureError('upstream_unavailable', `Invalid QOJ contest ID: ${contestId}`, {
+    throw new JudgeInfrastructureError('upstream_unavailable', 'Invalid QOJ contest ID', {
       platform: 'qoj',
     });
   }
-  const origin = validateOriginUrl(opts?.baseUrl ?? QOJ_DEFAULT_ORIGIN, 'qoj');
+  const { baseUrl, origin } = resolveBaseUrl(opts?.baseUrl ?? QOJ_DEFAULT_ORIGIN, 'qoj');
   const fetchImpl = opts?.fetchImpl ?? fetch;
   const signal = AbortSignal.any([AbortSignal.timeout(15_000), ...(opts?.signal ? [opts.signal] : [])]);
 
-  let response: Response;
-  try {
-    response = await fetchImpl(`${origin}/contest/${cleanId}`, { redirect: 'follow', signal });
-  } catch (cause) {
-    if (opts?.signal?.aborted) throw cause;
-    throw new JudgeInfrastructureError('upstream_unavailable', 'QOJ contest preview request failed', {
-      platform: 'qoj',
-      cause,
-    });
-  }
+  const contestUrl = `${baseUrl}/contest/${encodeURIComponent(cleanId)}`;
+  const response = await fetchSameOriginManual(contestUrl, origin, fetchImpl, signal);
   if (!response.ok) throw classifyHttpError(response.status, 'contest preview');
   const html = await response.text();
   const nodes = parseHtmlNodes(html);
 
-  // Title from <h1> or <title>
   const h1 = nodes.find(n => n.tagName === 'h1');
   const titleNode = nodes.find(n => n.tagName === 'title');
   const title = (h1 ? htmlText(h1) : titleNode ? htmlText(titleNode) : `QOJ Contest ${cleanId}`)
@@ -291,9 +364,8 @@ export async function previewQojContest(
     .replace(/\s*-\s*QOJ.*$/i, '')
     .trim();
 
-  // Extract problems from links matching /contest/<id>/problem/<pid> or /problem/<pid>
-  const problems: ContestPreviewProblem[] = [];
-  const seen = new Set<string>();
+  const contestScopedProblems: ContestPreviewProblem[] = [];
+  const seenScoped = new Set<string>();
   let statementPdfUrl: string | undefined;
 
   for (const node of nodes) {
@@ -303,19 +375,23 @@ export async function previewQojContest(
 
     if (!statementPdfUrl && (/\.pdf($|\?)/i.test(href) || /download.*statement|statements?\.pdf/i.test(href))) {
       try {
-        statementPdfUrl = new URL(href, origin).href;
+        const resolved = new URL(href, contestUrl);
+        if ((resolved.protocol === 'https:' || resolved.protocol === 'http:') && resolved.origin === origin) {
+          statementPdfUrl = resolved.href;
+        }
       } catch {
         // ignore malformed href
       }
     }
 
-    const probMatch = href.match(new RegExp(`(?:/contest/${cleanId})?/problem/(\\d+)(?:$|[/?#])`));
-    if (probMatch?.[1] && !seen.has(probMatch[1])) {
-      seen.add(probMatch[1]);
-      // Try to clean leading "#1234." or "A." from problem title
+    // Strictly match problems scoped to this contest (`/contest/<id>/problem/<pid>`)
+    const scopedMatch = href.match(new RegExp(`^.*/contest/${cleanId}/problem/(\\d+)(?:$|[/?#])|^/contest/${cleanId}/problem/(\\d+)(?:$|[/?#])`));
+    const pid = scopedMatch?.[1] ?? scopedMatch?.[2];
+    if (pid && !seenScoped.has(pid)) {
+      seenScoped.add(pid);
       const cleanTitle = linkText.replace(/^#?\d+\.\s*/, '').trim();
-      problems.push({
-        remote_id: probMatch[1],
+      contestScopedProblems.push({
+        remote_id: pid,
         ...(cleanTitle ? { title: cleanTitle } : {}),
       });
     }
@@ -332,7 +408,7 @@ export async function previewQojContest(
     contest_ref: `qoj:${cleanId}`,
     title: title || `QOJ Contest ${cleanId}`,
     status,
-    problems,
+    problems: contestScopedProblems,
     suggested_languages: QOJ_LANGUAGE_PRESETS,
     ...(statementPdfUrl ? { statement_pdf_url: statementPdfUrl } : {}),
   };
@@ -340,7 +416,7 @@ export async function previewQojContest(
 
 export interface QojJudgeConfig {
   contest_id?: number | string;
-  handle: string;
+  handle?: string;
   languages: Record<string, string>;
   problem_map?: Record<string, string>;
   account_id?: string;
@@ -360,65 +436,29 @@ export interface QojJudgeDeps {
 }
 
 export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}): ProgramJudge {
-  const origin = validateOriginUrl(config.base_url ?? QOJ_DEFAULT_ORIGIN, 'qoj');
+  const { baseUrl, origin } = resolveBaseUrl(config.base_url ?? QOJ_DEFAULT_ORIGIN, 'qoj');
+  const basePath = new URL(baseUrl).pathname.replace(/\/+$/, '');
   const fetchImpl = deps.fetchImpl ?? fetch;
   const delayImpl = deps.delayImpl ?? ((ms, sig) => delay(ms, undefined, { signal: sig }));
   const settlementMs = config.settlement_ms ?? QOJ_DEFAULT_SETTLEMENT_MS;
+  const normalizedContestId = config.contest_id !== undefined ? stripQojPrefix(config.contest_id) : undefined;
 
   const targetFor = (problem: string) =>
-    Object.hasOwn(config.problem_map ?? {}, problem) ? config.problem_map![problem]! : problem;
+    stripQojPrefix(Object.hasOwn(config.problem_map ?? {}, problem) ? config.problem_map![problem]! : problem);
 
   const problemUrlFor = (remoteProblemId: string) =>
-    config.contest_id !== undefined
-      ? `${origin}/contest/${config.contest_id}/problem/${remoteProblemId}`
-      : `${origin}/problem/${remoteProblemId}`;
+    normalizedContestId
+      ? `${baseUrl}/contest/${encodeURIComponent(normalizedContestId)}/problem/${encodeURIComponent(remoteProblemId)}`
+      : `${baseUrl}/problem/${encodeURIComponent(remoteProblemId)}`;
 
-  async function resolveTransport(): Promise<
-    { mode: 'submitter'; executable: string; handle: string; accountId?: string } |
-    { mode: 'cookie'; cookie: string; handle: string; accountId?: string }
-  > {
-    if (deps.executable) {
-      return { mode: 'submitter', executable: deps.executable, handle: config.handle, accountId: config.account_id };
-    }
-    if (deps.cookie) {
-      return { mode: 'cookie', cookie: deps.cookie, handle: config.handle, accountId: config.account_id };
-    }
-    if (config.account_id && deps.accounts) {
-      const account = await deps.accounts.get(config.account_id);
-      if (account.platform !== 'qoj') {
-        throw new JudgeInfrastructureError('auth_expired', `OJ account ${account.id} is not a QOJ account`, {
-          platform: 'qoj',
-        });
-      }
-      if (account.transport === 'submitter') {
-        if (!account.executable_path) {
-          throw new JudgeInfrastructureError('submitter_failed', 'QOJ submitter account has no executable_path', {
-            platform: 'qoj',
-          });
-        }
-        return { mode: 'submitter', executable: account.executable_path, handle: account.handle, accountId: account.id };
-      }
-      const secret = await deps.accounts.resolveSecret(account.id);
-      return { mode: 'cookie', cookie: secret, handle: account.handle, accountId: account.id };
-    }
-    if (deps.account?.transport === 'submitter' && deps.account.executable_path) {
-      return {
-        mode: 'submitter',
-        executable: deps.account.executable_path,
-        handle: deps.account.handle,
-        accountId: deps.account.id,
-      };
-    }
-    const envExec = process.env.CR_QOJ_SUBMITTER?.trim();
-    if (envExec) {
-      return { mode: 'submitter', executable: envExec, handle: config.handle, accountId: config.account_id };
-    }
-    const envCookie = process.env.CR_QOJ_COOKIE?.trim();
-    if (envCookie) {
-      return { mode: 'cookie', cookie: envCookie, handle: config.handle, accountId: config.account_id };
-    }
-    throw new JudgeInfrastructureError('auth_expired', 'No QOJ OJ account, cookie, or submitter configured', {
+  function resolveTransport() {
+    return resolveAdapterTransport({
       platform: 'qoj',
+      baseUrl,
+      origin,
+      configHandle: config.handle,
+      configAccountId: config.account_id,
+      deps,
     });
   }
 
@@ -428,7 +468,7 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
     session: Map<string, string>,
     signal: AbortSignal,
   ) {
-    const url = new URL(`${origin}/submissions`);
+    const url = new URL(`${baseUrl}/submissions`);
     url.searchParams.set('submitter', handle);
     url.searchParams.set('problem_id', remoteProblemId);
     const resp = await fetchImpl(url, {
@@ -436,6 +476,12 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
       redirect: 'manual',
       signal,
     });
+    if (resp.status >= 300 && resp.status < 400) {
+      throw new JudgeInfrastructureError('auth_expired', 'QOJ redirected submissions list request', {
+        platform: 'qoj',
+        status: resp.status,
+      });
+    }
     if (!resp.ok) throw classifyHttpError(resp.status, 'submissions list');
     return parseQojSubmissionList(await resp.text());
   }
@@ -456,11 +502,10 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
     let pageResp: Response;
     try {
       pageResp = await fetchImpl(submitPageUrl, { headers: cookieHeader(), redirect: 'manual', signal: requestSignal });
-    } catch (cause) {
-      if (signal.aborted) throw cause;
+    } catch (err) {
+      if (signal.aborted) throw err;
       throw new JudgeInfrastructureError('upstream_unavailable', 'QOJ submit page fetch failed', {
         platform: 'qoj',
-        cause,
       });
     }
     if (pageResp.status >= 300 && pageResp.status < 400) {
@@ -488,9 +533,16 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
       });
     }
 
-    // Record baseline submission ID before posting so correlation is exact.
-    const before = await fetchRecentSubmissions(handle, remoteProblemId, session, requestSignal).catch(() => []);
-    const baseline = Math.max(0, ...before.map(r => Number(r.id)).filter(Number.isFinite));
+    // Record baseline submission ID before posting. NEVER default failed baseline to 0!
+    let baselineKnown = false;
+    let baseline = 0;
+    try {
+      const before = await fetchRecentSubmissions(handle, remoteProblemId, session, requestSignal);
+      baseline = Math.max(0, ...before.map(r => Number(r.id)).filter(Number.isFinite));
+      baselineKnown = true;
+    } catch {
+      baselineKnown = false;
+    }
 
     const form = new URLSearchParams();
     form.set('_token', token);
@@ -513,31 +565,41 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
         redirect: 'manual',
         signal: requestSignal,
       });
-    } catch (cause) {
-      if (signal.aborted) throw cause;
+    } catch (err) {
+      if (signal.aborted) throw err;
       throw new JudgeInfrastructureError('submission_unconfirmed', 'QOJ submit POST failed; will not retry', {
         platform: 'qoj',
-        cause,
       });
     }
 
-    // 1. Check redirect to /submission/<id>
+    // 1. Check redirect receipt
     const location = postResp.headers.get('location');
     if (location && postResp.status >= 300 && postResp.status < 400) {
-      const targetUrl = new URL(location, origin);
+      const targetUrl = new URL(location, submitPageUrl);
+      const escapedBase = basePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       if (targetUrl.origin === origin) {
-        const directMatch = targetUrl.pathname.match(/^\/submission\/(\d+)\/?$/);
+        const directMatch = targetUrl.pathname.match(new RegExp(`^${escapedBase}/submission/(\\d+)/?$`));
         if (directMatch?.[1]) {
           await postResp.body?.cancel();
           return directMatch[1];
         }
-        if (/^\/submissions\/?$/.test(targetUrl.pathname) || /^\/contest\/\d+\/submissions\/?$/.test(targetUrl.pathname)) {
+        if (
+          new RegExp(`^${escapedBase}/submissions/?$`).test(targetUrl.pathname) ||
+          new RegExp(`^${escapedBase}/contest/\\d+/submissions/?$`).test(targetUrl.pathname)
+        ) {
           await postResp.body?.cancel();
+          if (!baselineKnown) {
+            throw new JudgeInfrastructureError(
+              'submission_unconfirmed',
+              'QOJ redirected to submissions list without a verified pre-submit baseline; will not guess or retry',
+              { platform: 'qoj' },
+            );
+          }
           return correlateQojSubmission(handle, remoteProblemId, baseline, session, requestSignal);
         }
       }
       await postResp.body?.cancel();
-      throw new JudgeInfrastructureError('auth_expired', `Unexpected QOJ submit redirect: ${location}`, {
+      throw new JudgeInfrastructureError('auth_expired', 'Unexpected QOJ submit redirect', {
         platform: 'qoj',
         status: postResp.status,
       });
@@ -548,36 +610,41 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
       throw classifyHttpError(postResp.status, 'submit POST');
     }
 
+    if (!postResp.ok) {
+      await postResp.body?.cancel();
+      throw new JudgeInfrastructureError(
+        'submission_unconfirmed',
+        `QOJ submit POST returned HTTP ${postResp.status}; will not retry`,
+        { platform: 'qoj', status: postResp.status },
+      );
+    }
+
     const bodyText = await postResp.text();
     const contentType = postResp.headers.get('content-type') ?? '';
     if (contentType.includes('application/json') || bodyText.trim().startsWith('{')) {
-      try {
-        const json = JSON.parse(bodyText) as { submission_id?: string | number; id?: string | number; error?: string };
-        const idVal = json.submission_id ?? json.id;
-        if (idVal !== undefined && String(idVal).trim()) return String(idVal);
-        if (json.error) {
-          throw new JudgeInfrastructureError('submission_unconfirmed', `QOJ rejected submission: ${json.error}`, {
-            platform: 'qoj',
-          });
-        }
-      } catch (err) {
-        if (err instanceof JudgeInfrastructureError) throw err;
+      const json = safeParseJson(bodyText, 'qoj', 'submit response', 'submission_unconfirmed') as {
+        submission_id?: string | number;
+        id?: string | number;
+        error?: string;
+      };
+      const idVal = json.submission_id ?? json.id;
+      if (idVal !== undefined && String(idVal).trim()) return String(idVal);
+      if (json.error) {
+        throw new JudgeInfrastructureError('submission_unconfirmed', 'QOJ rejected submission', {
+          platform: 'qoj',
+        });
       }
     }
 
-    const bodySubMatch = bodyText.match(/\/submission\/(\d+)/);
-    if (postResp.ok && bodySubMatch?.[1]) {
-      return bodySubMatch[1];
-    }
-
-    if (postResp.ok) {
+    // Do NOT scrape arbitrary /submission/\d+ links from HTML body; require verified baseline correlation.
+    if (baselineKnown) {
       return correlateQojSubmission(handle, remoteProblemId, baseline, session, requestSignal);
     }
 
     throw new JudgeInfrastructureError(
       'submission_unconfirmed',
-      `QOJ did not confirm submission (HTTP ${postResp.status}); will not retry`,
-      { platform: 'qoj', status: postResp.status },
+      'QOJ did not return an explicit submission receipt and baseline was unavailable; will not retry',
+      { platform: 'qoj' },
     );
   }
 
@@ -594,8 +661,9 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
       const newer = rows.filter(r => Number(r.id) > baseline);
       const exact = newer.filter(
         r =>
-          (!r.problem_id || r.problem_id === remoteProblemId) &&
-          (!r.submitter || r.submitter.toLowerCase() === handle.toLowerCase()),
+          r.problem_id === remoteProblemId &&
+          r.submitter !== undefined &&
+          r.submitter.toLowerCase() === handle.toLowerCase(),
       );
       if (exact.length === 1 && newer.length === 1) return exact[0]!.id;
       if (newer.length > 0) {
@@ -626,9 +694,9 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
         if (transport.mode === 'submitter') {
           return runExternalSubmitter({
             platform: 'qoj',
-            executable: transport.executable,
+            executable: transport.executable!,
             args: [
-              ...(config.contest_id !== undefined ? [String(config.contest_id)] : ['none']),
+              normalizedContestId ?? 'none',
               remoteProblemId,
               remoteLang,
               '__SOURCE_FILE__',
@@ -637,8 +705,8 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
             source,
             env: {
               CR_OJ_PLATFORM: 'qoj',
-              CR_QOJ_BASE_URL: origin,
-              CR_QOJ_CONTEST_ID: config.contest_id !== undefined ? String(config.contest_id) : '',
+              CR_QOJ_BASE_URL: baseUrl,
+              CR_QOJ_CONTEST_ID: normalizedContestId ?? '',
               CR_QOJ_PROBLEM: remoteProblemId,
               CR_QOJ_LANGUAGE: remoteLang,
               CR_QOJ_HANDLE: transport.handle,
@@ -647,40 +715,38 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
             execImpl: deps.execImpl,
           });
         }
-        return submitViaCookie(remoteProblemId, remoteLang, source, transport.handle, transport.cookie, signal);
+        return submitViaCookie(remoteProblemId, remoteLang, source, transport.handle, transport.cookie!, signal);
       };
 
-      const serializationKey = transport.accountId ?? `qoj:${transport.handle.toLowerCase()}`;
       if (deps.pool) {
-        return deps.pool.enqueueSubmission(serializationKey, execute, signal);
+        return deps.pool.enqueueSubmission(transport.queueKey, execute, signal);
       }
       return execute();
     },
 
     async verdicts(ids, problems, signal) {
       if (!ids.length) return new Map();
-      const transport = await resolveTransport().catch(() => undefined);
+      const transport = await resolveTransport();
       const headers: Record<string, string> = {};
-      if (transport?.mode === 'cookie') {
-        headers.cookie = serializeCookieHeader(parseCookieHeader(transport.cookie, 'qoj'));
+      if (transport.mode === 'cookie') {
+        headers.cookie = serializeCookieHeader(parseCookieHeader(transport.cookie!, 'qoj'));
       }
-      const handle = transport?.handle ?? config.handle;
+      const handle = transport.handle;
       const result = new Map<string, JudgeVerdict>();
 
       for (const id of ids) {
         const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(15_000)]);
         let resp: Response;
         try {
-          resp = await fetchImpl(`${origin}/submission/${encodeURIComponent(id)}`, {
+          resp = await fetchImpl(`${baseUrl}/submission/${encodeURIComponent(id)}`, {
             headers,
             redirect: 'manual',
             signal: requestSignal,
           });
-        } catch (cause) {
-          if (signal.aborted) throw cause;
+        } catch (err) {
+          if (signal.aborted) throw err;
           throw new JudgeInfrastructureError('upstream_unavailable', `QOJ verdict fetch failed for #${id}`, {
             platform: 'qoj',
-            cause,
           });
         }
         if (resp.status >= 300 && resp.status < 400) {
@@ -693,23 +759,39 @@ export function createQojJudge(config: QojJudgeConfig, deps: QojJudgeDeps = {}):
 
         const body = await resp.text();
         const row = parseQojSubmissionPage(id, body);
-        const expectedProblem = problems.get(id) ? targetFor(problems.get(id)!) : undefined;
-        if (expectedProblem && row.problem_id && row.problem_id !== expectedProblem) {
-          throw new JudgeInfrastructureError('identity_mismatch', `QOJ submission #${id} problem mismatch`, {
+        if (!row) {
+          throw new JudgeInfrastructureError(
+            'identity_mismatch',
+            `QOJ submission #${id} page missing matching summary row`,
+            { platform: 'qoj' },
+          );
+        }
+        // Fail closed on submission ID, submitter handle, and target problem!
+        if (row.id !== id) {
+          throw new JudgeInfrastructureError('identity_mismatch', `QOJ submission ID mismatch for #${id}`, {
             platform: 'qoj',
           });
         }
-        if (row.submitter && row.submitter.toLowerCase() !== handle.toLowerCase()) {
-          throw new JudgeInfrastructureError('identity_mismatch', `QOJ submission #${id} submitter mismatch`, {
+        if (!row.submitter || row.submitter.toLowerCase() !== handle.toLowerCase()) {
+          throw new JudgeInfrastructureError('identity_mismatch', `QOJ submission #${id} missing or mismatched submitter`, {
             platform: 'qoj',
           });
+        }
+        const localProblem = problems.get(id);
+        if (localProblem) {
+          const expectedProblem = targetFor(localProblem);
+          if (!row.problem_id || row.problem_id !== expectedProblem) {
+            throw new JudgeInfrastructureError('identity_mismatch', `QOJ submission #${id} missing or mismatched problem`, {
+              platform: 'qoj',
+            });
+          }
         }
 
         const normalized = normalizeVerdict(row.raw_verdict, row.score, row.max_score);
         if (normalized === 'judge_error') {
           throw new JudgeInfrastructureError(
             'upstream_unavailable',
-            `QOJ reported Judgement Failed (${row.raw_verdict}) for submission #${id}`,
+            `QOJ reported Judgement Failed for submission #${id}`,
             { platform: 'qoj' },
           );
         }

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -11,6 +11,7 @@ import {
   createOjAccountSchema,
   ojAccountResponseSchema,
   ojAccountsResponseSchema,
+  submissionQueueKey,
 } from '../dist/oj-accounts.js';
 
 const initialCookie = 'JSESSIONID=test-only-cf-session-initial-001; 39ce7=fixtureA';
@@ -35,7 +36,7 @@ async function makeTempStore(t) {
   return { base, store };
 }
 
-test('OjAccounts cookie CRUD enforces write-only secrets, origin pinning, permissions, rotation and delete guard', async t => {
+test('OjAccounts cookie CRUD enforces write-only secrets, origin binding, permissions, rotation and delete guard', async t => {
   const { store } = await makeTempStore(t);
 
   assert.deepEqual(await store.list(), []);
@@ -103,7 +104,32 @@ test('OjAccounts cookie CRUD enforces write-only secrets, origin pinning, permis
   const credPath = join(store.root, 'credentials', created.credential_ref);
   assert.equal((await stat(credPath)).mode & 0o777, 0o600);
   assert.equal(await readFile(credPath, 'utf8'), initialCookie);
-  assert.equal(await store.resolveSecret('cf-main-1'), initialCookie);
+
+  // Runtime origin & platform strong binding on resolveSecret and resolveAccountTransport
+  assert.equal(
+    await store.resolveSecret('cf-main-1', { platform: 'codeforces', origin: 'https://codeforces.com' }),
+    initialCookie,
+  );
+  const atomicResolved = await store.resolveAccountTransport('cf-main-1', {
+    platform: 'codeforces',
+    origin: 'https://codeforces.com',
+  });
+  assert.equal(atomicResolved.secret, initialCookie);
+  assert.equal(atomicResolved.account.handle, 'cr_cf_bot1');
+
+  // Wrong origin or wrong platform MUST refuse to release secret
+  await assert.rejects(
+    store.resolveSecret('cf-main-1', { platform: 'codeforces', origin: 'https://evil.example.com' }),
+    err => err instanceof OjAccountError && err.status === 409,
+  );
+  await assert.rejects(
+    store.resolveSecret('cf-main-1', { platform: 'qoj', origin: 'https://codeforces.com' }),
+    err => err instanceof OjAccountError && err.status === 409,
+  );
+  await assert.rejects(
+    store.resolveAccountTransport('cf-main-1', { platform: 'codeforces', origin: 'https://mirror.codeforces.com' }),
+    err => err instanceof OjAccountError && err.status === 409,
+  );
 
   // Duplicate ID fails with 409
   await assert.rejects(
@@ -139,7 +165,10 @@ test('OjAccounts cookie CRUD enforces write-only secrets, origin pinning, permis
   const rotated = await store.rotate('cf-main-1', { secret: rotatedCookie });
   assert.equal(rotated.ready, true);
   assertNoSecrets(JSON.stringify(rotated));
-  assert.equal(await store.resolveSecret('cf-main-1'), rotatedCookie);
+  assert.equal(
+    await store.resolveSecret('cf-main-1', { platform: 'codeforces', origin: 'https://codeforces.com' }),
+    rotatedCookie,
+  );
   assert.equal((await stat(credPath)).mode & 0o777, 0o600);
 
   // list() & listPool()
@@ -160,10 +189,26 @@ test('OjAccounts cookie CRUD enforces write-only secrets, origin pinning, permis
   await assert.rejects(store.get('cf-main-1'), err => err instanceof OjAccountError && err.status === 404);
 });
 
-test('OjAccounts submitter transport verifies X_OK readiness and rejects secret rotation', async t => {
+test('OjAccounts submitter transport verifies X_OK regular file (rejecting symlink to directory) and rejects secret rotation', async t => {
   const { base, store } = await makeTempStore(t);
   const scriptPath = join(base, 'cf-submitter.sh');
   await writeFile(scriptPath, '#!/bin/sh\necho \'{"submission_id":"1"}\'\n', { mode: 0o644 });
+
+  // Symlink pointing to a directory MUST NOT be considered ready
+  const someDir = join(base, 'some-dir');
+  await mkdir(someDir, { mode: 0o755 });
+  const dirSymlink = join(base, 'dir-link');
+  await symlink(someDir, dirSymlink);
+
+  const dirAcc = await store.create({
+    id: 'qoj-dir-link',
+    label: 'Bad Symlink',
+    platform: 'qoj',
+    handle: 'qoj_bot',
+    transport: 'submitter',
+    executable_path: dirSymlink,
+  });
+  assert.equal(dirAcc.ready, false);
 
   const acc = await store.create({
     id: 'qoj-exec-1',
@@ -181,12 +226,25 @@ test('OjAccounts submitter transport verifies X_OK readiness and rejects secret 
   await chmod(scriptPath, 0o755);
   assert.equal((await store.get('qoj-exec-1')).ready, true);
 
+  // Symlink pointing to an executable regular file IS ready
+  const fileSymlink = join(base, 'file-link');
+  await symlink(scriptPath, fileSymlink);
+  const fileLinkAcc = await store.create({
+    id: 'qoj-file-link',
+    label: 'Good Symlink',
+    platform: 'qoj',
+    handle: 'qoj_bot',
+    transport: 'submitter',
+    executable_path: fileSymlink,
+  });
+  assert.equal(fileLinkAcc.ready, true);
+
   await assert.rejects(
     store.rotate('qoj-exec-1', rotatedCookie),
     err => err instanceof OjAccountError && err.status === 400,
   );
   await assert.rejects(
-    store.resolveSecret('qoj-exec-1'),
+    store.resolveSecret('qoj-exec-1', { platform: 'qoj', origin: 'https://qoj.ac' }),
     err => err instanceof OjAccountError && err.status === 400,
   );
 });
@@ -224,12 +282,12 @@ test('OjAccountPool manages exclusive leasing, queueing, double-release safety a
   const lease2 = await pool.acquire('codeforces', { pool: 'shared' });
   assert.notEqual(lease1.account.id, lease2.account.id);
 
-  // Third caller waits in queue; fourth caller aborts while waiting
+  // Third caller waits with no explicit pool (should still be counted in status('codeforces', 'shared')!);
+  // fourth caller waits with explicit accountIds and aborts.
   const ac = new AbortController();
-  const waiter3 = pool.acquire('codeforces', { pool: 'shared' });
-  const waiter4 = pool.acquire('codeforces', { pool: 'shared' }, ac.signal);
+  const waiter3 = pool.acquire('codeforces', {});
+  const waiter4 = pool.acquire('codeforces', { accountIds: ['cf-1'] }, ac.signal);
 
-  // Give microtasks a tick so waiters register
   await delay(10);
   assert.deepEqual(await pool.status('codeforces', 'shared'), {
     total: 2,
@@ -265,14 +323,102 @@ test('OjAccountPool manages exclusive leasing, queueing, double-release safety a
   });
 });
 
-test('OjAccountPool.enqueueSubmission strictly serializes writes per account and allows cross-account parallelism', async () => {
+test('OjAccountPool handles concurrent release + abort during async lookup with zero lease leaks and no lost waiters', async t => {
+  const { store } = await makeTempStore(t);
+  await store.create({
+    id: 'cf-r1',
+    label: 'CF R1',
+    platform: 'codeforces',
+    handle: 'r1',
+    pool: 'race',
+    transport: 'cookie',
+    secret: 'secret-race-0001',
+  });
+  await store.create({
+    id: 'cf-r2',
+    label: 'CF R2',
+    platform: 'codeforces',
+    handle: 'r2',
+    pool: 'race',
+    transport: 'cookie',
+    secret: 'secret-race-0002',
+  });
+
+  // Wrap store.list() with controlled async deferral to deterministically trigger abort mid-lookup
+  let deferNextList = false;
+  let releaseDeferredList;
+  let listStarted;
+  const wrappedStore = Object.create(store);
+  wrappedStore.list = async () => {
+    if (deferNextList) {
+      deferNextList = false;
+      listStarted?.();
+      await new Promise(resolve => {
+        releaseDeferredList = resolve;
+      });
+    }
+    return store.list();
+  };
+
+  const pool = new OjAccountPool(wrappedStore);
+  const l1 = await pool.acquire('codeforces', { pool: 'race' });
+  const l2 = await pool.acquire('codeforces', { pool: 'race' });
+
+  const ac1 = new AbortController();
+  const w1 = pool.acquire('codeforces', { pool: 'race' }, ac1.signal);
+  const w2 = pool.acquire('codeforces', { pool: 'race' });
+  const w3 = pool.acquire('codeforces', { pool: 'race' });
+  await delay(10);
+
+  // Trigger concurrent releases while w1 is mid-lookup, and abort w1 before lookup resolves!
+  deferNextList = true;
+  const startedPromise = new Promise(resolve => {
+    listStarted = resolve;
+  });
+  l1.release();
+  l2.release();
+  await startedPromise;
+  ac1.abort(new Error('aborted mid-dispatch'));
+  releaseDeferredList();
+
+  await assert.rejects(w1, /aborted mid-dispatch/);
+  // Both w2 and w3 MUST receive the two freed leases with zero leaks and zero starvation!
+  const [lease2, lease3] = await Promise.all([w2, w3]);
+  assert.notEqual(lease2.account.id, lease3.account.id);
+
+  lease2.release();
+  lease3.release();
+  assert.deepEqual(await pool.status('codeforces', 'race'), {
+    total: 2,
+    busy: 0,
+    available: 2,
+    queued: 0,
+  });
+
+  // If all remaining accounts are removed while a waiter is queued, releasing rejects the waiter promptly
+  const held = await pool.acquire('codeforces', { accountIds: ['cf-r1'] });
+  const doomed = pool.acquire('codeforces', { accountIds: ['cf-r1'] });
+  await delay(10);
+  await store.remove('cf-r1');
+  held.release();
+  await assert.rejects(doomed, err => err instanceof OjAccountError && err.status === 503);
+});
+
+test('OjAccountPool.enqueueSubmission strictly serializes writes per canonical handle key and allows cross-handle parallelism', async () => {
   const pool = new OjAccountPool([]);
   const timeline = [];
   let inFlightA = 0;
   let maxInFlightA = 0;
 
-  const jobA = (label, ms) =>
-    pool.enqueueSubmission('acc-A', async () => {
+  // Two different account IDs pointing at the same (platform, origin, handle) share one canonical key
+  const keyA1 = submissionQueueKey('codeforces', 'https://codeforces.com/', 'Bot_A');
+  const keyA2 = submissionQueueKey('codeforces', 'https://codeforces.com', 'bot_a');
+  const keyB = submissionQueueKey('codeforces', 'https://codeforces.com', 'bot_b');
+  assert.equal(keyA1, keyA2);
+  assert.notEqual(keyA1, keyB);
+
+  const jobA = (key, label, ms) =>
+    pool.enqueueSubmission(key, async () => {
       inFlightA++;
       maxInFlightA = Math.max(maxInFlightA, inFlightA);
       timeline.push(`start:${label}`);
@@ -283,17 +429,17 @@ test('OjAccountPool.enqueueSubmission strictly serializes writes per account and
     });
 
   const abortMiddle = new AbortController();
-  const p1 = jobA('A1', 40);
+  const p1 = jobA(keyA1, 'A1', 40);
   const pCancelled = pool.enqueueSubmission(
-    'acc-A',
+    keyA2,
     async () => {
       timeline.push('SHOULD_NOT_RUN');
       return 'cancelled';
     },
     abortMiddle.signal,
   );
-  const p3 = jobA('A3', 20);
-  const pB = pool.enqueueSubmission('acc-B', async () => {
+  const p3 = jobA(keyA2, 'A3', 20);
+  const pB = pool.enqueueSubmission(keyB, async () => {
     timeline.push('start:B1');
     await delay(15);
     timeline.push('end:B1');
@@ -310,6 +456,5 @@ test('OjAccountPool.enqueueSubmission strictly serializes writes per account and
   assert.equal(maxInFlightA, 1);
   assert.ok(!timeline.includes('SHOULD_NOT_RUN'));
   assert.ok(timeline.indexOf('end:A1') < timeline.indexOf('start:A3'));
-  // B1 ran in parallel with A1 and finished before A1 finished
   assert.ok(timeline.indexOf('end:B1') < timeline.indexOf('end:A1'));
 });

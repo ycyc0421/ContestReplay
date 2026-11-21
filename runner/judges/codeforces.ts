@@ -17,9 +17,11 @@ import {
   normalizeVerdict,
   parseCookieHeader,
   parseHtmlNodes,
+  resolveAdapterTransport,
+  resolveBaseUrl,
   runExternalSubmitter,
+  safeResponseJson,
   serializeCookieHeader,
-  validateOriginUrl,
   walkHtml,
 } from './types.js';
 
@@ -61,6 +63,8 @@ const cfStatusResponseSchema = z.object({
     }),
   ),
 });
+
+type CfStatusRow = z.infer<typeof cfStatusResponseSchema>['result'][number];
 
 const cfStandingsResponseSchema = z.object({
   status: z.literal('OK'),
@@ -105,8 +109,8 @@ function classifyHttpError(status: number, context: string): JudgeInfrastructure
   });
 }
 
-function detectCaptcha(html: string): boolean {
-  return /cf-turnstile|captcha|just a moment\.\.\.|verify you are human|ddos-guard/i.test(html);
+function detectCaptchaChallenge(html: string): boolean {
+  return /cf-turnstile|g-recaptcha|h-captcha|just a moment\.\.\.|verify you are human|ddos-guard/i.test(html);
 }
 
 export function cfFormForContest(
@@ -115,14 +119,11 @@ export function cfFormForContest(
   handle: string,
   opts?: { gym?: boolean; origin?: string },
 ) {
-  if (detectCaptcha(markup)) {
-    throw new JudgeInfrastructureError('captcha_required', 'Codeforces returned a bot/captcha challenge page', {
-      platform: 'codeforces',
-    });
-  }
   const gym = Boolean(opts?.gym);
-  const origin = validateOriginUrl(opts?.origin ?? CODEFORCES_DEFAULT_ORIGIN, 'codeforces');
-  const expectedPath = `/${routePrefix(gym)}/${contest}/submit`;
+  const { baseUrl, origin } = resolveBaseUrl(opts?.origin ?? CODEFORCES_DEFAULT_ORIGIN, 'codeforces');
+  const basePath = new URL(baseUrl).pathname.replace(/\/+$/, '');
+  const expectedPath = `${basePath}/${routePrefix(gym)}/${contest}/submit`;
+  const submitPageUrl = `${origin}${expectedPath}`;
   const nodes = parseHtmlNodes(markup);
   const profile = nodes.some(
     el =>
@@ -136,20 +137,26 @@ export function cfFormForContest(
       walkHtml(el).some(node => htmlAttr(node, 'name') === 'submittedProblemIndex') &&
       walkHtml(el).some(node => htmlAttr(node, 'name') === 'source'),
   );
+  // Check signed-in form FIRST so a problem title mentioning "captcha" does not false-positive.
   if (!profile || !form) {
+    if (detectCaptchaChallenge(markup)) {
+      throw new JudgeInfrastructureError('captcha_required', 'Codeforces returned a bot/captcha challenge page', {
+        platform: 'codeforces',
+      });
+    }
     throw new JudgeInfrastructureError(
       'auth_expired',
       'Codeforces did not return the signed-in submission form (session expired or wrong handle)',
       { platform: 'codeforces' },
     );
   }
-  const action = new URL(htmlAttr(form, 'action') || expectedPath, origin);
+  // Resolve relative action (e.g. "?csrf_token=...") against the actual submit page URL.
+  const rawAction = htmlAttr(form, 'action');
+  const action = new URL(rawAction || expectedPath, submitPageUrl);
   if (action.origin !== origin || action.pathname !== expectedPath) {
-    throw new JudgeInfrastructureError(
-      'upstream_unavailable',
-      `Unexpected Codeforces form route: ${action.pathname}`,
-      { platform: 'codeforces' },
-    );
+    throw new JudgeInfrastructureError('upstream_unavailable', 'Unexpected Codeforces form route', {
+      platform: 'codeforces',
+    });
   }
   const fields = new URLSearchParams();
   for (const el of walkHtml(form)) {
@@ -172,36 +179,104 @@ export function cfReceiptForContest(
 ): string | undefined {
   if (!location) return undefined;
   const gym = Boolean(opts?.gym);
-  const origin = validateOriginUrl(opts?.origin ?? CODEFORCES_DEFAULT_ORIGIN, 'codeforces');
-  const url = new URL(location, origin);
+  const { baseUrl, origin } = resolveBaseUrl(opts?.origin ?? CODEFORCES_DEFAULT_ORIGIN, 'codeforces');
+  const basePath = new URL(baseUrl).pathname.replace(/\/+$/, '');
+  const url = new URL(location, `${baseUrl}/`);
   if (url.origin !== origin) return undefined;
   const prefix = routePrefix(gym);
-  const matched = url.pathname.match(new RegExp(`^/${prefix}/${contest}/submission/(\\d+)/?$`))?.[1];
+  const escapedBase = basePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const matched = url.pathname.match(new RegExp(`^${escapedBase}/${prefix}/${contest}/submission/(\\d+)/?$`))?.[1];
   if (!matched) return undefined;
   const value = Number(matched);
   return Number.isSafeInteger(value) && value > 0 ? String(value) : undefined;
 }
 
+/**
+ * Parse authenticated `/gym/<id>/my` HTML status table into CfStatusRow records
+ * as a fallback when Codeforces API `contest.status` is restricted for a Gym.
+ */
+export function parseCfMySubmissionsHtml(markup: string, contest: number, handle: string): CfStatusRow[] {
+  const nodes = parseHtmlNodes(markup);
+  const rows: CfStatusRow[] = [];
+  for (const tr of nodes) {
+    if (tr.tagName !== 'tr') continue;
+    const rawSubId = htmlAttr(tr, 'data-submission-id');
+    const subId = rawSubId ? Number(rawSubId) : undefined;
+    if (!subId || !Number.isSafeInteger(subId) || subId <= 0) continue;
+
+    const tds = (tr.childNodes ?? []).filter(c => c.tagName === 'td');
+    if (tds.length < 6) continue;
+
+    let problemIndex: string | undefined;
+    let authorHandle: string | undefined;
+    let verdictText = '';
+    let timeMs: number | undefined;
+    let memBytes: number | undefined;
+
+    for (const td of tds) {
+      const tdNodes = walkHtml(td);
+      for (const n of tdNodes) {
+        if (n.tagName === 'a') {
+          const href = htmlAttr(n, 'href') ?? '';
+          const pMatch = href.match(new RegExp(`/(?:gym|contest)/${contest}/problem/([A-Za-z0-9]+)`));
+          if (pMatch?.[1] && !problemIndex) problemIndex = pMatch[1];
+          const uMatch = href.match(/^\/profile\/([^/?#]+)$/);
+          if (uMatch?.[1] && !authorHandle) authorHandle = decodeURIComponent(uMatch[1]);
+        }
+        const verdictAttr = htmlAttr(n, 'submissionverdict');
+        if (verdictAttr) verdictText = verdictAttr;
+      }
+      const cls = htmlAttr(td, 'class') ?? '';
+      const txt = htmlText(td).replace(/\s+/g, ' ').trim();
+      if (cls.includes('status-verdict-cell') && !verdictText) verdictText = txt;
+      if (cls.includes('time-consumed-cell')) {
+        const m = txt.match(/(\d+)\s*ms/i);
+        if (m?.[1]) timeMs = Number(m[1]);
+      }
+      if (cls.includes('memory-consumed-cell')) {
+        const m = txt.match(/(\d+)\s*KB/i);
+        if (m?.[1]) memBytes = Number(m[1]) * 1024;
+      }
+    }
+
+    if (!problemIndex) continue;
+    const effectiveHandle = authorHandle ?? handle;
+    rows.push({
+      id: subId,
+      contestId: contest,
+      problem: { index: problemIndex, contestId: contest },
+      author: {
+        participantType: 'PRACTICE',
+        members: [{ handle: effectiveHandle }],
+      },
+      creationTimeSeconds: Math.floor(Date.now() / 1000),
+      ...(verdictText ? { verdict: verdictText } : {}),
+      ...(timeMs !== undefined ? { timeConsumedMillis: timeMs } : {}),
+      ...(memBytes !== undefined ? { memoryConsumedBytes: memBytes } : {}),
+    });
+  }
+  return rows;
+}
+
 async function cfApiRequest(
-  method: 'user.status' | 'contest.standings',
+  method: 'user.status' | 'contest.status' | 'contest.standings',
   params: Record<string, string>,
-  opts: { origin: string; fetchImpl: FetchLike; signal?: AbortSignal },
+  opts: { baseUrl: string; fetchImpl: FetchLike; signal?: AbortSignal },
 ): Promise<unknown> {
-  const url = new URL(`${opts.origin}/api/${method}`);
+  const url = new URL(`${opts.baseUrl}/api/${method}`);
   url.search = new URLSearchParams(params).toString();
   const signal = AbortSignal.any([AbortSignal.timeout(15_000), ...(opts.signal ? [opts.signal] : [])]);
   let response: Response;
   try {
     response = await opts.fetchImpl(url, { redirect: 'error', signal });
-  } catch (cause) {
-    if (opts.signal?.aborted) throw cause;
+  } catch (err) {
+    if (opts.signal?.aborted) throw err;
     throw new JudgeInfrastructureError('upstream_unavailable', `Codeforces API ${method} request failed`, {
       platform: 'codeforces',
-      cause,
     });
   }
   if (!response.ok) throw classifyHttpError(response.status, `API ${method}`);
-  return response.json() as Promise<unknown>;
+  return safeResponseJson(response, 'codeforces', `API ${method}`);
 }
 
 export async function previewCodeforcesContest(
@@ -210,19 +285,20 @@ export async function previewCodeforcesContest(
 ): Promise<ContestPreview> {
   const numericId = typeof contestId === 'number' ? contestId : Number(String(contestId).replace(/^gym:/i, ''));
   if (!Number.isSafeInteger(numericId) || numericId <= 0) {
-    throw new JudgeInfrastructureError('upstream_unavailable', `Invalid Codeforces contest ID: ${contestId}`, {
+    throw new JudgeInfrastructureError('upstream_unavailable', `Invalid Codeforces contest ID`, {
       platform: 'codeforces',
     });
   }
   const gym = opts?.gym ?? (typeof contestId === 'string' && /^gym:/i.test(contestId));
-  const origin = validateOriginUrl(opts?.baseUrl ?? CODEFORCES_DEFAULT_ORIGIN, 'codeforces');
+  const { baseUrl } = resolveBaseUrl(opts?.baseUrl ?? CODEFORCES_DEFAULT_ORIGIN, 'codeforces');
   const fetchImpl = opts?.fetchImpl ?? fetch;
 
-  const raw = await cfApiRequest(
-    'contest.standings',
-    { contestId: String(numericId), from: '1', count: '1' },
-    { origin, fetchImpl, signal: opts?.signal },
-  );
+  // Regular contests do not pass extra from/count params (matching runner/codeforces.ts).
+  const params: Record<string, string> = gym
+    ? { contestId: String(numericId), showUnofficial: 'false' }
+    : { contestId: String(numericId) };
+
+  const raw = await cfApiRequest('contest.standings', params, { baseUrl, fetchImpl, signal: opts?.signal });
   const parsed = cfStandingsResponseSchema.safeParse(raw);
   if (!parsed.success) {
     throw new JudgeInfrastructureError('upstream_unavailable', 'Unexpected Codeforces contest.standings payload', {
@@ -232,7 +308,11 @@ export async function previewCodeforcesContest(
   const { contest, problems } = parsed.data.result;
   const phase = contest.phase.toUpperCase();
   const status: ContestPreview['status'] =
-    phase === 'FINISHED' ? 'finished' : phase === 'CODING' || phase === 'PENDING_SYSTEM_TEST' || phase === 'SYSTEM_TEST' ? 'active' : 'unknown';
+    phase === 'FINISHED'
+      ? 'finished'
+      : phase === 'CODING' || phase === 'PENDING_SYSTEM_TEST' || phase === 'SYSTEM_TEST'
+        ? 'active'
+        : 'unknown';
 
   return {
     platform: 'codeforces',
@@ -251,7 +331,7 @@ export async function previewCodeforcesContest(
 export interface CodeforcesJudgeConfig {
   contest_id: number;
   gym?: boolean;
-  handle: string;
+  handle?: string;
   languages: Record<string, string | number>;
   problem_map?: Record<string, string>;
   account_id?: string;
@@ -276,7 +356,8 @@ export function createCodeforcesJudge(
   deps: CodeforcesJudgeDeps = {},
 ): ProgramJudge {
   const gym = Boolean(config.gym);
-  const origin = validateOriginUrl(config.base_url ?? CODEFORCES_DEFAULT_ORIGIN, 'codeforces');
+  const { baseUrl, origin } = resolveBaseUrl(config.base_url ?? CODEFORCES_DEFAULT_ORIGIN, 'codeforces');
+  const basePath = new URL(baseUrl).pathname.replace(/\/+$/, '');
   const fetchImpl = deps.fetchImpl ?? fetch;
   const delayImpl = deps.delayImpl ?? ((ms, sig) => delay(ms, undefined, { signal: sig }));
   const settlementMs = config.settlement_ms ?? CODEFORCES_DEFAULT_SETTLEMENT_MS;
@@ -285,66 +366,75 @@ export function createCodeforcesJudge(
   const targetFor = (problem: string) =>
     Object.hasOwn(config.problem_map ?? {}, problem) ? config.problem_map![problem]! : problem;
 
-  let checkedContest: Promise<unknown> | undefined;
+  // Cache ONLY a verified contest check; clear on failure/cancellation so transient errors can retry.
+  let checkedContest: Promise<ContestPreview> | undefined;
 
-  async function resolveTransport(): Promise<
-    { mode: 'submitter'; executable: string; handle: string; accountId?: string } |
-    { mode: 'cookie'; cookie: string; handle: string; accountId?: string }
-  > {
-    if (deps.executable) {
-      return { mode: 'submitter', executable: deps.executable, handle: config.handle, accountId: config.account_id };
+  function resolveTransport() {
+    return resolveAdapterTransport({
+      platform: 'codeforces',
+      baseUrl,
+      origin,
+      configHandle: config.handle,
+      configAccountId: config.account_id,
+      deps,
+    });
+  }
+
+  async function fetchGymMyHtml(handle: string, cookie: string, signal: AbortSignal): Promise<CfStatusRow[]> {
+    const session = parseCookieHeader(cookie, 'codeforces');
+    const url = `${baseUrl}/gym/${config.contest_id}/my`;
+    const resp = await fetchImpl(url, {
+      headers: { cookie: serializeCookieHeader(session) },
+      redirect: 'manual',
+      signal,
+    });
+    if (resp.status >= 300 && resp.status < 400) {
+      throw new JudgeInfrastructureError('auth_expired', 'Codeforces redirected /gym/my request (sign-in required)', {
+        platform: 'codeforces',
+        status: resp.status,
+      });
     }
-    if (deps.cookie) {
-      return { mode: 'cookie', cookie: deps.cookie, handle: config.handle, accountId: config.account_id };
-    }
-    if (config.account_id && deps.accounts) {
-      const account = await deps.accounts.get(config.account_id);
-      if (account.platform !== 'codeforces') {
-        throw new JudgeInfrastructureError('auth_expired', `OJ account ${account.id} is not a Codeforces account`, {
-          platform: 'codeforces',
-        });
-      }
-      if (account.transport === 'submitter') {
-        if (!account.executable_path) {
-          throw new JudgeInfrastructureError('submitter_failed', 'Codeforces submitter account has no executable_path', {
+    if (!resp.ok) throw classifyHttpError(resp.status, 'gym my submissions');
+    return parseCfMySubmissionsHtml(await resp.text(), config.contest_id, handle);
+  }
+
+  async function fetchSubmissions(
+    handle: string,
+    count: number,
+    signal: AbortSignal,
+    cookie?: string,
+  ): Promise<CfStatusRow[]> {
+    if (gym) {
+      // CF user.status does NOT return Gym submissions; use contest.status for Gym.
+      try {
+        const raw = await cfApiRequest(
+          'contest.status',
+          { contestId: String(config.contest_id), handle, from: '1', count: String(count) },
+          { baseUrl, fetchImpl, signal },
+        );
+        const parsed = cfStatusResponseSchema.safeParse(raw);
+        if (!parsed.success) {
+          throw new JudgeInfrastructureError('upstream_unavailable', 'Invalid Codeforces contest.status payload', {
             platform: 'codeforces',
           });
         }
-        return { mode: 'submitter', executable: account.executable_path, handle: account.handle, accountId: account.id };
-      }
-      const secret = await deps.accounts.resolveSecret(account.id);
-      return { mode: 'cookie', cookie: secret, handle: account.handle, accountId: account.id };
-    }
-    if (deps.account) {
-      if (deps.account.transport === 'submitter' && deps.account.executable_path) {
-        return {
-          mode: 'submitter',
-          executable: deps.account.executable_path,
-          handle: deps.account.handle,
-          accountId: deps.account.id,
-        };
+        return parsed.data.result;
+      } catch (err) {
+        if (
+          cookie &&
+          err instanceof JudgeInfrastructureError &&
+          (err.code === 'auth_expired' || err.details?.status === 400)
+        ) {
+          return fetchGymMyHtml(handle, cookie, signal);
+        }
+        throw err;
       }
     }
-    const envExec = process.env.CR_CODEFORCES_SUBMITTER?.trim();
-    if (envExec) {
-      return { mode: 'submitter', executable: envExec, handle: config.handle, accountId: config.account_id };
-    }
-    const envCookie = process.env.CR_CODEFORCES_COOKIE?.trim();
-    if (envCookie) {
-      return { mode: 'cookie', cookie: envCookie, handle: config.handle, accountId: config.account_id };
-    }
-    throw new JudgeInfrastructureError(
-      'auth_expired',
-      'No Codeforces OJ account, cookie, or submitter configured',
-      { platform: 'codeforces' },
-    );
-  }
 
-  async function fetchUserSubmissions(handle: string, count: number, signal: AbortSignal) {
     const raw = await cfApiRequest(
       'user.status',
       { handle, from: '1', count: String(count) },
-      { origin, fetchImpl, signal },
+      { baseUrl, fetchImpl, signal },
     );
     const parsed = cfStatusResponseSchema.safeParse(raw);
     if (!parsed.success) {
@@ -364,18 +454,17 @@ export function createCodeforcesJudge(
     signal: AbortSignal,
   ): Promise<string> {
     const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(30_000)]);
-    const submitUrl = `${origin}/${prefix}/${config.contest_id}/submit`;
+    const submitUrl = `${baseUrl}/${prefix}/${config.contest_id}/submit`;
     const session = parseCookieHeader(cookie, 'codeforces');
     const cookieHeader = () => ({ cookie: serializeCookieHeader(session) });
 
     let formResponse: Response;
     try {
       formResponse = await fetchImpl(submitUrl, { headers: cookieHeader(), redirect: 'manual', signal: requestSignal });
-    } catch (cause) {
-      if (signal.aborted) throw cause;
+    } catch (err) {
+      if (signal.aborted) throw err;
       throw new JudgeInfrastructureError('upstream_unavailable', 'Codeforces submit form fetch failed', {
         platform: 'codeforces',
-        cause,
       });
     }
     if (formResponse.status >= 300 && formResponse.status < 400) {
@@ -387,7 +476,10 @@ export function createCodeforcesJudge(
     if (!formResponse.ok) throw classifyHttpError(formResponse.status, 'submit page');
     mergeSetCookies(session, formResponse.headers);
 
-    const { action, fields } = cfFormForContest(await formResponse.text(), config.contest_id, handle, { gym, origin });
+    const { action, fields } = cfFormForContest(await formResponse.text(), config.contest_id, handle, {
+      gym,
+      origin: baseUrl,
+    });
     fields.set('action', 'submitSolutionFormSubmitted');
     fields.set('submittedProblemIndex', target);
     fields.set('programTypeId', languageId);
@@ -395,7 +487,7 @@ export function createCodeforcesJudge(
     fields.set('source', source);
     fields.set('tabSize', '4');
 
-    const before = await fetchUserSubmissions(handle, 10, requestSignal);
+    const before = await fetchSubmissions(handle, 10, requestSignal, serializeCookieHeader(session));
     const baseline = Math.max(0, ...before.map(row => row.id));
     const since = Math.floor(Date.now() / 1000) - 10;
 
@@ -408,26 +500,26 @@ export function createCodeforcesJudge(
         redirect: 'manual',
         signal: requestSignal,
       });
-    } catch (cause) {
-      if (signal.aborted) throw cause;
+    } catch (err) {
+      if (signal.aborted) throw err;
       throw new JudgeInfrastructureError('submission_unconfirmed', 'Codeforces submit POST failed; will not retry', {
         platform: 'codeforces',
-        cause,
       });
     }
 
     const location = uploaded.headers.get('location');
-    const redirect = location && uploaded.status >= 300 && uploaded.status < 400 ? new URL(location, origin) : undefined;
-    const directId = redirect ? cfReceiptForContest(redirect.href, config.contest_id, { gym, origin }) : undefined;
+    const redirect = location && uploaded.status >= 300 && uploaded.status < 400 ? new URL(location, submitUrl) : undefined;
+    const directId = redirect ? cfReceiptForContest(redirect.href, config.contest_id, { gym, origin: baseUrl }) : undefined;
     if (directId) {
       await uploaded.body?.cancel();
       return directId;
     }
 
-    const listRedirect = redirect?.origin === origin && redirect.pathname === `/${prefix}/${config.contest_id}/my`;
+    const expectedMyPath = `${basePath}/${prefix}/${config.contest_id}/my`;
+    const listRedirect = redirect?.origin === origin && redirect.pathname === expectedMyPath;
     const bodyText = uploaded.ok ? await uploaded.text() : '';
     if (!uploaded.ok) await uploaded.body?.cancel();
-    if (bodyText && detectCaptcha(bodyText)) {
+    if (bodyText && detectCaptchaChallenge(bodyText)) {
       throw new JudgeInfrastructureError('captcha_required', 'Codeforces challenged the submission with captcha', {
         platform: 'codeforces',
       });
@@ -437,7 +529,7 @@ export function createCodeforcesJudge(
     if (listRedirect || confirmed) {
       for (let attempt = 0; attempt < 4; attempt++) {
         await delayImpl(2500, requestSignal);
-        const rows = await fetchUserSubmissions(handle, 30, requestSignal);
+        const rows = await fetchSubmissions(handle, 30, requestSignal, serializeCookieHeader(session));
         const candidates = exactPracticeCandidates(rows, {
           baseline,
           contest: config.contest_id,
@@ -484,32 +576,40 @@ export function createCodeforcesJudge(
       if (langId === undefined) {
         throw new Error(`Unsupported Codeforces language key: ${language}`);
       }
+      // Resolve transport & origin binding BEFORE any network requests.
+      const transport = await resolveTransport();
+
       if (!deps.skipContestCheck) {
-        checkedContest ??= previewCodeforcesContest(config.contest_id, {
-          gym,
-          baseUrl: origin,
-          fetchImpl,
-          signal,
-        }).then(preview => {
-          if (preview.status !== 'finished') {
-            throw new JudgeInfrastructureError(
-              'upstream_unavailable',
-              `Codeforces contest ${config.contest_id} is not finished (status: ${preview.status})`,
-              { platform: 'codeforces' },
-            );
-          }
-          return preview;
-        });
+        if (!checkedContest) {
+          const checkPromise = previewCodeforcesContest(config.contest_id, {
+            gym,
+            baseUrl,
+            fetchImpl,
+            signal,
+          }).then(preview => {
+            if (preview.status !== 'finished') {
+              throw new JudgeInfrastructureError(
+                'upstream_unavailable',
+                `Codeforces contest ${config.contest_id} is not finished`,
+                { platform: 'codeforces' },
+              );
+            }
+            return preview;
+          });
+          checkedContest = checkPromise;
+          checkPromise.catch(() => {
+            if (checkedContest === checkPromise) checkedContest = undefined;
+          });
+        }
         await checkedContest;
       }
 
       const target = targetFor(problem);
-      const transport = await resolveTransport();
       const execute = async () => {
         if (transport.mode === 'submitter') {
           return runExternalSubmitter({
             platform: 'codeforces',
-            executable: transport.executable,
+            executable: transport.executable!,
             args: [
               String(config.contest_id),
               target,
@@ -531,21 +631,20 @@ export function createCodeforcesJudge(
             execImpl: deps.execImpl,
           });
         }
-        return submitViaCookie(target, String(langId), source, transport.handle, transport.cookie, signal);
+        return submitViaCookie(target, String(langId), source, transport.handle, transport.cookie!, signal);
       };
 
-      const serializationKey = transport.accountId ?? `cf:${transport.handle.toLowerCase()}`;
       if (deps.pool) {
-        return deps.pool.enqueueSubmission(serializationKey, execute, signal);
+        return deps.pool.enqueueSubmission(transport.queueKey, execute, signal);
       }
       return execute();
     },
 
     async verdicts(ids, problems, signal) {
       if (!ids.length) return new Map();
-      const transport = await resolveTransport().catch(() => ({ handle: config.handle }));
+      const transport = await resolveTransport();
       const handle = transport.handle;
-      const rows = await fetchUserSubmissions(handle, 1000, signal);
+      const rows = await fetchSubmissions(handle, 1000, signal, transport.mode === 'cookie' ? transport.cookie : undefined);
       const wanted = new Set(ids);
       const result = new Map<string, JudgeVerdict>();
 
@@ -567,18 +666,20 @@ export function createCodeforcesJudge(
           });
         }
         const rawVerdict = row.verdict ?? 'TESTING';
-        const score = row.points;
-        const maxScore = row.problem.points;
+        // Only treat CF points as IOI partial score when the verdict is explicitly PARTIAL
+        // (avoids confusing CF time-decayed contest points with partial scoring).
+        const isExplicitPartial = rawVerdict.toUpperCase() === 'PARTIAL';
+        const score = isExplicitPartial ? row.points : undefined;
+        const maxScore = isExplicitPartial ? row.problem.points : undefined;
         const normalized = normalizeVerdict(rawVerdict, score, maxScore);
         if (normalized === 'judge_error') {
           throw new JudgeInfrastructureError(
             'upstream_unavailable',
-            `Codeforces reported judge error (${rawVerdict}) for submission ${remoteId}`,
+            `Codeforces reported judge error for submission ${remoteId}`,
             { platform: 'codeforces' },
           );
         }
-        const final = isFinalVerdict(normalized);
-        if (final) {
+        if (isFinalVerdict(normalized)) {
           result.set(remoteId, {
             remote_submission_id: remoteId,
             verdict: normalized,
