@@ -117,7 +117,9 @@ const workspaceLocks = new Map<string, Promise<void>>();
 
 async function acquireCrossProcessWorkspaceLock(baseReal: string) {
   const uid = process.getuid?.();
-  const lockDir = join(tmpdir(), `contestreplay-workspace-locks-${uid ?? 'user'}`);
+  // Anchor the cross-process lock to a stable location independent of TMPDIR so CLI and MCP
+  // processes with differing TMPDIRs always serialize on the exact same lock file.
+  const lockDir = join(homedir(), '.config', 'contestreplay', 'workspace-locks');
   await mkdir(lockDir, { recursive: true, mode: 0o700 });
   const dirInfo = await lstat(lockDir);
   if (dirInfo.isSymbolicLink() || !dirInfo.isDirectory()) {

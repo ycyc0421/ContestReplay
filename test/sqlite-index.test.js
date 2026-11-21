@@ -900,7 +900,9 @@ test('WorkspaceIndex confines custom root & transitive deps, enforces strict eff
   assert.equal(gaps.total_gaps, 2);
   assert.deepEqual(gaps.cells.map(g => g.agent).sort(), ['agents/dup-v1.json', 'agents/dup-v2.json']);
 
-  // Duplicate paths with the IDENTICAL revision collapse to 1 cell (never emitting duplicate revisions to makePlan)!
+  // Duplicate paths with the IDENTICAL planner revision (even when service_tier: fast vs priority
+  // have different profile_sha256 but map to the exact same effective Codex config & planner revision!)
+  // collapse to 1 cell so toBatchSpec never emits duplicate revisions rejected by makePlan!
   await writeFile(
     join(base, 'agents', 'dup-v1.zz-copy.json'),
     JSON.stringify({
@@ -910,7 +912,19 @@ test('WorkspaceIndex confines custom root & transitive deps, enforces strict eff
       model: 'gpt-5.3-codex',
       speed_tier: 'fast',
       provider: 'p-strict',
-      harness: { kind: 'codex', version: '0.170.0', options: { reasoning_effort: 'medium' } },
+      harness: { kind: 'codex', version: '0.170.0', options: { reasoning_effort: 'medium', service_tier: 'fast' } },
+    }),
+  );
+  await writeFile(
+    join(base, 'agents', 'dup-v1.zz-priority.json'),
+    JSON.stringify({
+      kind: 'contestreplay.dev/agent',
+      schema_version: 1,
+      id: 'dup-id',
+      model: 'gpt-5.3-codex',
+      speed_tier: 'fast',
+      provider: 'p-strict',
+      harness: { kind: 'codex', version: '0.170.0', options: { reasoning_effort: 'medium', service_tier: 'priority' } },
     }),
   );
 
@@ -962,9 +976,13 @@ test('WorkspaceIndex confines custom root & transitive deps, enforces strict eff
   assert.ok(!index.listAgents().items.some(a => a.id === 'cred-store-leak'));
 
   const covAfter = index.queryCoverage({ agentIds: ['dup-id'], contestIds: ['strict-r1'] });
-  // Still 2 cells (dup-v1-copy collapsed with dup-v1; dup-v2 preserved as distinct revision)!
-  assert.equal(covAfter.length, 2);
-  assert.deepEqual(covAfter.map(c => c.agent_path).sort(), ['agents/dup-v1.json', 'agents/dup-v2.json']);
+  // 3 cells: dup-v1.json (no service_tier), dup-v1.zz-copy.json (collapsed with dup-v1.zz-priority.json!), and dup-v2.json!
+  assert.equal(covAfter.length, 3);
+  assert.deepEqual(covAfter.map(c => c.agent_path).sort(), [
+    'agents/dup-v1.json',
+    'agents/dup-v1.zz-copy.json',
+    'agents/dup-v2.json',
+  ]);
   // Null speed_tier run NOT credited as current!
   const v1Cell = covAfter.find(c => c.agent_path === 'agents/dup-v1.json');
   assert.ok(v1Cell);

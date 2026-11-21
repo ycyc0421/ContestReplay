@@ -8,15 +8,17 @@ import {
   isForbiddenPublicFilename,
   loadVerifiedAgentFromDoc,
   loadVerifiedContestFromDoc,
+  readConfinedRegularFile,
   resolveProtectedDirs,
 } from './automation.js';
-import { sha256 } from './config.js';
+import { revisionFor, sha256 } from './config.js';
 import { Connections, type Connection } from './connections.js';
 import { speedTierSchema } from './harnesses.js';
-import { protocolDigestForPreset, resolveProtocolPreset } from './protocol.js';
+import { protocolDigest, protocolDigestForPreset, resolveProtocolPreset } from './protocol.js';
 import { canonical, documentFormat, parseDocumentText } from './serialization.js';
 
-export const INDEX_SCHEMA_VERSION = 2;
+export const INDEX_SCHEMA_VERSION = 3;
+const PLANNER_PLACEHOLDER_IMAGE = `sha256:${'0'.repeat(64)}`;
 
 const SKIPPED_DIRS = new Set(['.git', 'node_modules', 'dist', 'coverage', 'runs']);
 const MAX_CONFIG_BYTES = 1_048_576; // 1 MiB
@@ -744,6 +746,7 @@ export class WorkspaceIndex {
         speed_tier TEXT,
         agent_revision TEXT,
         effective_sha256 TEXT,
+        planner_revision TEXT,
         provider_meta_hash TEXT,
         deps_json TEXT,
         valid INTEGER NOT NULL,
@@ -1000,6 +1003,7 @@ export class WorkspaceIndex {
       speed_tier: string | null;
       agent_revision: string | null;
       effective_sha256: string | null;
+      planner_revision: string | null;
       provider_meta_hash: string | null;
       deps_json: string;
       valid: number;
@@ -1112,7 +1116,7 @@ export class WorkspaceIndex {
 
         let raw: Record<string, unknown>;
         try {
-          const bytes = await readBoundedNoFollow(fullPath, MAX_CONFIG_BYTES);
+          const { bytes } = await readConfinedRegularFile(base, fullPath, ['file'], MAX_CONFIG_BYTES);
           raw = record(parseDocumentText(bytes.toString('utf8'), documentFormat(fullPath)));
         } catch {
           scannedUpserts.push({ path: relPath, kind: 'other', mtime_ms: mtimeMs, size });
@@ -1170,6 +1174,15 @@ export class WorkspaceIndex {
             speed_tier: speedTier ?? null,
             agent_revision: 'value' in loaded ? loaded.value.profileDigest : null,
             effective_sha256: 'value' in loaded ? loaded.value.effectiveDigest : null,
+            planner_revision:
+              'value' in loaded
+                ? revisionFor(
+                    loaded.value.profile,
+                    loaded.value.effectiveDigest,
+                    PLANNER_PLACEHOLDER_IMAGE,
+                    protocolDigest,
+                  )
+                : null,
             provider_meta_hash: pHash,
             deps_json: JSON.stringify(depStats),
             valid: 'value' in loaded ? 1 : 0,
@@ -1249,9 +1262,9 @@ export class WorkspaceIndex {
       const upsertAgent = this.db.prepare(`
         INSERT OR REPLACE INTO agents (
           path, id, name, model, vendor, harness, provider, speed_tier,
-          agent_revision, effective_sha256, provider_meta_hash, deps_json,
+          agent_revision, effective_sha256, planner_revision, provider_meta_hash, deps_json,
           valid, issues_json, mtime_ms, size, indexed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       for (const a of agentUpserts) {
         upsertAgent.run(
@@ -1265,6 +1278,7 @@ export class WorkspaceIndex {
           a.speed_tier,
           a.agent_revision,
           a.effective_sha256,
+          a.planner_revision,
           a.provider_meta_hash,
           a.deps_json,
           a.valid,
@@ -1974,7 +1988,7 @@ export class WorkspaceIndex {
     }
     const agentRows = this.db
       .prepare(
-        `SELECT path, id, name, harness, speed_tier, agent_revision, effective_sha256, valid FROM agents ${agentWhere.length ? `WHERE ${agentWhere.join(' AND ')}` : ''} ORDER BY id ASC, valid DESC, path ASC`,
+        `SELECT path, id, name, harness, speed_tier, agent_revision, effective_sha256, planner_revision, valid FROM agents ${agentWhere.length ? `WHERE ${agentWhere.join(' AND ')}` : ''} ORDER BY id ASC, valid DESC, path ASC`,
       )
       .all(...agentParams) as unknown as Array<{
       path: string;
@@ -1984,6 +1998,7 @@ export class WorkspaceIndex {
       speed_tier: string | null;
       agent_revision: string | null;
       effective_sha256: string | null;
+      planner_revision: string | null;
       valid: number;
     }>;
 
@@ -2061,14 +2076,14 @@ export class WorkspaceIndex {
       list.push(r);
     }
 
-    // Collapse duplicate paths that resolve to the EXACT same agent/contest revision (so toBatchSpec
+    // Collapse duplicate paths that resolve to the EXACT same planner revision identity (so toBatchSpec
     // never emits duplicate revisions rejected by makePlan), while preserving distinct valid revisions sharing an ID!
     const uniqueAgents: typeof agentRows = [];
     const seenAgentRevs = new Set<string>();
     for (const a of agentRows) {
       const revKey =
-        a.valid === 1 && (a.agent_revision !== null || a.effective_sha256 !== null)
-          ? JSON.stringify([a.id, a.agent_revision, a.effective_sha256, a.speed_tier ?? 'standard'])
+        a.valid === 1 && a.planner_revision !== null
+          ? JSON.stringify([a.id, a.planner_revision, a.speed_tier ?? 'standard'])
           : `path:${a.path}`;
       if (seenAgentRevs.has(revKey)) continue;
       seenAgentRevs.add(revKey);
@@ -2079,8 +2094,8 @@ export class WorkspaceIndex {
     const seenContestRevs = new Set<string>();
     for (const c of contestRows) {
       const revKey =
-        c.valid === 1 && (c.contest_revision !== null || c.contest_sha256 !== null)
-          ? JSON.stringify([c.id, c.data_version, c.contest_revision, c.contest_sha256])
+        c.valid === 1 && c.contest_sha256 !== null
+          ? JSON.stringify([c.id, c.data_version, c.contest_sha256])
           : `path:${c.path}`;
       if (seenContestRevs.has(revKey)) continue;
       seenContestRevs.add(revKey);

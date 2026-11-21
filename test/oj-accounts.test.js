@@ -368,7 +368,11 @@ test('OjAccountPool handles concurrent release + abort during async lookup with 
   const w1 = pool.acquire('codeforces', { pool: 'race' }, ac1.signal);
   const w2 = pool.acquire('codeforces', { pool: 'race' });
   const w3 = pool.acquire('codeforces', { pool: 'race' });
-  await delay(10);
+  for (let i = 0; i < 50; i++) {
+    if ((await pool.status('codeforces', 'race')).queued === 3) break;
+    await delay(5);
+  }
+  assert.equal((await pool.status('codeforces', 'race')).queued, 3);
 
   // Trigger concurrent releases while w1 is mid-lookup, and abort w1 before lookup resolves!
   deferNextList = true;
