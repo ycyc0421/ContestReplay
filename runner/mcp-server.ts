@@ -1,12 +1,10 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { chmod, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { realpath } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
 import { z } from 'zod';
-import { agentKind, FieldError, manifestProvider } from './agent-manifest.js';
+import { FieldError, manifestProvider } from './agent-manifest.js';
 import {
-  assertNotForbiddenMaterialPath,
   assertNotInProtectedDirs,
   batchApplyAgents,
   batchImportContests,
@@ -16,35 +14,25 @@ import {
   ifExistsSchema,
   inspectPdfBytes,
   isForbiddenPublicFilename,
-  isJudgeAnswerBytes,
+  loadVerifiedAgentFromDoc,
+  loadVerifiedContestFromDoc,
   readConfinedRegularFile,
   resolveConfinedPath,
   resolveProtectedDirs,
   schemaTargetSchema,
 } from './automation.js';
-import {
-  agentDigests,
-  agentRevision,
-  agentSchema,
-  resolveAgentManifest,
-  resolveContest,
-  sha256,
-  validated,
-} from './config.js';
+import { agentRevision, sha256 } from './config.js';
 import { Connections } from './connections.js';
 import { speedTierSchema } from './harnesses.js';
 import { OjAccounts, ojPlatformSchema } from './oj-accounts.js';
 import { checkPdfLimits } from './pdf-synth.js';
 import { specSchema } from './plan.js';
 import { protocolDigest, protocolPresetNames, protocolPresets, resolveProtocolPreset } from './protocol.js';
-import { canonical, documentFormat, formatSchema, parseDocumentText, serializeDocument } from './serialization.js';
+import { documentFormat, formatSchema, parseDocumentText, serializeDocument } from './serialization.js';
 import { toBatchSpec, WorkspaceIndex } from './sqlite-index.js';
 
 const PREVIEW_PLACEHOLDER_IMAGE = `sha256:${'0'.repeat(64)}`;
 const MAX_MANIFEST_BYTES = 1_048_576;
-const MAX_NATIVE_CONFIG_BYTES = 64_000;
-const MAX_ATTACHMENT_BYTES = 16_000_000;
-const MAX_JUDGE_FILE_BYTES = 4_000_000;
 const MAX_PDF_BYTES = 128 * 1024 * 1024;
 
 export interface WorkbenchMcpOptions {
@@ -82,276 +70,6 @@ function errorPayload(error: unknown, code = 'error'): Record<string, unknown> {
   };
 }
 
-async function prevalidateAgentTransitiveRefs(
-  base: string,
-  agentAbsPath: string,
-  rawDoc: Record<string, unknown>,
-  protectedDirs: readonly string[],
-): Promise<{
-  validationDoc: Record<string, unknown>;
-  savedNativeConfig?: Record<string, unknown>;
-  legacyConfigText?: string;
-}> {
-  const dir = dirname(agentAbsPath);
-  let validationDoc: Record<string, unknown> = rawDoc;
-  let savedNativeConfig: Record<string, unknown> | undefined;
-  let legacyConfigText: string | undefined;
-
-  const harnessObj =
-    rawDoc.harness && typeof rawDoc.harness === 'object' && !Array.isArray(rawDoc.harness)
-      ? (rawDoc.harness as Record<string, unknown>)
-      : undefined;
-  const nativeCfg =
-    harnessObj?.native_config &&
-    typeof harnessObj.native_config === 'object' &&
-    !Array.isArray(harnessObj.native_config)
-      ? (harnessObj.native_config as Record<string, unknown>)
-      : undefined;
-  if (nativeCfg && typeof nativeCfg.path === 'string') {
-    const candidate = isAbsolute(nativeCfg.path) ? nativeCfg.path : resolve(dir, nativeCfg.path);
-    const nativeRead = await readConfinedRegularFile(
-      base,
-      candidate,
-      ['harness', 'native_config', 'path'],
-      MAX_NATIVE_CONFIG_BYTES,
-    );
-    assertNotInProtectedDirs(
-      nativeRead.absPath,
-      nativeRead.relPath,
-      protectedDirs,
-      ['harness', 'native_config', 'path'],
-      'Native config',
-    );
-    if (typeof nativeCfg.sha256 === 'string' && sha256(nativeRead.bytes) !== nativeCfg.sha256) {
-      throw new FieldError(
-        ['harness', 'native_config', 'sha256'],
-        `Native config SHA-256 mismatch: ${nativeRead.relPath}`,
-      );
-    }
-    const normalizedPath = isAbsolute(nativeCfg.path)
-      ? relative(dir, nativeRead.absPath).split(sep).join('/')
-      : nativeCfg.path;
-    savedNativeConfig = {
-      ...nativeCfg,
-      path: normalizedPath,
-    };
-    validationDoc = {
-      ...rawDoc,
-      harness: {
-        ...harnessObj,
-        native_config: {
-          format: nativeCfg.format,
-          ...(typeof nativeCfg.schema === 'string' ? { schema: nativeCfg.schema } : {}),
-          content: nativeRead.bytes.toString('utf8'),
-        },
-      },
-    };
-  }
-  if (typeof rawDoc.config === 'string') {
-    const candidate = isAbsolute(rawDoc.config) ? rawDoc.config : resolve(dir, rawDoc.config);
-    const legacyRead = await readConfinedRegularFile(base, candidate, ['config'], MAX_NATIVE_CONFIG_BYTES);
-    assertNotInProtectedDirs(legacyRead.absPath, legacyRead.relPath, protectedDirs, ['config'], 'Legacy config');
-    legacyConfigText = legacyRead.bytes.toString('utf8');
-  }
-  return { validationDoc, savedNativeConfig, legacyConfigText };
-}
-
-interface VerifiedContestFiles {
-  entrypointBytes?: Buffer;
-  attachments: Array<{ index: number; bytes: Buffer }>;
-  judgeBytes?: Buffer;
-}
-
-async function prevalidateContestTransitiveRefs(
-  base: string,
-  contestAbsPath: string,
-  rawDoc: Record<string, unknown>,
-  protectedDirs: readonly string[],
-): Promise<VerifiedContestFiles> {
-  const dir = dirname(contestAbsPath);
-  const verified: VerifiedContestFiles = { attachments: [] };
-
-  let judgeAbsPath: string | undefined;
-  const judge =
-    rawDoc.judge && typeof rawDoc.judge === 'object' && !Array.isArray(rawDoc.judge)
-      ? (rawDoc.judge as Record<string, unknown>)
-      : undefined;
-  if (judge) {
-    const answers =
-      judge.answers && typeof judge.answers === 'object' && !Array.isArray(judge.answers)
-        ? (judge.answers as Record<string, unknown>)
-        : undefined;
-    const rawJudgePath = typeof answers?.path === 'string' ? answers.path : typeof judge.path === 'string' ? judge.path : undefined;
-    const judgeFieldPath = typeof answers?.path === 'string' ? ['judge', 'answers', 'path'] : ['judge', 'path'];
-    if (rawJudgePath !== undefined) {
-      const candidate = isAbsolute(rawJudgePath) ? rawJudgePath : resolve(dir, rawJudgePath);
-      const judgeRead = await readConfinedRegularFile(base, candidate, judgeFieldPath, MAX_JUDGE_FILE_BYTES);
-      assertNotInProtectedDirs(judgeRead.absPath, judgeRead.relPath, protectedDirs, judgeFieldPath, 'Local answers file');
-      judgeAbsPath = judgeRead.absPath;
-      verified.judgeBytes = judgeRead.bytes;
-    }
-  }
-
-  const checkEntrypoint = async (rawPath: unknown, fieldPath: string[]) => {
-    if (typeof rawPath !== 'string') return;
-    const candidate = isAbsolute(rawPath) ? rawPath : resolve(dir, rawPath);
-    const confined = await resolveConfinedPath(base, candidate, fieldPath);
-    assertNotForbiddenMaterialPath(confined.absPath, confined.relPath, protectedDirs, judgeAbsPath, fieldPath);
-    const loaded = await readConfinedRegularFile(base, confined.absPath, fieldPath, MAX_PDF_BYTES);
-    verified.entrypointBytes = loaded.bytes;
-  };
-
-  const materials =
-    rawDoc.materials && typeof rawDoc.materials === 'object' && !Array.isArray(rawDoc.materials)
-      ? (rawDoc.materials as Record<string, unknown>)
-      : undefined;
-  if (materials) {
-    const entry =
-      materials.entrypoint && typeof materials.entrypoint === 'object' && !Array.isArray(materials.entrypoint)
-        ? (materials.entrypoint as Record<string, unknown>)
-        : undefined;
-    await checkEntrypoint(entry?.path, ['materials', 'entrypoint', 'path']);
-    if (Array.isArray(materials.attachments)) {
-      for (let i = 0; i < materials.attachments.length; i++) {
-        const att = materials.attachments[i];
-        if (att && typeof att === 'object' && !Array.isArray(att)) {
-          const attPath = (att as Record<string, unknown>).path;
-          if (typeof attPath !== 'string') continue;
-          const fieldPath = ['materials', 'attachments', String(i), 'path'];
-          const candidate = isAbsolute(attPath) ? attPath : resolve(dir, attPath);
-          const confined = await resolveConfinedPath(base, candidate, fieldPath);
-          assertNotForbiddenMaterialPath(confined.absPath, confined.relPath, protectedDirs, judgeAbsPath, fieldPath);
-          const attRead = await readConfinedRegularFile(base, confined.absPath, fieldPath, MAX_ATTACHMENT_BYTES);
-          if (isJudgeAnswerBytes(attRead.bytes)) {
-            throw new FieldError(fieldPath, `Judge answer file cannot be exposed as contest material: ${confined.relPath}`);
-          }
-          verified.attachments.push({ index: i, bytes: attRead.bytes });
-        }
-      }
-    }
-  }
-  const statement =
-    rawDoc.statement && typeof rawDoc.statement === 'object' && !Array.isArray(rawDoc.statement)
-      ? (rawDoc.statement as Record<string, unknown>)
-      : undefined;
-  await checkEntrypoint(statement?.path, ['statement', 'path']);
-
-  return verified;
-}
-
-async function resolvePreviewContestFromVerified(
-  rawDoc: Record<string, unknown>,
-  verified: VerifiedContestFiles,
-  relPath: string,
-) {
-  const stageDir = await mkdtemp(join(tmpdir(), 'cr-preview-contest-'));
-  await chmod(stageDir, 0o700);
-  try {
-    const stagedDoc: Record<string, unknown> = { ...rawDoc };
-    if (verified.entrypointBytes !== undefined) {
-      await writeFile(join(stageDir, 'entrypoint.pdf'), verified.entrypointBytes, { mode: 0o600, flag: 'wx' });
-    }
-    if (verified.judgeBytes !== undefined) {
-      await writeFile(join(stageDir, 'judge.json'), verified.judgeBytes, { mode: 0o600, flag: 'wx' });
-    }
-    const attStageNames = new Map<number, string>();
-    for (const att of verified.attachments) {
-      const name = `att-${att.index}.bin`;
-      await writeFile(join(stageDir, name), att.bytes, { mode: 0o600, flag: 'wx' });
-      attStageNames.set(att.index, name);
-    }
-
-    let origEntryPath: string | undefined;
-    const origAttPaths: string[] = [];
-    let origJudgePath: string | undefined;
-
-    if (rawDoc.materials && typeof rawDoc.materials === 'object' && !Array.isArray(rawDoc.materials)) {
-      const mats = rawDoc.materials as Record<string, unknown>;
-      const entry =
-        mats.entrypoint && typeof mats.entrypoint === 'object' && !Array.isArray(mats.entrypoint)
-          ? (mats.entrypoint as Record<string, unknown>)
-          : undefined;
-      if (entry && typeof entry.path === 'string') {
-        origEntryPath = entry.path;
-      }
-      const nextAttachments = Array.isArray(mats.attachments)
-        ? mats.attachments.map((att, idx) => {
-            if (att && typeof att === 'object' && !Array.isArray(att)) {
-              const rec = att as Record<string, unknown>;
-              if (typeof rec.path === 'string') origAttPaths[idx] = rec.path;
-              const stageName = attStageNames.get(idx);
-              if (stageName) return { ...rec, path: stageName };
-            }
-            return att;
-          })
-        : mats.attachments;
-      stagedDoc.materials = {
-        ...mats,
-        ...(entry && verified.entrypointBytes !== undefined ? { entrypoint: { ...entry, path: 'entrypoint.pdf' } } : {}),
-        ...(nextAttachments !== undefined ? { attachments: nextAttachments } : {}),
-      };
-    }
-
-    if (rawDoc.statement && typeof rawDoc.statement === 'object' && !Array.isArray(rawDoc.statement)) {
-      const stmt = rawDoc.statement as Record<string, unknown>;
-      if (typeof stmt.path === 'string') origEntryPath = stmt.path;
-      if (verified.entrypointBytes !== undefined) {
-        stagedDoc.statement = { ...stmt, path: 'entrypoint.pdf' };
-      }
-    }
-
-    if (rawDoc.judge && typeof rawDoc.judge === 'object' && !Array.isArray(rawDoc.judge)) {
-      const judge = rawDoc.judge as Record<string, unknown>;
-      if (judge.answers && typeof judge.answers === 'object' && !Array.isArray(judge.answers)) {
-        const answers = judge.answers as Record<string, unknown>;
-        if (typeof answers.path === 'string') origJudgePath = answers.path;
-        if (verified.judgeBytes !== undefined) {
-          stagedDoc.judge = { ...judge, answers: { ...answers, path: 'judge.json' } };
-        }
-      } else if (typeof judge.path === 'string') {
-        origJudgePath = judge.path;
-        if (verified.judgeBytes !== undefined) {
-          stagedDoc.judge = { ...judge, path: 'judge.json' };
-        }
-      }
-    }
-
-    try {
-      const loaded = await resolveContest(stagedDoc, join(stageDir, 'contest.json'));
-      const { statement: _stmt, ...v } = loaded.contest;
-      const restored = {
-        ...v,
-        materials: {
-          entrypoint: {
-            ...v.materials.entrypoint,
-            ...(origEntryPath !== undefined ? { path: origEntryPath } : {}),
-          },
-          attachments: v.materials.attachments.map((att, idx) => ({
-            ...att,
-            ...(origAttPaths[idx] !== undefined ? { path: origAttPaths[idx]! } : {}),
-          })),
-        },
-        judge:
-          v.judge.kind === 'local' && origJudgePath !== undefined
-            ? { ...v.judge, answers: { ...v.judge.answers, path: origJudgePath } }
-            : v.judge,
-      };
-      return {
-        contest: loaded.contest,
-        contestDigest: sha256(JSON.stringify(restored)),
-      };
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : 'Invalid contest';
-      if (msg.includes('Invalid JSON')) {
-        throw new FieldError(['contests', relPath], `Invalid JSON: ${relPath}`);
-      }
-      throw error;
-    }
-  } finally {
-    await rm(stageDir, { recursive: true, force: true });
-  }
-}
-
 /**
  * Creates a narrow-permission local ContestReplay MCP server for Coding Agents.
  *
@@ -374,7 +92,7 @@ export function createWorkbenchMcpServer(opts: WorkbenchMcpOptions): McpServer {
   const withIndex = async <T>(fn: (index: WorkspaceIndex) => Promise<T> | T): Promise<T> => {
     const index = new WorkspaceIndex(root);
     try {
-      await index.sync({ base, root, store });
+      await index.sync({ base, root, store, credentialDirs });
       return await fn(index);
     } finally {
       index.close();
@@ -601,52 +319,54 @@ export function createWorkbenchMcpServer(opts: WorkbenchMcpOptions): McpServer {
           credentialDirs,
         });
         const previewPath = join(baseReal, 'agents', 'preview.toml');
-        const { validationDoc, savedNativeConfig } = await prevalidateAgentTransitiveRefs(
+        const loaded = await loadVerifiedAgentFromDoc({
           base,
-          previewPath,
-          document,
+          agentAbsPath: previewPath,
+          relPath: 'agents/preview.toml',
+          rawDoc: document,
+          store,
           protectedDirs,
-        );
-
-        const resolved = await resolveAgentManifest(validationDoc, previewPath, store);
-        const digestsRaw = agentDigests(resolved.profile, resolved.native, resolved.nativeText, resolved.env);
-        const manifestForSource = savedNativeConfig
+        });
+        if (!loaded.manifest || !loaded.connection || !loaded.effective) {
+          throw new FieldError(['document'], 'Agent manifest must be a valid v1 manifest');
+        }
+        const manifestForSource = loaded.savedNativeConfig
           ? {
-              ...resolved.manifest,
+              ...loaded.manifest,
               harness: {
-                ...resolved.manifest.harness,
-                native_config: savedNativeConfig,
+                ...loaded.manifest.harness,
+                native_config: loaded.savedNativeConfig,
               },
             }
-          : resolved.manifest;
+          : loaded.manifest;
         const serialized = serializeDocument(manifestForSource, 'toml');
         return mcpResult({
           ok: true,
           valid: true,
-          agent_id: resolved.manifest.id,
-          ...(resolved.manifest.name ? { name: resolved.manifest.name } : {}),
+          agent_id: loaded.manifest.id,
+          ...(loaded.manifest.name ? { name: loaded.manifest.name } : {}),
           provider: {
-            id: manifestProvider(resolved.manifest),
-            label: resolved.connection.label,
-            protocol: resolved.connection.protocol,
-            base_url: resolved.connection.base_url,
-            ...(resolved.connection.supports_fast !== undefined
-              ? { supports_fast: resolved.connection.supports_fast }
+            id: manifestProvider(loaded.manifest),
+            label: loaded.connection.label,
+            protocol: loaded.connection.protocol,
+            base_url: loaded.connection.base_url,
+            ...(loaded.connection.supports_fast !== undefined
+              ? { supports_fast: loaded.connection.supports_fast }
               : {}),
-            ...(resolved.connection.supports_ultrafast !== undefined
-              ? { supports_ultrafast: resolved.connection.supports_ultrafast }
+            ...(loaded.connection.supports_ultrafast !== undefined
+              ? { supports_ultrafast: loaded.connection.supports_ultrafast }
               : {}),
           },
-          speed_tier: resolved.manifest.speed_tier ?? 'standard',
+          speed_tier: loaded.manifest.speed_tier ?? 'standard',
           effective: {
-            format: resolved.effective.format,
-            content: resolved.effective.content,
+            format: loaded.effective.format,
+            content: loaded.effective.content,
           },
           digests: {
             source_sha256: sha256(serialized),
-            profile_sha256: digestsRaw.profileDigest,
-            ...(digestsRaw.nativeDigest ? { native_sha256: digestsRaw.nativeDigest } : {}),
-            effective_sha256: digestsRaw.effectiveDigest,
+            profile_sha256: loaded.profileDigest,
+            ...(loaded.nativeDigest ? { native_sha256: loaded.nativeDigest } : {}),
+            effective_sha256: loaded.effectiveDigest,
           },
         });
       } catch (error) {
@@ -947,52 +667,16 @@ export function createWorkbenchMcpServer(opts: WorkbenchMcpOptions): McpServer {
                 throw new FieldError(['agents', ref], `Invalid agent manifest: ${confined.relPath}`);
               }
               const rawDoc = rawParsed as Record<string, unknown>;
-              const pre = await prevalidateAgentTransitiveRefs(base, confined.absPath, rawDoc, protectedDirs);
-
-              let profile;
-              let effectiveDigest: string;
-              let agentName: string | undefined;
-              let speedTier: string;
-              if ('kind' in rawDoc) {
-                if (rawDoc.kind !== agentKind) {
-                  throw new FieldError(['agents', ref], 'Unsupported Agent manifest kind');
-                }
-                const resolved = await resolveAgentManifest(pre.validationDoc, confined.absPath, store);
-                profile = resolved.profile;
-                effectiveDigest = agentDigests(resolved.profile, resolved.native, resolved.nativeText, resolved.env).effectiveDigest;
-                agentName = profile.name;
-                speedTier = profile.speed_tier ?? 'standard';
-              } else {
-                let candidateRaw: unknown = rawDoc;
-                let nativeText: string | undefined;
-                if ('schema_version' in rawDoc || 'agent_id' in rawDoc) {
-                  if (
-                    rawDoc.schema_version !== 1 ||
-                    typeof rawDoc.agent_id !== 'string' ||
-                    typeof rawDoc.config !== 'string' ||
-                    pre.legacyConfigText === undefined
-                  ) {
-                    throw new FieldError(['agents', ref], `Invalid legacy agent manifest: ${confined.relPath}`);
-                  }
-                  let parsedLegacy: Record<string, unknown>;
-                  try {
-                    parsedLegacy = Object(parseDocumentText(pre.legacyConfigText, 'toml')) as Record<string, unknown>;
-                  } catch {
-                    throw new FieldError(['agents', ref], `Invalid legacy config TOML: ${confined.relPath}`);
-                  }
-                  const { name: _displayName, ...nativeCore } = parsedLegacy;
-                  nativeText = canonical(nativeCore);
-                  const hObj =
-                    rawDoc.harness && typeof rawDoc.harness === 'object' && !Array.isArray(rawDoc.harness)
-                      ? (rawDoc.harness as Record<string, unknown>)
-                      : undefined;
-                  candidateRaw = { ...parsedLegacy, id: rawDoc.agent_id, harness: hObj?.kind };
-                }
-                profile = validated(agentSchema, candidateRaw, confined.relPath);
-                effectiveDigest = agentDigests(profile, undefined, nativeText, undefined).effectiveDigest;
-                agentName = profile.name;
-                speedTier = profile.speed_tier ?? 'standard';
-              }
+              const loaded = await loadVerifiedAgentFromDoc({
+                base,
+                agentAbsPath: confined.absPath,
+                relPath: confined.relPath,
+                rawDoc,
+                store,
+                protectedDirs,
+                fieldPrefix: ['agents', ref],
+              });
+              const { profile, effectiveDigest, agentName, speedTier } = loaded;
 
               if (profile.api !== 'responses' && profile.api !== 'passthrough') {
                 throw new Error(
@@ -1035,8 +719,14 @@ export function createWorkbenchMcpServer(opts: WorkbenchMcpOptions): McpServer {
                 throw new FieldError(['contests', ref], `Invalid contest manifest: ${confined.relPath}`);
               }
               const rawDoc = rawParsed as Record<string, unknown>;
-              const verifiedFiles = await prevalidateContestTransitiveRefs(base, confined.absPath, rawDoc, protectedDirs);
-              const loaded = await resolvePreviewContestFromVerified(rawDoc, verifiedFiles, confined.relPath);
+              const loaded = await loadVerifiedContestFromDoc({
+                base,
+                contestAbsPath: confined.absPath,
+                relPath: confined.relPath,
+                rawDoc,
+                protectedDirs,
+                fieldPrefix: ['contests', ref],
+              });
               // Retain ONLY lightweight metadata; immediately drop PDF, attachment buffers, and judge answers!
               contests.set(ref, {
                 absPath: confined.absPath,

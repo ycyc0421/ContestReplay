@@ -1160,4 +1160,100 @@ test('MCP cr_catalog_list invokes 0 secret methods via prototype spy, and cr_pla
   const brokenText = parseToolJson(brokenRes).text;
   assert.ok(!brokenText.includes(SECRET_LINE), 'Leaked raw malformed JSON content in cr_plan_preview!');
   assert.match(brokenText, /Invalid JSON: contests\/broken\.json/);
+
+  // 2d. Protected-dir check MUST execute BEFORE opening files (unreadable 0o000 file inside base/runs fails with protected-dir error, not EACCES)!
+  await mkdir(join(base, 'runs'), { recursive: true });
+  const protectedFile = join(base, 'runs', 'unreadable-native.toml');
+  await writeFile(protectedFile, 'model_reasoning_effort = "high"\n', { mode: 0o600 });
+  await chmod(protectedFile, 0o000);
+  t.after(() => chmod(protectedFile, 0o600).catch(() => {}));
+  const protectedNativeRes = await client.callTool({
+    name: 'cr_agent_validate',
+    arguments: {
+      document: {
+        kind: 'contestreplay.dev/agent',
+        schema_version: 1,
+        id: 'prot-check',
+        vendor: 'openai',
+        model: 'gpt-5.3-codex',
+        provider: 'p-spy',
+        harness: {
+          kind: 'codex',
+          version: '0.170.0',
+          options: {},
+          native_config: { format: 'toml', path: '../runs/unreadable-native.toml', sha256: 'a'.repeat(64) },
+        },
+      },
+    },
+  });
+  assert.equal(protectedNativeRes.isError, true);
+  assert.match(parseToolJson(protectedNativeRes).text, /cannot reside inside runs\//i);
+  assert.doesNotMatch(parseToolJson(protectedNativeRes).text, /EACCES|permission denied/i);
+
+  // 2e. Preview & cr_agent_validate MUST reject native_config path reference missing required sha256!
+  await writeFile(join(base, 'agents', 'override.toml'), 'model_reasoning_effort = "high"\n');
+  const noShaRes = await client.callTool({
+    name: 'cr_agent_validate',
+    arguments: {
+      document: {
+        kind: 'contestreplay.dev/agent',
+        schema_version: 1,
+        id: 'no-sha-agent',
+        vendor: 'openai',
+        model: 'gpt-5.3-codex',
+        provider: 'p-spy',
+        harness: {
+          kind: 'codex',
+          version: '0.170.0',
+          options: {},
+          native_config: { format: 'toml', path: 'override.toml' },
+        },
+      },
+    },
+  });
+  assert.equal(noShaRes.isError, true);
+
+  // 2f. Legacy agent preview MUST enforce strict harness version ('0.1.0')!
+  await writeFile(
+    join(base, 'agents', 'legacy-cfg.toml'),
+    'id = "leg-1"\nharness = "builtin-responses"\nmodel = "gpt-4.1-2025-04-14"\n',
+  );
+  await writeFile(
+    join(base, 'agents', 'legacy-bad-ver.json'),
+    JSON.stringify({
+      schema_version: 1,
+      agent_id: 'leg-1',
+      harness: { kind: 'builtin-responses', version: '9.9.9' },
+      config: 'legacy-cfg.toml',
+    }),
+  );
+  const badLegacyRes = await client.callTool({
+    name: 'cr_plan_preview',
+    arguments: { spec: { schema_version: 2, cells: [{ agent: 'agents/legacy-bad-ver.json', contest: 'contests/ok.json' }] } },
+  });
+  assert.equal(badLegacyRes.isError, true);
+
+  // 2g. Preview MUST enforce attachment count limit (> 32) BEFORE buffering!
+  await writeFile(join(base, 'contests', 'tiny.txt'), 'ok\n');
+  await writeFile(
+    join(base, 'contests', 'too-many-att.json'),
+    JSON.stringify({
+      schema_version: 2,
+      contest_id: 'many-att',
+      data_version: 1,
+      title: 'Too Many Attachments',
+      source: { name: 'Local' },
+      materials: {
+        entrypoint: { kind: 'pdf', path: 'p.pdf' },
+        attachments: Array.from({ length: 33 }, (_, idx) => ({ name: `f${idx}.txt`, path: 'tiny.txt' })),
+      },
+      judge: { kind: 'local', answers: { path: 'judge.json' } },
+    }),
+  );
+  const tooManyAttRes = await client.callTool({
+    name: 'cr_plan_preview',
+    arguments: { spec: { schema_version: 2, cells: [{ agent: 'agents/a1.json', contest: 'contests/too-many-att.json' }] } },
+  });
+  assert.equal(tooManyAttRes.isError, true);
+  assert.match(parseToolJson(tooManyAttRes).text, /maximum of 32/i);
 });

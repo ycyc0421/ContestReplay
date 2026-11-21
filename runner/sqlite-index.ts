@@ -4,8 +4,13 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { z } from 'zod';
 import { agentKind } from './agent-manifest.js';
-import { isForbiddenPublicFilename } from './automation.js';
-import { loadAgent, loadContest, sha256 } from './config.js';
+import {
+  isForbiddenPublicFilename,
+  loadVerifiedAgentFromDoc,
+  loadVerifiedContestFromDoc,
+  resolveProtectedDirs,
+} from './automation.js';
+import { sha256 } from './config.js';
 import { Connections, type Connection } from './connections.js';
 import { speedTierSchema } from './harnesses.js';
 import { protocolDigestForPreset, resolveProtocolPreset } from './protocol.js';
@@ -118,54 +123,6 @@ async function depsUnchanged(baseReal: string, depsJson: string | null): Promise
   for (const dep of deps) {
     const current = await statDep(baseReal, dep.path);
     if (current.mtime_ms !== dep.mtime_ms || current.size !== dep.size) {
-      return false;
-    }
-  }
-  return true;
-}
-
-async function isConfinedNoSymlink(
-  baseReal: string,
-  candidatePath: string,
-  opts?: { forbidPublicFilename?: boolean; rawRoot?: string; rootReal?: string },
-): Promise<boolean> {
-  if (!candidatePath || candidatePath.includes('\0')) return false;
-  const rel = relative(baseReal, candidatePath);
-  if (!rel || rel === '.' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-    return false;
-  }
-  const parts = rel.split(sep);
-  if (parts.some(seg => !seg || seg === '.' || seg === '..' || seg.startsWith('.'))) {
-    return false;
-  }
-  if (parts[0] === 'runs') return false;
-  if (
-    opts?.rawRoot &&
-    opts.rawRoot !== baseReal &&
-    (candidatePath === opts.rawRoot || candidatePath.startsWith(opts.rawRoot + sep))
-  ) {
-    return false;
-  }
-  if (
-    opts?.rootReal &&
-    opts.rootReal !== baseReal &&
-    (candidatePath === opts.rootReal || candidatePath.startsWith(opts.rootReal + sep))
-  ) {
-    return false;
-  }
-  if (opts?.forbidPublicFilename && isForbiddenPublicFilename(candidatePath)) {
-    return false;
-  }
-  let current = baseReal;
-  for (let i = 0; i < parts.length; i++) {
-    current = join(current, parts[i]!);
-    try {
-      const info = await lstat(current);
-      if (info.isSymbolicLink()) return false;
-      if (i < parts.length - 1 && !info.isDirectory()) return false;
-      if (i === parts.length - 1 && !info.isFile()) return false;
-    } catch (error) {
-      if (isEnoent(error)) break;
       return false;
     }
   }
@@ -380,6 +337,7 @@ export interface SyncOptions {
   base?: string;
   root?: string;
   store?: Connections;
+  credentialDirs?: string[];
 }
 
 export interface SyncStats {
@@ -576,7 +534,8 @@ function runMatchesCurrentRevision(
   if (agent.effective_sha256 !== null) {
     if (r.effective_sha256 === null || r.effective_sha256 !== agent.effective_sha256) return false;
   }
-  if ((r.speed_tier || 'standard') !== (agent.speed_tier || 'standard')) return false;
+  const expectedSpeedTier = agent.speed_tier || 'standard';
+  if (r.speed_tier === null || r.speed_tier !== expectedSpeedTier) return false;
   if (contest.contest_revision !== null || contest.contest_sha256 !== null) {
     if (contest.contest_revision !== null && r.contest_revision !== null) {
       if (r.contest_revision !== contest.contest_revision) return false;
@@ -960,7 +919,14 @@ export class WorkspaceIndex {
       runs_pruned: 0,
     };
 
-    await this.syncConfigs(base, root, rootReal, store, nowIso, stats);
+    const protectedDirs = await resolveProtectedDirs({
+      baseReal: base,
+      baseResolved: rawBase,
+      root,
+      store,
+      credentialDirs: opts.credentialDirs,
+    });
+    await this.syncConfigs(base, root, rootReal, protectedDirs, store, nowIso, stats);
     await this.syncBatchesAndRuns(root, nowIso, stats);
     this.hardenFileModes();
     return stats;
@@ -970,6 +936,7 @@ export class WorkspaceIndex {
     base: string,
     rawRoot: string,
     rootReal: string,
+    protectedDirs: readonly string[],
     store: Connections,
     nowIso: string,
     stats: SyncStats,
@@ -1087,7 +1054,13 @@ export class WorkspaceIndex {
       for (const name of entries) {
         if (name.startsWith('.') || SKIPPED_DIRS.has(name)) continue;
         const fullPath = join(currentDir, name);
-        if (fullPath === rawRoot || fullPath === rootReal) continue;
+        if (
+          fullPath === rawRoot ||
+          fullPath === rootReal ||
+          protectedDirs.some(dir => fullPath === dir || fullPath.startsWith(dir + sep))
+        ) {
+          continue;
+        }
         let info;
         try {
           info = await lstat(fullPath);
@@ -1157,28 +1130,24 @@ export class WorkspaceIndex {
           seenAgentPaths.add(relPath);
           const depPaths = collectAgentDepPaths(fullPath, raw);
           const depStats = await Promise.all(depPaths.map(p => statDep(base, p)));
-          let depsSafe = await isConfinedNoSymlink(base, fullPath, { rawRoot, rootReal });
-          if (depsSafe) {
-            for (const depPath of depPaths) {
-              if (!(await isConfinedNoSymlink(base, depPath, { rawRoot, rootReal }))) {
-                depsSafe = false;
-                break;
-              }
-            }
-          }
-          const loaded = depsSafe
-            ? await loadAgent(fullPath, store).then(
-                value => ({ value }),
-                error => ({ error }),
-              )
-            : { error: new Error('Dependency escapes workspace or traverses a symlink') };
+          const loaded = await loadVerifiedAgentFromDoc({
+            base,
+            agentAbsPath: fullPath,
+            relPath,
+            rawDoc: raw,
+            store,
+            protectedDirs,
+          }).then(
+            value => ({ value }),
+            error => ({ error }),
+          );
           const harnessObj = record(raw.harness);
           const provider =
-            textVal(raw.provider) ?? textVal(raw.connection) ?? ('value' in loaded ? loaded.value.connection : undefined);
+            textVal(raw.provider) ?? textVal(raw.connection) ?? ('value' in loaded ? loaded.value.connectionId : undefined);
           const id =
             textVal(raw.id) ??
             textVal(raw.agent_id) ??
-            ('value' in loaded ? loaded.value.agent.agent_id : name);
+            ('value' in loaded ? loaded.value.profile.id : name);
           const displayName =
             ('value' in loaded ? loaded.value.agentName : undefined) ?? (textVal(raw.name)?.trim() || undefined);
           const rawTier = speedTierSchema.safeParse(raw.speed_tier);
@@ -1213,31 +1182,18 @@ export class WorkspaceIndex {
           stats.agents_indexed++;
         } else if (isContest) {
           seenContestPaths.add(relPath);
-          const { materialPaths, judgePaths, allPaths } = collectContestDepPaths(fullPath, raw);
+          const { allPaths } = collectContestDepPaths(fullPath, raw);
           const depStats = await Promise.all(allPaths.map(p => statDep(base, p)));
-          let depsSafe = await isConfinedNoSymlink(base, fullPath, { rawRoot, rootReal });
-          if (depsSafe) {
-            for (const matPath of materialPaths) {
-              if (!(await isConfinedNoSymlink(base, matPath, { forbidPublicFilename: true, rawRoot, rootReal }))) {
-                depsSafe = false;
-                break;
-              }
-            }
-          }
-          if (depsSafe) {
-            for (const jPath of judgePaths) {
-              if (!(await isConfinedNoSymlink(base, jPath, { forbidPublicFilename: false, rawRoot, rootReal }))) {
-                depsSafe = false;
-                break;
-              }
-            }
-          }
-          const loaded = depsSafe
-            ? await loadContest(fullPath).then(
-                value => ({ value }),
-                error => ({ error }),
-              )
-            : { error: new Error('Dependency escapes workspace or traverses a symlink') };
+          const loaded = await loadVerifiedContestFromDoc({
+            base,
+            contestAbsPath: fullPath,
+            relPath,
+            rawDoc: raw,
+            protectedDirs,
+          }).then(
+            value => ({ value }),
+            error => ({ error }),
+          );
           const judgeObj = record(raw.judge);
           const rulesObj = record(raw.rules);
           const materialsObj = record(raw.materials);
@@ -2105,10 +2061,35 @@ export class WorkspaceIndex {
       list.push(r);
     }
 
-    // Key coverage entries by (agent.path, contest.path) so distinct valid manifests sharing an ID are NEVER dropped!
-    const cells: CoverageCell[] = [];
+    // Collapse duplicate paths that resolve to the EXACT same agent/contest revision (so toBatchSpec
+    // never emits duplicate revisions rejected by makePlan), while preserving distinct valid revisions sharing an ID!
+    const uniqueAgents: typeof agentRows = [];
+    const seenAgentRevs = new Set<string>();
     for (const a of agentRows) {
-      for (const c of contestRows) {
+      const revKey =
+        a.valid === 1 && (a.agent_revision !== null || a.effective_sha256 !== null)
+          ? JSON.stringify([a.id, a.agent_revision, a.effective_sha256, a.speed_tier ?? 'standard'])
+          : `path:${a.path}`;
+      if (seenAgentRevs.has(revKey)) continue;
+      seenAgentRevs.add(revKey);
+      uniqueAgents.push(a);
+    }
+
+    const uniqueContests: typeof contestRows = [];
+    const seenContestRevs = new Set<string>();
+    for (const c of contestRows) {
+      const revKey =
+        c.valid === 1 && (c.contest_revision !== null || c.contest_sha256 !== null)
+          ? JSON.stringify([c.id, c.data_version, c.contest_revision, c.contest_sha256])
+          : `path:${c.path}`;
+      if (seenContestRevs.has(revKey)) continue;
+      seenContestRevs.add(revKey);
+      uniqueContests.push(c);
+    }
+
+    const cells: CoverageCell[] = [];
+    for (const a of uniqueAgents) {
+      for (const c of uniqueContests) {
         const key = `${a.id}\0${c.id}\0${c.data_version}`;
         const cellRuns = runsByCellKey.get(key) ?? [];
         let completedCount = 0;

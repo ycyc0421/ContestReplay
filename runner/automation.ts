@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { chmod, link, lstat, mkdir, mkdtemp, open, realpath, rename, rm, unlink, writeFile } from 'node:fs/promises';
@@ -14,6 +15,7 @@ import {
   resolveAgentManifest,
   resolveContest,
   sha256,
+  validated,
 } from './config.js';
 import { connectionProtocols, Connections } from './connections.js';
 import {
@@ -33,7 +35,14 @@ import { inspectPdf, synthesizeTextContestPdf, synthProblemSchema, type PdfInfo 
 import { planSchema, specSchema } from './plan.js';
 import { protocolPresetNames, protocolPresets, resolveProtocolPreset, scoringModes } from './protocol.js';
 import { resultSchema, resultsSchema } from './results.js';
-import { documentFormat, formatSchema, parseDocumentText, serializeDocument, type Format } from './serialization.js';
+import {
+  canonical,
+  documentFormat,
+  formatSchema,
+  parseDocumentText,
+  serializeDocument,
+  type Format,
+} from './serialization.js';
 
 export const schemaTargetSchema = z.enum(['all', 'agent', 'contest', 'batch', 'results']);
 export type SchemaTarget = z.infer<typeof schemaTargetSchema>;
@@ -106,6 +115,49 @@ function toManifestRelativePath(manifestAbsPath: string, refAbsPath: string): st
 
 const workspaceLocks = new Map<string, Promise<void>>();
 
+async function acquireCrossProcessWorkspaceLock(baseReal: string) {
+  const uid = process.getuid?.();
+  const lockDir = join(tmpdir(), `contestreplay-workspace-locks-${uid ?? 'user'}`);
+  await mkdir(lockDir, { recursive: true, mode: 0o700 });
+  const dirInfo = await lstat(lockDir);
+  if (dirInfo.isSymbolicLink() || !dirInfo.isDirectory()) {
+    throw new Error('Workspace lock directory is invalid');
+  }
+  if (uid !== undefined && dirInfo.uid !== uid) {
+    throw new Error('Workspace lock directory is owned by another user');
+  }
+  if ((dirInfo.mode & 0o077) !== 0) {
+    await chmod(lockDir, 0o700);
+  }
+  const lockPath = join(lockDir, `${sha256(baseReal).slice(0, 32)}.lock`);
+  const handle = await open(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || (uid !== undefined && info.uid !== uid)) {
+      throw new Error('Workspace lock file is invalid');
+    }
+    if ((info.mode & 0o077) !== 0) {
+      await handle.chmod(0o600);
+    }
+    const result = await new Promise<number | null>((resolveExit, rejectExit) => {
+      const child = spawn('flock', ['-x', '-w', '10', '3'], {
+        stdio: ['ignore', 'ignore', 'ignore', handle.fd],
+      });
+      child.once('error', rejectExit);
+      child.once('close', resolveExit);
+    }).catch(() => {
+      throw new Error('Workspace lock unavailable');
+    });
+    if (result !== 0) {
+      throw new Error('Workspace is busy with another batch operation; retry shortly');
+    }
+    return handle;
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
 async function withWorkspaceLock<T>(baseReal: string, fn: () => Promise<T>): Promise<T> {
   const prev = workspaceLocks.get(baseReal) ?? Promise.resolve();
   let release!: () => void;
@@ -115,9 +167,12 @@ async function withWorkspaceLock<T>(baseReal: string, fn: () => Promise<T>): Pro
   const tail = prev.then(() => gate);
   workspaceLocks.set(baseReal, tail);
   await prev;
+  let flockHandle: Awaited<ReturnType<typeof open>> | undefined;
   try {
+    flockHandle = await acquireCrossProcessWorkspaceLock(baseReal);
     return await fn();
   } finally {
+    if (flockHandle) await flockHandle.close().catch(() => {});
     release();
     if (workspaceLocks.get(baseReal) === tail) {
       workspaceLocks.delete(baseReal);
@@ -312,11 +367,11 @@ export async function resolveConfinedPath(
 
   const rel = relative(baseReal, candidate);
   if (!rel || rel === '.' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-    throw new FieldError(fieldPath, `Path must stay inside workspace base: ${targetPath}`);
+    throw new FieldError(fieldPath, 'Path must stay inside workspace base');
   }
   const parts = rel.split(sep);
   if (parts.some(seg => !seg || seg === '.' || seg === '..' || seg.startsWith('.'))) {
-    throw new FieldError(fieldPath, `Hidden or invalid path segment is not allowed: ${targetPath}`);
+    throw new FieldError(fieldPath, 'Hidden or invalid path segment is not allowed');
   }
 
   let current = baseReal;
@@ -345,21 +400,68 @@ export async function resolveConfinedPath(
 }
 
 /**
- * Resolves a path strictly inside `baseReal` and reads it using `O_NOFOLLOW` to prevent
- * TOCTOU symlink swaps, verifying regular file type and byte limit.
+ * Resolves a path strictly inside `base`, verifies parent directory identity
+ * before and after opening with `O_NOFOLLOW` to block parent-directory symlink
+ * swaps, and reads the verified descriptor within `maxBytes`.
  */
 export async function readConfinedRegularFile(
-  baseReal: string,
+  base: string,
   candidatePath: string,
   fieldPath: string[],
   maxBytes: number,
 ): Promise<{ absPath: string; relPath: string; bytes: Buffer; mode: number }> {
-  const confined = await resolveConfinedPath(baseReal, candidatePath, fieldPath);
+  const confined = await resolveConfinedPath(base, candidatePath, fieldPath);
+  const baseReal = await realpath(resolve(base));
+  const parts = confined.relPath.split('/');
+
+  // Snapshot (dev, ino) for baseReal and every parent directory component BEFORE open().
+  const expectedDirs: Array<{ path: string; dev: number; ino: number }> = [];
+  const baseInfo = await lstat(baseReal);
+  if (baseInfo.isSymbolicLink() || !baseInfo.isDirectory()) {
+    throw new FieldError(fieldPath, `Workspace base is not a real directory`);
+  }
+  expectedDirs.push({ path: baseReal, dev: baseInfo.dev, ino: baseInfo.ino });
+  let cursor = baseReal;
+  for (let i = 0; i < parts.length - 1; i++) {
+    cursor = join(cursor, parts[i]!);
+    const info = await lstat(cursor);
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new FieldError(fieldPath, `Parent directory is a symlink or invalid: ${confined.relPath}`);
+    }
+    expectedDirs.push({ path: cursor, dev: info.dev, ino: info.ino });
+  }
+
   const handle = await open(confined.absPath, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
   try {
     const info = await handle.stat();
     if (!info.isFile()) {
       throw new FieldError(fieldPath, `Not a regular file: ${confined.relPath}`);
+    }
+    // Re-verify parent directory chain (dev, ino), realpath(dirname), and leaf identity AFTER open()
+    // so a concurrent parent-directory symlink swap between lstat-walk and open() is caught immediately.
+    const parentReal = await realpath(dirname(confined.absPath));
+    if (parentReal !== dirname(confined.absPath)) {
+      throw new FieldError(fieldPath, `Parent directory changed concurrently: ${confined.relPath}`);
+    }
+    for (const dirEntry of expectedDirs) {
+      const afterDir = await lstat(dirEntry.path);
+      if (
+        afterDir.isSymbolicLink() ||
+        !afterDir.isDirectory() ||
+        afterDir.dev !== dirEntry.dev ||
+        afterDir.ino !== dirEntry.ino
+      ) {
+        throw new FieldError(fieldPath, `Parent directory replaced during read: ${confined.relPath}`);
+      }
+    }
+    const leafAfter = await lstat(confined.absPath);
+    if (
+      leafAfter.isSymbolicLink() ||
+      !leafAfter.isFile() ||
+      leafAfter.dev !== info.dev ||
+      leafAfter.ino !== info.ino
+    ) {
+      throw new FieldError(fieldPath, `File replaced during read: ${confined.relPath}`);
     }
     if (info.size > maxBytes) {
       throw new FieldError(fieldPath, `File exceeds ${maxBytes} bytes: ${confined.relPath}`);
@@ -382,6 +484,358 @@ export async function readConfinedRegularFile(
     };
   } finally {
     await handle.close();
+  }
+}
+
+export const legacyAgentManifestSchema = z.strictObject({
+  schema_version: z.literal(1),
+  agent_id: idSchema,
+  harness: z.strictObject({
+    kind: z.literal('builtin-responses'),
+    version: z.literal('0.1.0'),
+  }),
+  config: z.string().min(1).max(4096).refine(v => !v.includes('\0')),
+});
+
+const MAX_CONTEST_ATTACHMENTS = 32;
+const MAX_VERIFIED_PDF_BYTES = 128 * 1024 * 1024;
+
+export async function loadVerifiedAgentFromDoc(opts: {
+  base: string;
+  agentAbsPath: string;
+  relPath: string;
+  rawDoc: Record<string, unknown>;
+  store: Connections;
+  protectedDirs: readonly string[];
+  fieldPrefix?: string[];
+}) {
+  const { base, agentAbsPath, relPath, rawDoc, store, protectedDirs } = opts;
+  const prefix = opts.fieldPrefix ?? [];
+  const dir = dirname(agentAbsPath);
+
+  if ('kind' in rawDoc) {
+    if (rawDoc.kind !== agentKind) {
+      throw new FieldError([...prefix, 'kind'], 'Unsupported Agent manifest kind');
+    }
+    // Validate the ORIGINAL manifest against manifestSchema BEFORE substituting native_config.content,
+    // so path references missing required fields like sha256 are rejected identically to runner/config.ts!
+    const parsedOriginal = manifestSchema.safeParse(rawDoc);
+    if (!parsedOriginal.success) {
+      const issue = parsedOriginal.error.issues[0];
+      throw new FieldError(
+        [...prefix, ...(issue?.path.map(String) ?? [])],
+        issue?.message ?? `Invalid agent manifest: ${relPath}`,
+      );
+    }
+
+    let validationDoc: Record<string, unknown> = rawDoc;
+    let savedNativeConfig: Record<string, unknown> | undefined;
+    const nativeCfg = parsedOriginal.data.harness.native_config;
+    if (nativeCfg && 'path' in nativeCfg) {
+      const fieldPath = [...prefix, 'harness', 'native_config', 'path'];
+      const candidate = isAbsolute(nativeCfg.path) ? nativeCfg.path : resolve(dir, nativeCfg.path);
+      const confined = await resolveConfinedPath(base, candidate, fieldPath);
+      // Enforce protected-directory policy BEFORE opening/reading any bytes!
+      assertNotInProtectedDirs(confined.absPath, confined.relPath, protectedDirs, fieldPath, 'Native config');
+      const nativeRead = await readConfinedRegularFile(base, confined.absPath, fieldPath, MAX_NATIVE_CONFIG_BYTES);
+      if (sha256(nativeRead.bytes) !== nativeCfg.sha256) {
+        throw new FieldError(
+          [...prefix, 'harness', 'native_config', 'sha256'],
+          `Native config SHA-256 mismatch: ${nativeRead.relPath}`,
+        );
+      }
+      const normalizedPath = isAbsolute(nativeCfg.path)
+        ? toManifestRelativePath(agentAbsPath, nativeRead.absPath)
+        : nativeCfg.path;
+      savedNativeConfig = {
+        ...nativeCfg,
+        path: normalizedPath,
+      };
+      const harnessObj = rawDoc.harness as Record<string, unknown>;
+      validationDoc = {
+        ...rawDoc,
+        harness: {
+          ...harnessObj,
+          native_config: {
+            format: nativeCfg.format,
+            ...(nativeCfg.schema ? { schema: nativeCfg.schema } : {}),
+            content: nativeRead.bytes.toString('utf8'),
+          },
+        },
+      };
+    }
+
+    const resolved = await resolveAgentManifest(validationDoc, agentAbsPath, store);
+    const digests = agentDigests(resolved.profile, resolved.native, resolved.nativeText, resolved.env);
+    return {
+      profile: resolved.profile,
+      manifest: resolved.manifest,
+      connection: resolved.connection,
+      connectionId: manifestProvider(resolved.manifest),
+      vendor: resolved.manifest.vendor,
+      effective: resolved.effective,
+      savedNativeConfig,
+      profileDigest: digests.profileDigest,
+      nativeDigest: digests.nativeDigest,
+      effectiveDigest: digests.effectiveDigest,
+      agentName: resolved.profile.name,
+      speedTier: resolved.profile.speed_tier ?? 'standard',
+    };
+  }
+
+  // Legacy agent manifest or direct AgentProfile
+  let candidateRaw: unknown = rawDoc;
+  let nativeText: string | undefined;
+  if ('schema_version' in rawDoc || 'agent_id' in rawDoc) {
+    const legacy = validated(legacyAgentManifestSchema, rawDoc, relPath);
+    const fieldPath = [...prefix, 'config'];
+    const candidate = isAbsolute(legacy.config) ? legacy.config : resolve(dir, legacy.config);
+    const confined = await resolveConfinedPath(base, candidate, fieldPath);
+    // Enforce protected-directory policy BEFORE opening/reading any bytes!
+    assertNotInProtectedDirs(confined.absPath, confined.relPath, protectedDirs, fieldPath, 'Legacy config');
+    const legacyRead = await readConfinedRegularFile(base, confined.absPath, fieldPath, MAX_NATIVE_CONFIG_BYTES);
+    let parsedLegacy: Record<string, unknown>;
+    try {
+      parsedLegacy = Object(parseDocumentText(legacyRead.bytes.toString('utf8'), 'toml')) as Record<string, unknown>;
+    } catch {
+      throw new FieldError(fieldPath, `Invalid legacy config TOML: ${relPath}`);
+    }
+    const { name: _displayName, ...nativeCore } = parsedLegacy;
+    nativeText = canonical(nativeCore);
+    candidateRaw = { ...parsedLegacy, id: legacy.agent_id, harness: legacy.harness.kind };
+  }
+  const profile = validated(agentSchema, candidateRaw, relPath);
+  const digests = agentDigests(profile, undefined, nativeText, undefined);
+  return {
+    profile,
+    manifest: undefined,
+    connection: undefined,
+    connectionId: undefined,
+    vendor: undefined,
+    effective: undefined,
+    savedNativeConfig: undefined,
+    profileDigest: digests.profileDigest,
+    nativeDigest: digests.nativeDigest,
+    effectiveDigest: digests.effectiveDigest,
+    agentName: profile.name,
+    speedTier: profile.speed_tier ?? 'standard',
+  };
+}
+
+export async function loadVerifiedContestFromDoc(opts: {
+  base: string;
+  contestAbsPath: string;
+  relPath: string;
+  rawDoc: Record<string, unknown>;
+  protectedDirs: readonly string[];
+  fieldPrefix?: string[];
+}) {
+  const { base, contestAbsPath, relPath, rawDoc, protectedDirs } = opts;
+  const prefix = opts.fieldPrefix ?? [];
+  const dir = dirname(contestAbsPath);
+
+  let judgeAbsPath: string | undefined;
+  let judgeBytes: Buffer | undefined;
+  const judge =
+    rawDoc.judge && typeof rawDoc.judge === 'object' && !Array.isArray(rawDoc.judge)
+      ? (rawDoc.judge as Record<string, unknown>)
+      : undefined;
+  if (judge) {
+    const answers =
+      judge.answers && typeof judge.answers === 'object' && !Array.isArray(judge.answers)
+        ? (judge.answers as Record<string, unknown>)
+        : undefined;
+    const rawJudgePath =
+      typeof answers?.path === 'string'
+        ? answers.path
+        : typeof judge.path === 'string'
+          ? judge.path
+          : undefined;
+    const judgeFieldPath =
+      typeof answers?.path === 'string' ? [...prefix, 'judge', 'answers', 'path'] : [...prefix, 'judge', 'path'];
+    if (rawJudgePath !== undefined) {
+      const candidate = isAbsolute(rawJudgePath) ? rawJudgePath : resolve(dir, rawJudgePath);
+      const confined = await resolveConfinedPath(base, candidate, judgeFieldPath);
+      // Enforce protected-directory policy BEFORE opening/reading any bytes!
+      assertNotInProtectedDirs(confined.absPath, confined.relPath, protectedDirs, judgeFieldPath, 'Local answers file');
+      const judgeRead = await readConfinedRegularFile(base, confined.absPath, judgeFieldPath, MAX_JUDGE_FILE_BYTES);
+      judgeAbsPath = judgeRead.absPath;
+      judgeBytes = judgeRead.bytes;
+    }
+  }
+
+  let entrypointBytes: Buffer | undefined;
+  const readEntrypoint = async (rawPath: unknown, fieldPath: string[]) => {
+    if (typeof rawPath !== 'string') return;
+    const candidate = isAbsolute(rawPath) ? rawPath : resolve(dir, rawPath);
+    const confined = await resolveConfinedPath(base, candidate, fieldPath);
+    assertNotForbiddenMaterialPath(confined.absPath, confined.relPath, protectedDirs, judgeAbsPath, fieldPath);
+    const loaded = await readConfinedRegularFile(base, confined.absPath, fieldPath, MAX_VERIFIED_PDF_BYTES);
+    entrypointBytes = loaded.bytes;
+  };
+
+  const attachments: Array<{ index: number; bytes: Buffer }> = [];
+  const materials =
+    rawDoc.materials && typeof rawDoc.materials === 'object' && !Array.isArray(rawDoc.materials)
+      ? (rawDoc.materials as Record<string, unknown>)
+      : undefined;
+  if (materials) {
+    const entry =
+      materials.entrypoint && typeof materials.entrypoint === 'object' && !Array.isArray(materials.entrypoint)
+        ? (materials.entrypoint as Record<string, unknown>)
+        : undefined;
+    await readEntrypoint(entry?.path, [...prefix, 'materials', 'entrypoint', 'path']);
+    if (Array.isArray(materials.attachments)) {
+      if (materials.attachments.length > MAX_CONTEST_ATTACHMENTS) {
+        throw new FieldError(
+          [...prefix, 'materials', 'attachments'],
+          `Contest attachments exceed maximum of ${MAX_CONTEST_ATTACHMENTS}`,
+        );
+      }
+      let totalAttachmentBytes = 0;
+      for (let i = 0; i < materials.attachments.length; i++) {
+        const att = materials.attachments[i];
+        if (!att || typeof att !== 'object' || Array.isArray(att)) continue;
+        const attPath = (att as Record<string, unknown>).path;
+        if (typeof attPath !== 'string') continue;
+        const fieldPath = [...prefix, 'materials', 'attachments', String(i), 'path'];
+        const candidate = isAbsolute(attPath) ? attPath : resolve(dir, attPath);
+        const confined = await resolveConfinedPath(base, candidate, fieldPath);
+        assertNotForbiddenMaterialPath(confined.absPath, confined.relPath, protectedDirs, judgeAbsPath, fieldPath);
+        const remainingBudget = MAX_TOTAL_ATTACHMENTS_BYTES - totalAttachmentBytes;
+        if (remainingBudget <= 0) {
+          throw new FieldError(
+            [...prefix, 'materials', 'attachments'],
+            `Total attachments exceed ${MAX_TOTAL_ATTACHMENTS_BYTES} bytes`,
+          );
+        }
+        const attRead = await readConfinedRegularFile(
+          base,
+          confined.absPath,
+          fieldPath,
+          Math.min(MAX_ATTACHMENT_BYTES, remainingBudget),
+        );
+        totalAttachmentBytes += attRead.bytes.length;
+        if (totalAttachmentBytes > MAX_TOTAL_ATTACHMENTS_BYTES) {
+          throw new FieldError(
+            [...prefix, 'materials', 'attachments'],
+            `Total attachments exceed ${MAX_TOTAL_ATTACHMENTS_BYTES} bytes`,
+          );
+        }
+        if (isJudgeAnswerBytes(attRead.bytes)) {
+          throw new FieldError(fieldPath, `Judge answer file cannot be exposed as contest material: ${confined.relPath}`);
+        }
+        attachments.push({ index: i, bytes: attRead.bytes });
+      }
+    }
+  }
+  const statement =
+    rawDoc.statement && typeof rawDoc.statement === 'object' && !Array.isArray(rawDoc.statement)
+      ? (rawDoc.statement as Record<string, unknown>)
+      : undefined;
+  await readEntrypoint(statement?.path, [...prefix, 'statement', 'path']);
+
+  const stageDir = await mkdtemp(join(tmpdir(), 'cr-verified-contest-'));
+  await chmod(stageDir, 0o700);
+  try {
+    const stagedDoc: Record<string, unknown> = { ...rawDoc };
+    if (entrypointBytes !== undefined) {
+      await writeFile(join(stageDir, 'entrypoint.pdf'), entrypointBytes, { mode: 0o600, flag: 'wx' });
+    }
+    if (judgeBytes !== undefined) {
+      await writeFile(join(stageDir, 'judge.json'), judgeBytes, { mode: 0o600, flag: 'wx' });
+    }
+    const attStageNames = new Map<number, string>();
+    for (const att of attachments) {
+      const stageName = `att-${att.index}.bin`;
+      await writeFile(join(stageDir, stageName), att.bytes, { mode: 0o600, flag: 'wx' });
+      attStageNames.set(att.index, stageName);
+    }
+
+    let origEntryPath: string | undefined;
+    const origAttPaths: string[] = [];
+    let origJudgePath: string | undefined;
+
+    if (materials) {
+      const entry =
+        materials.entrypoint && typeof materials.entrypoint === 'object' && !Array.isArray(materials.entrypoint)
+          ? (materials.entrypoint as Record<string, unknown>)
+          : undefined;
+      if (entry && typeof entry.path === 'string') origEntryPath = entry.path;
+      const nextAttachments = Array.isArray(materials.attachments)
+        ? materials.attachments.map((att, idx) => {
+            if (att && typeof att === 'object' && !Array.isArray(att)) {
+              const rec = att as Record<string, unknown>;
+              if (typeof rec.path === 'string') origAttPaths[idx] = rec.path;
+              const stageName = attStageNames.get(idx);
+              if (stageName) return { ...rec, path: stageName };
+            }
+            return att;
+          })
+        : materials.attachments;
+      stagedDoc.materials = {
+        ...materials,
+        ...(entry && entrypointBytes !== undefined ? { entrypoint: { ...entry, path: 'entrypoint.pdf' } } : {}),
+        ...(nextAttachments !== undefined ? { attachments: nextAttachments } : {}),
+      };
+    }
+
+    if (statement) {
+      if (typeof statement.path === 'string') origEntryPath = statement.path;
+      if (entrypointBytes !== undefined) {
+        stagedDoc.statement = { ...statement, path: 'entrypoint.pdf' };
+      }
+    }
+
+    if (judge) {
+      if (judge.answers && typeof judge.answers === 'object' && !Array.isArray(judge.answers)) {
+        const answersObj = judge.answers as Record<string, unknown>;
+        if (typeof answersObj.path === 'string') origJudgePath = answersObj.path;
+        if (judgeBytes !== undefined) {
+          stagedDoc.judge = { ...judge, answers: { ...answersObj, path: 'judge.json' } };
+        }
+      } else if (typeof judge.path === 'string') {
+        origJudgePath = judge.path;
+        if (judgeBytes !== undefined) {
+          stagedDoc.judge = { ...judge, path: 'judge.json' };
+        }
+      }
+    }
+
+    try {
+      const loaded = await resolveContest(stagedDoc, join(stageDir, 'contest.json'));
+      const { statement: _stmt, ...v } = loaded.contest;
+      const restored = {
+        ...v,
+        materials: {
+          entrypoint: {
+            ...v.materials.entrypoint,
+            ...(origEntryPath !== undefined ? { path: origEntryPath } : {}),
+          },
+          attachments: v.materials.attachments.map((att, idx) => ({
+            ...att,
+            ...(origAttPaths[idx] !== undefined ? { path: origAttPaths[idx]! } : {}),
+          })),
+        },
+        judge:
+          v.judge.kind === 'local' && origJudgePath !== undefined
+            ? { ...v.judge, answers: { ...v.judge.answers, path: origJudgePath } }
+            : v.judge,
+      };
+      return {
+        contest: loaded.contest,
+        contestRevision: loaded.contestRevision,
+        contestDigest: sha256(JSON.stringify(restored)),
+      };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Invalid contest manifest';
+      if (msg.includes('judge.json')) {
+        throw new FieldError(prefix, `Invalid local answers file for contest: ${relPath}`);
+      }
+      throw new FieldError(prefix, msg.replaceAll(stageDir, '.'));
+    }
+  } finally {
+    await rm(stageDir, { recursive: true, force: true });
   }
 }
 
@@ -902,18 +1356,23 @@ export async function batchApplyAgents(
           const nativeCandidate = isAbsolute(nativeCfg.path)
             ? nativeCfg.path
             : resolve(dirname(confined.absPath), nativeCfg.path);
-          const nativeRead = await readConfinedRegularFile(
+          const nativeConfined = await resolveConfinedPath(
             baseResolved,
             nativeCandidate,
             ['document', 'harness', 'native_config', 'path'],
-            MAX_NATIVE_CONFIG_BYTES,
           );
           assertNotInProtectedDirs(
-            nativeRead.absPath,
-            nativeRead.relPath,
+            nativeConfined.absPath,
+            nativeConfined.relPath,
             protectedDirs,
             ['document', 'harness', 'native_config', 'path'],
             'Native config',
+          );
+          const nativeRead = await readConfinedRegularFile(
+            baseResolved,
+            nativeConfined.absPath,
+            ['document', 'harness', 'native_config', 'path'],
+            MAX_NATIVE_CONFIG_BYTES,
           );
           const computedNativeHash = sha256(nativeRead.bytes);
           if (computedNativeHash !== nativeCfg.sha256) {
@@ -958,18 +1417,19 @@ export async function batchApplyAgents(
           const legacyCandidate = isAbsolute(doc.config)
             ? doc.config
             : resolve(dirname(confined.absPath), doc.config);
-          const legacyRead = await readConfinedRegularFile(
-            baseResolved,
-            legacyCandidate,
-            ['document', 'config'],
-            MAX_NATIVE_CONFIG_BYTES,
-          );
+          const legacyConfined = await resolveConfinedPath(baseResolved, legacyCandidate, ['document', 'config']);
           assertNotInProtectedDirs(
-            legacyRead.absPath,
-            legacyRead.relPath,
+            legacyConfined.absPath,
+            legacyConfined.relPath,
             protectedDirs,
             ['document', 'config'],
             'Legacy config',
+          );
+          const legacyRead = await readConfinedRegularFile(
+            baseResolved,
+            legacyConfined.absPath,
+            ['document', 'config'],
+            MAX_NATIVE_CONFIG_BYTES,
           );
           referencedInputs.add(legacyRead.absPath);
         } catch (error) {

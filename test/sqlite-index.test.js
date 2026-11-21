@@ -870,18 +870,21 @@ test('WorkspaceIndex confines custom root & transitive deps, enforces strict eff
   const allAgents = index.listAgents();
   assert.ok(!allAgents.items.some(a => a.id === 'should-not-be-walked'));
 
-  // Escaping agent and symlinked-attachment contest both recorded invalid with safe fixed issue!
+  // Escaping agent and symlinked-attachment contest both recorded invalid without leaking host paths!
   const escAgent = allAgents.items.find(a => a.id === 'esc-agent');
   assert.ok(escAgent);
   assert.equal(escAgent.valid, false);
-  assert.deepEqual(escAgent.issues, ['Dependency escapes workspace or traverses a symlink']);
+  assert.equal(escAgent.issues.length, 1);
+  assert.match(escAgent.issues[0], /inside workspace base|symlink/i);
+  assert.ok(!escAgent.issues[0].includes(outsideDir));
 
   const symContest = index.listContests().items.find(c => c.id === 'sym-att');
   assert.ok(symContest);
   assert.equal(symContest.valid, false);
-  assert.deepEqual(symContest.issues, ['Dependency escapes workspace or traverses a symlink']);
+  assert.equal(symContest.issues.length, 1);
+  assert.match(symContest.issues[0], /symlink|inside workspace base/i);
 
-  // Both duplicate-ID valid agent manifests are preserved in queryCoverage & findUncoveredCells!
+  // Both duplicate-ID valid agent manifests with DISTINCT revisions are preserved in queryCoverage & findUncoveredCells!
   const cov = index.queryCoverage({ agentIds: ['dup-id'], contestIds: ['strict-r1'] });
   assert.equal(cov.length, 2);
   assert.deepEqual(cov.map(c => c.agent_path).sort(), ['agents/dup-v1.json', 'agents/dup-v2.json']);
@@ -896,4 +899,75 @@ test('WorkspaceIndex confines custom root & transitive deps, enforces strict eff
   const gaps = index.findUncoveredCells({ agentIds: ['dup-id'], contestIds: ['strict-r1'] });
   assert.equal(gaps.total_gaps, 2);
   assert.deepEqual(gaps.cells.map(g => g.agent).sort(), ['agents/dup-v1.json', 'agents/dup-v2.json']);
+
+  // Duplicate paths with the IDENTICAL revision collapse to 1 cell (never emitting duplicate revisions to makePlan)!
+  await writeFile(
+    join(base, 'agents', 'dup-v1.zz-copy.json'),
+    JSON.stringify({
+      kind: 'contestreplay.dev/agent',
+      schema_version: 1,
+      id: 'dup-id',
+      model: 'gpt-5.3-codex',
+      speed_tier: 'fast',
+      provider: 'p-strict',
+      harness: { kind: 'codex', version: '0.170.0', options: { reasoning_effort: 'medium' } },
+    }),
+  );
+
+  // Run with matching hashes EXCEPT speed_tier === null MUST NOT be credited as current (no default to 'standard')!
+  const nullTierRunId = randomUUID();
+  const nullTierDir = join(customRoot, nullTierRunId);
+  await mkdir(nullTierDir, { recursive: true });
+  await writeFile(
+    join(nullTierDir, 'run.json'),
+    JSON.stringify({
+      schema_version: 2,
+      run_id: nullTierRunId,
+      contest_id: 'strict-r1',
+      data_version: 1,
+      contest_revision: loadedContest.contestRevision,
+      protocol_sha256: protocolDigest,
+      agent_id: 'dup-id',
+      agent_revision: loadedV1.profileDigest,
+      agent_digests: { profile_sha256: loadedV1.profileDigest, effective_sha256: loadedV1.effectiveDigest },
+      model: { model: 'gpt-5.3-codex' },
+      started_at: '2026-01-01T14:00:00.000Z',
+    }),
+  );
+  await writeFile(
+    join(nullTierDir, 'events.jsonl'),
+    [
+      JSON.stringify({ schema_version: 1, seq: 1, elapsed_ms: 0, type: 'run_started' }),
+      JSON.stringify({ schema_version: 1, seq: 2, elapsed_ms: 100, type: 'run_ended', status: 'completed', score: 200, max_score: 200 }),
+    ].join('\n') + '\n',
+  );
+
+  // Credential dir placed inside base MUST be skipped during syncConfigs!
+  const credInBase = join(base, 'cred-store');
+  await mkdir(credInBase, { recursive: true, mode: 0o700 });
+  await writeFile(
+    join(credInBase, 'secret-agent.json'),
+    JSON.stringify({
+      kind: 'contestreplay.dev/agent',
+      schema_version: 1,
+      id: 'cred-store-leak',
+      vendor: 'openai',
+      model: 'gpt-5.3-codex',
+      provider: 'p-strict',
+      harness: { kind: 'codex', version: '0.170.0', options: {} },
+    }),
+  );
+
+  await index.sync({ base, root: customRoot, store, credentialDirs: [credInBase] });
+  assert.ok(!index.listAgents().items.some(a => a.id === 'cred-store-leak'));
+
+  const covAfter = index.queryCoverage({ agentIds: ['dup-id'], contestIds: ['strict-r1'] });
+  // Still 2 cells (dup-v1-copy collapsed with dup-v1; dup-v2 preserved as distinct revision)!
+  assert.equal(covAfter.length, 2);
+  assert.deepEqual(covAfter.map(c => c.agent_path).sort(), ['agents/dup-v1.json', 'agents/dup-v2.json']);
+  // Null speed_tier run NOT credited as current!
+  const v1Cell = covAfter.find(c => c.agent_path === 'agents/dup-v1.json');
+  assert.ok(v1Cell);
+  assert.equal(v1Cell.completed_count, 0);
+  assert.equal(v1Cell.historical_completed_count, 5);
 });
