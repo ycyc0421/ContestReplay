@@ -158,6 +158,29 @@ function parseScoreText(text: string): { score?: number; max_score?: number; exp
   return { explicitRatio: false };
 }
 
+function htmlTextExcluding(node: HtmlNode, excluded?: HtmlNode): string {
+  if (excluded && node === excluded) return '';
+  return (node.value ?? '') + (node.childNodes ?? []).map(child => htmlTextExcluding(child, excluded)).join('');
+}
+
+const QOJ_EMPTY_LIST_LABELS = new Set([
+  'no data',
+  'no data available in table',
+  'no matching records found',
+  'no submission',
+  'no submissions',
+  'none',
+  'empty',
+  '无',
+  '暂无',
+  '暂无数据',
+  '暂无记录',
+  '暂无提交',
+  '没有数据',
+  '没有记录',
+  '没有提交',
+  '没有提交记录',
+]);
 function collectAnchors(node: HtmlNode): HtmlNode[] {
   return walkHtml(node).filter(cur => cur.tagName === 'a');
 }
@@ -253,9 +276,13 @@ export function parseQojSubmissionPage(expectedId: string, body: string): QojSub
     let maxScore: number | undefined;
     let rawVerdict = 'Waiting';
 
-    // Strip any numeric score token ("65/100" or bare "65") from resultCell to detect accompanying status text
+    // Strip the parsed .uoj-score node text first (so "Accepted <a class='uoj-score'>100</a>" yields clean "Accepted"),
+    // then strip any inline numeric ratio ("65/100") or standalone number to inspect accompanying status text
     // (e.g. "Unknown Error 100/100" -> statusText = "Unknown Error", which MUST map to judge_error!).
-    const statusText = resultCell
+    const cellWithoutScoreNode = scoreNode
+      ? htmlTextExcluding(resultTd, scoreNode).replace(/\s+/g, ' ').trim()
+      : resultCell;
+    const statusText = cellWithoutScoreNode
       .replace(/\b\d+(?:\.\d+)?\s*\/\s*\d+(?:\.\d+)?\b/g, '')
       .replace(/^\s*\d+(?:\.\d+)?\s*$/, '')
       .replace(/\s+/g, ' ')
@@ -351,8 +378,8 @@ export function parseQojSubmissionListPage(markup: string): QojSubmissionListRes
       if (!tds.length) continue; // Header row only
 
       const rowText = tds.map(td => htmlText(td).replace(/\s+/g, ' ').trim()).join(' ').trim();
-      // Recognize explicit empty-list placeholder row (e.g. "No data", "暂无", "No submissions")
-      if (tds.length === 1 && /^(no data|no submissions?|none|empty|暂无.*|没有.*|无)$/i.test(rowText)) {
+      // Recognize ONLY exact known empty-list placeholders (never prefix-match messages like "没有权限查看提交记录").
+      if (tds.length === 1 && QOJ_EMPTY_LIST_LABELS.has(rowText.toLowerCase())) {
         continue;
       }
 

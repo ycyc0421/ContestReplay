@@ -437,14 +437,25 @@ async function previewGymPageHtml(
     });
   }
 
-  // Explicitly verify finished status from Gym page content (never blindly assume finished!).
-  const visibleText = nodes
-    .filter(n => n.value !== undefined)
-    .map(n => n.value!)
-    .join(' ')
-    .replace(/\s+/g, ' ');
-  const hasActiveMarker = /\b(contest is running|before the contest|pending system test|system testing)\b/i.test(visibleText);
-  const hasFinishedMarker = /\b(final standings|contest is over|practice|finished)\b/i.test(visibleText);
+  // Explicitly verify finished status ONLY from CF sidebar/status containers (never fuzzy-match page title like "Practice Round").
+  const stateContainers = nodes.filter(n => {
+    const cls = (htmlAttr(n, 'class') ?? '').toLowerCase();
+    return (
+      cls.includes('contest-state-phase') ||
+      cls.includes('contest-state-regular') ||
+      cls.includes('rtable') ||
+      cls.includes('sidebox')
+    );
+  });
+  const stateText = stateContainers
+    .map(n => htmlText(n).replace(/\s+/g, ' ').trim())
+    .join(' ');
+  const hasCountdown =
+    nodes.some(n => (htmlAttr(n, 'class') ?? '').toLowerCase().includes('countdown')) ||
+    /\b\d{1,2}:\d{2}:\d{2}\b/.test(stateText);
+  const hasActiveMarker =
+    hasCountdown || /\b(contest is running|before the contest|pending system test|system testing)\b/i.test(stateText);
+  const hasFinishedMarker = /\b(final standings|contest is over|finished)\b/i.test(stateText);
   const status: ContestPreview['status'] = hasActiveMarker ? 'active' : hasFinishedMarker ? 'finished' : 'unknown';
 
   return {
@@ -768,17 +779,22 @@ export function createCodeforcesJudge(
             { platform: 'codeforces' },
           );
         }
-        // Relax timestamp lower bound by 60s ONLY for minute-precision HTML timestamps (/gym/<id>/my),
-        // while still requiring strict row.id > baseline and unique single new submission.
-        const hasMinutePrecision = rows.some(r => r._minutePrecision === true);
-        const effectiveSince = hasMinutePrecision ? since - 60 : since;
-        const candidates = exactPracticeCandidates(rows, {
-          baseline,
-          contest: config.contest_id,
-          problem: target,
-          handle,
-          since: effectiveSince,
-        });
+        // Apply timestamp tolerance strictly per candidate row based on THAT row's own precision
+        // (never relax second-precision rows just because another row has minute precision).
+        const candidates = rows
+          .filter(row => {
+            const rowSince = row._minutePrecision ? since - 60 : since;
+            return (
+              exactPracticeCandidates([row], {
+                baseline,
+                contest: config.contest_id,
+                problem: target,
+                handle,
+                since: rowSince,
+              }).length === 1
+            );
+          })
+          .map(row => row.id);
         const newerCount = rows.filter(row => row.id > baseline).length;
         if (candidates.length === 1 && newerCount === 1) return String(candidates[0]!);
         if (newerCount > 0) {

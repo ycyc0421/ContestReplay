@@ -933,6 +933,33 @@ test('Final review regression suite: QOJ maintenance page & bare score, CF Gym a
     ).recognized,
     true,
   );
+  assert.equal(
+    parseQojSubmissionListPage(
+      '<table><thead><tr><th>ID</th><th>Problem</th><th>Submitter</th><th>Result</th></tr></thead><tbody><tr><td>暂无数据</td></tr></tbody></table>',
+    ).recognized,
+    true,
+  );
+  // Permission denied text starting with "没有" MUST NOT be mistaken for an empty submission list!
+  assert.equal(
+    parseQojSubmissionListPage(
+      '<table><thead><tr><th>ID</th><th>Problem</th><th>Submitter</th><th>Result</th></tr></thead><tbody><tr><td>没有权限查看提交记录</td></tr></tbody></table>',
+    ).recognized,
+    false,
+  );
+
+  // Accepted + <a class="uoj-score">100</a> strips the .uoj-score node cleanly so verdict is 'accepted' with score 100
+  const acceptedWithScoreNodeHtml = `
+    <table><tr>
+      <td><a href="/submission/6004">#6004</a></td>
+      <td><a href="/problem/7801">Task</a></td>
+      <td><a href="/user/profile/qoj_tester">qoj_tester</a></td>
+      <td>Accepted <a class="uoj-score">100</a></td>
+    </tr></table>
+  `;
+  const accScoreRow = parseQojSubmissionPage('6004', acceptedWithScoreNodeHtml);
+  assert.equal(accScoreRow?.raw_verdict, 'Accepted');
+  assert.equal(accScoreRow?.score, 100);
+  assert.equal(normalizeVerdict(accScoreRow.raw_verdict, accScoreRow.score, accScoreRow.max_score), 'accepted');
 
   const bareScoreHtml = `
     <table><tr>
@@ -1066,7 +1093,7 @@ test('Final review regression suite: QOJ maintenance page & bare score, CF Gym a
       if (url.pathname === '/gym/104567') {
         return htmlResponse(`
           <html><head><title>Private Gym - Codeforces</title></head><body>
-            <div>Final standings</div>
+            <div class="sidebox"><div class="contest-state-phase">Finished</div><div>Final standings</div></div>
             <a href="/gym/104567/problem/A">Alpha</a>
             <a href="https://evil.example/gym/104567/problem/Z">Spoofed</a>
           </body></html>
@@ -1082,26 +1109,30 @@ test('Final review regression suite: QOJ maintenance page & bare score, CF Gym a
     ['A'],
   );
 
-  // Gym HTML without finished evidence MUST report status: 'unknown' (not blindly 'finished')
-  const gymPreviewUnknown = await previewCodeforcesContest(104567, {
+  // Page titled "Practice Round" WITHOUT an explicit status container MUST stay 'unknown' (not fuzzy-matched as finished!)
+  const gymPreviewPracticeTitle = await previewCodeforcesContest(104567, {
     gym: true,
     cookie: 'JSESSIONID=gym-auth',
     fetchImpl: async input => {
       const url = new URL(String(input));
       if (url.pathname === '/api/contest.standings') return jsonResponse({ status: 'FAILED' }, 403);
-      return htmlResponse('<html><body><a href="/gym/104567/problem/A">Alpha</a></body></html>');
+      return htmlResponse(
+        '<html><head><title>ICPC Practice Round - Codeforces</title></head><body><h1>Practice Round</h1><a href="/gym/104567/problem/A">Alpha</a></body></html>',
+      );
     },
   });
-  assert.equal(gymPreviewUnknown.status, 'unknown');
+  assert.equal(gymPreviewPracticeTitle.status, 'unknown');
 
-  // Gym HTML with active contest marker MUST report status: 'active'
+  // Gym HTML with countdown timer in status box MUST report status: 'active'
   const gymPreviewActive = await previewCodeforcesContest(104567, {
     gym: true,
     cookie: 'JSESSIONID=gym-auth',
     fetchImpl: async input => {
       const url = new URL(String(input));
       if (url.pathname === '/api/contest.standings') return jsonResponse({ status: 'FAILED' }, 403);
-      return htmlResponse('<html><body><div>Contest is running</div><a href="/gym/104567/problem/A">Alpha</a></body></html>');
+      return htmlResponse(
+        '<html><body><div class="sidebox"><div class="contest-state-phase">Contest is running</div><span class="countdown">01:23:45</span></div><a href="/gym/104567/problem/A">Alpha</a></body></html>',
+      );
     },
   });
   assert.equal(gymPreviewActive.status, 'active');
@@ -1140,6 +1171,44 @@ test('Final review regression suite: QOJ maintenance page & bare score, CF Gym a
     },
   );
   assert.equal(await gymMyJudge.submit('A', 'cpp20', 'int main(){}', AbortSignal.timeout(5000)), '777002');
+
+  // Per-row timestamp precision: a second-precision row older than `since` (-40s) MUST NOT be accepted
+  // even when another row on the page has minute precision!
+  const staleSecStamp = new Date(Date.now() - 40_000).toISOString();
+  let gymMixedSubmitted = false;
+  const gymMixedJudge = createCodeforcesJudge(
+    { contest_id: 104567, gym: true, handle: 'cf_tester', languages: { cpp20: 89 } },
+    {
+      cookie: 'JSESSIONID=gym-my',
+      skipContestCheck: true,
+      delayImpl: async () => {},
+      fetchImpl: async (input, init) => {
+        const url = new URL(String(input));
+        if (url.pathname === '/api/contest.status') return jsonResponse({ status: 'FAILED' }, 403);
+        if (url.pathname === '/gym/104567/submit' && (!init?.method || init.method === 'GET')) {
+          return htmlResponse(
+            '<a href="/profile/cf_tester">cf_tester</a><form action="?csrf_token=t"><input type="hidden" name="csrf_token" value="t"><select name="submittedProblemIndex"></select><textarea name="source"></textarea></form>',
+          );
+        }
+        if (url.pathname === '/gym/104567/submit' && init?.method === 'POST') {
+          gymMixedSubmitted = true;
+          return redirectResponse('/gym/104567/my');
+        }
+        if (url.pathname === '/gym/104567/my') {
+          const oldMinuteRow = `<tr data-submission-id="777001"><td>777001</td><td class="status-small"><span class="format-time">${minuteStamp}</span></td><td class="status-party-cell">* <a href="/profile/cf_tester">cf_tester</a></td><td><a href="/gym/104567/problem/A">A</a></td><td>C++20</td><td class="status-verdict-cell"><span submissionverdict="OK">Accepted</span></td></tr>`;
+          const staleSecRow = gymMixedSubmitted
+            ? `<tr data-submission-id="777009"><td>777009</td><td class="status-small"><span class="format-time">${staleSecStamp}</span></td><td class="status-party-cell">* <a href="/profile/cf_tester">cf_tester</a></td><td><a href="/gym/104567/problem/A">A</a></td><td>C++20</td><td class="status-verdict-cell"><span submissionverdict="OK">Accepted</span></td></tr>`
+            : '';
+          return htmlResponse(`<table>${staleSecRow}${oldMinuteRow}</table>`);
+        }
+        throw new Error(url.href);
+      },
+    },
+  );
+  await assert.rejects(
+    gymMixedJudge.submit('A', 'cpp20', 'int main(){}', AbortSignal.timeout(5000)),
+    err => err instanceof JudgeInfrastructureError && err.code === 'identity_mismatch',
+  );
 
   // parseCfMySubmissionsHtml MUST reject rows missing author, timestamp, or explicit PRACTICE marker
   const myHtml = `
