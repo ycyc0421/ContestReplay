@@ -163,6 +163,16 @@ function unwrapBatchArray(raw: unknown): unknown[] {
   }
   throw new CliError('Expected a JSON array or an object with an "items" array', 3, 'validation_error');
 }
+async function readAutomationJson(filePath: string): Promise<unknown> {
+  try {
+    return await readJson(filePath);
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new CliError('Invalid JSON input file', 3, 'validation_error');
+    }
+    throw error;
+  }
+}
 function position(list: string[], optional = false) {
   if (list.length > 1 || (!optional && list.length !== 1)) throw new CliError(usage, 3, 'validation_error');
   return list[0];
@@ -195,10 +205,10 @@ async function main(args: string[]) {
       console.log(usage); return 0;
     }
     if (group === 'bench' && command === 'run') {
-      if (!rest.length) { console.log(usage); return 0; }
+      if (!rest.length) throw new CliError(usage, 3, 'validation_error');
       const { positionals, values } = parseArgs({ args: rest, allowPositionals: true, options: { agent: str, out: str, json: bool } });
       const file = position(positionals)!;
-      if (!values.agent || values.out === '') throw new Error(usage);
+      if (!values.agent || values.out === '') throw new CliError(usage, 3, 'validation_error');
       const root = workdir(values.out);
       await modelKey(await loadAgent(values.agent));
       const plan = await makePlan({ schema_version: 1, agents: [values.agent], contests: [file] }, process.cwd());
@@ -429,7 +439,7 @@ async function main(args: string[]) {
         options: { 'dry-run': bool, 'if-exists': str, base: str, json: bool },
       });
       const file = position(positionals)!;
-      const items = unwrapBatchArray(await readJson(file));
+      const items = unwrapBatchArray(await readAutomationJson(file));
       const result = await batchApplyAgents(items, {
         base: resolve(v.base ?? process.cwd()),
         store: new Connections(),
@@ -448,7 +458,7 @@ async function main(args: string[]) {
         options: { 'dry-run': bool, 'if-exists': str, base: str, json: bool },
       });
       const file = position(positionals)!;
-      const spec = await readJson(file);
+      const spec = await readAutomationJson(file);
       const result = await generateAgentVariants(spec, {
         base: resolve(v.base ?? process.cwd()),
         store: new Connections(),
@@ -467,7 +477,7 @@ async function main(args: string[]) {
         options: { workspace: str, base: str, 'dry-run': bool, 'if-exists': str, json: bool },
       });
       const file = position(positionals)!;
-      const items = unwrapBatchArray(await readJson(file));
+      const items = unwrapBatchArray(await readAutomationJson(file));
       const result = await abortable(signal =>
         batchImportContests(items, {
           root: workdir(v.workspace),
@@ -511,7 +521,7 @@ async function main(args: string[]) {
       });
       const specFile = position(positionals)!;
       if (!v.out) throw new CliError('Expected --out <problems.pdf>', 3, 'validation_error');
-      const rawSpec = await readJson(specFile);
+      const rawSpec = await readAutomationJson(specFile);
       const specObj = Array.isArray(rawSpec)
         ? { problems: rawSpec }
         : rawSpec && typeof rawSpec === 'object'
@@ -768,7 +778,7 @@ async function main(args: string[]) {
     if (group === 'studio') {
       const { values } = parseArgs({ args: args.slice(1), options: { workspace: str, port: str } });
       const port = values.port === undefined ? 0 : Number(values.port);
-      if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Invalid --port');
+      if (!Number.isInteger(port) || port < 0 || port > 65535) throw new CliError('Invalid --port', 3, 'validation_error');
       const { serveStudio } = await import('./studio.js');
       await abortable(async signal => { await serveStudio(workdir(values.workspace), port, signal); });
       return 0;

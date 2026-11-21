@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { chmod, link, lstat, mkdir, mkdtemp, open, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, link, lstat, mkdir, mkdtemp, open, realpath, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { z } from 'zod';
@@ -54,8 +54,98 @@ const PDF_MAGIC = Buffer.from('%PDF-');
 const MAX_ATTACHMENT_BYTES = 16_000_000;
 const MAX_TOTAL_ATTACHMENTS_BYTES = 32_000_000;
 const MAX_JUDGE_FILE_BYTES = 4_000_000;
+const MAX_CONTEST_MANIFEST_BYTES = 1_000_000;
 const MAX_NATIVE_CONFIG_BYTES = 64_000;
 const MAX_EXISTING_DOC_BYTES = 1_048_576;
+
+export function isForbiddenPublicFilename(filePath: string): boolean {
+  const nameLower = basename(filePath).toLowerCase();
+  return (
+    nameLower === 'judge.json' ||
+    nameLower.endsWith('.judge.json') ||
+    nameLower === 'package.json' ||
+    nameLower === 'run.json'
+  );
+}
+
+function containsAcceptedAnswers(value: unknown, depth = 0): boolean {
+  if (depth > 32 || !value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (containsAcceptedAnswers(item, depth + 1)) return true;
+    }
+    return false;
+  }
+  if (Object.hasOwn(value, 'accepted_answers')) return true;
+  for (const child of Object.values(value as Record<string, unknown>)) {
+    if (containsAcceptedAnswers(child, depth + 1)) return true;
+  }
+  return false;
+}
+
+export function isExistingLocalJudgeDocument(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  const obj = raw as Record<string, unknown>;
+  return obj.schema_version === 1 && Array.isArray(obj.problems);
+}
+
+export function isJudgeAnswerBytes(bytes: Buffer): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytes.toString('utf8'));
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== 'object') return false;
+  return isExistingLocalJudgeDocument(parsed) || containsAcceptedAnswers(parsed);
+}
+
+function toManifestRelativePath(manifestAbsPath: string, refAbsPath: string): string {
+  return relative(dirname(manifestAbsPath), refAbsPath).split(sep).join('/');
+}
+
+const workspaceLocks = new Map<string, Promise<void>>();
+
+async function withWorkspaceLock<T>(baseReal: string, fn: () => Promise<T>): Promise<T> {
+  const prev = workspaceLocks.get(baseReal) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>(resolveGate => {
+    release = resolveGate;
+  });
+  const tail = prev.then(() => gate);
+  workspaceLocks.set(baseReal, tail);
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (workspaceLocks.get(baseReal) === tail) {
+      workspaceLocks.delete(baseReal);
+    }
+  }
+}
+
+export async function inspectPdfBytes(
+  bytes: Buffer,
+  displayPath: string,
+  opts?: { useExternalTools?: boolean },
+): Promise<PdfInfo> {
+  const stageDir = await mkdtemp(join(tmpdir(), 'cr-pdf-inspect-'));
+  await chmod(stageDir, 0o700);
+  try {
+    const stagedPath = join(stageDir, 'input.pdf');
+    await writeFile(stagedPath, bytes, { mode: 0o600, flag: 'wx' });
+    const info = await inspectPdf(stagedPath, {
+      useExternalTools: opts?.useExternalTools ?? false,
+    });
+    return {
+      ...info,
+      path: displayPath,
+    };
+  } finally {
+    await rm(stageDir, { recursive: true, force: true });
+  }
+}
 
 function normalizeKeyName(key: string): string {
   return key
@@ -295,7 +385,7 @@ export async function readConfinedRegularFile(
   }
 }
 
-async function resolveProtectedDirs(opts: {
+export async function resolveProtectedDirs(opts: {
   baseReal: string;
   baseResolved: string;
   root?: string;
@@ -325,7 +415,7 @@ async function resolveProtectedDirs(opts: {
   return [...out];
 }
 
-function assertNotInProtectedDirs(
+export function assertNotInProtectedDirs(
   absPath: string,
   relPath: string,
   protectedDirs: readonly string[],
@@ -357,7 +447,7 @@ function assertAllowedWritePrefix(
   }
 }
 
-function assertNotForbiddenMaterialPath(
+export function assertNotForbiddenMaterialPath(
   absPath: string,
   relPath: string,
   protectedDirs: readonly string[],
@@ -365,8 +455,12 @@ function assertNotForbiddenMaterialPath(
   fieldPath: string[],
 ): void {
   assertNotInProtectedDirs(absPath, relPath, protectedDirs, fieldPath, 'Contest material');
-  if (basename(absPath).toLowerCase().endsWith('.judge.json')) {
+  const nameLower = basename(absPath).toLowerCase();
+  if (nameLower === 'judge.json' || nameLower.endsWith('.judge.json')) {
     throw new FieldError(fieldPath, `Judge answer file cannot be exposed as contest material: ${relPath}`);
+  }
+  if (isForbiddenPublicFilename(absPath)) {
+    throw new FieldError(fieldPath, `Forbidden filename cannot be exposed as contest material: ${relPath}`);
   }
   if (judgeAbsPath && absPath === judgeAbsPath) {
     throw new FieldError(fieldPath, `Contest judge answers file cannot be exposed as contest material: ${relPath}`);
@@ -440,12 +534,6 @@ function isExistingContestDocument(raw: unknown): boolean {
   return false;
 }
 
-function isExistingLocalJudgeDocument(raw: unknown): boolean {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
-  const obj = raw as Record<string, unknown>;
-  return obj.schema_version === 1 && Array.isArray(obj.problems);
-}
-
 async function readExistingForOverwriteCheck(
   baseReal: string,
   absPath: string,
@@ -453,11 +541,8 @@ async function readExistingForOverwriteCheck(
   kind: 'agent' | 'contest' | 'judge' | 'pdf',
   fieldPath: string[],
 ): Promise<{ backup: Buffer; mode: number }> {
-  const nameLower = basename(absPath).toLowerCase();
-  if (kind === 'agent' || kind === 'contest') {
-    if (nameLower === 'package.json' || nameLower === 'run.json' || nameLower.endsWith('.judge.json')) {
-      throw new FieldError(fieldPath, `Refusing to overwrite non-${kind} file: ${relPath}`);
-    }
+  if ((kind === 'agent' || kind === 'contest') && isForbiddenPublicFilename(absPath)) {
+    throw new FieldError(fieldPath, `Refusing to overwrite non-${kind} file: ${relPath}`);
   }
   const maxBytes = kind === 'pdf' ? 128 * 1024 * 1024 : kind === 'judge' ? MAX_JUDGE_FILE_BYTES : MAX_EXISTING_DOC_BYTES;
   const loaded = await readConfinedRegularFile(baseReal, absPath, fieldPath, maxBytes);
@@ -517,23 +602,58 @@ async function atomicWriteFile(absPath: string, content: string | Buffer, overwr
 interface RollbackEntry {
   path: string;
   existed: boolean;
+  writtenSha256: string;
   backup?: Buffer;
   mode?: number;
 }
 
-async function rollbackWrites(entries: RollbackEntry[]): Promise<void> {
+async function readCurrentFileHashNoFollow(filePath: string): Promise<{ missing: true } | { missing: false; hash: string }> {
+  let handle;
+  try {
+    handle = await open(filePath, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (isEnoent(error)) return { missing: true };
+    throw error;
+  }
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) {
+      throw new Error(`Refusing to roll back non-regular file: ${filePath}`);
+    }
+    const buf = Buffer.alloc(info.size + 1);
+    let offset = 0;
+    while (offset < buf.length) {
+      const { bytesRead } = await handle.read(buf, offset, buf.length - offset, offset);
+      if (!bytesRead) break;
+      offset += bytesRead;
+    }
+    return { missing: false, hash: sha256(buf.subarray(0, offset)) };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function rollbackWrites(entries: RollbackEntry[]): Promise<string[]> {
+  const failures: string[] = [];
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i]!;
     try {
+      const current = await readCurrentFileHashNoFollow(entry.path);
+      if (current.missing) continue;
+      if (current.hash !== entry.writtenSha256) {
+        failures.push(`Skipped rollback of ${entry.path}: file was modified concurrently`);
+        continue;
+      }
       if (entry.existed && entry.backup !== undefined) {
         await atomicWriteFile(entry.path, entry.backup, true, entry.mode ?? 0o600);
       } else if (!entry.existed) {
-        await rm(entry.path, { force: true });
+        await unlink(entry.path);
       }
-    } catch {
-      // Best-effort rollback of remaining files.
+    } catch (error) {
+      failures.push(`Rollback failed for ${entry.path}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+  return failures;
 }
 
 export interface AgentDigestsSummary {
@@ -632,348 +752,414 @@ export async function batchApplyAgents(
     credentialDirs: opts.credentialDirs,
   });
 
-  const errors: AutomationIssue[] = [];
-  const planned: Array<{
-    id: string;
-    name?: string;
-    absPath: string;
-    relPath: string;
-    format: Format;
-    provider: string;
-    serialized: string;
-    action: 'create' | 'skip' | 'overwrite';
-    backup?: Buffer;
-    backupMode?: number;
-    digests: AgentDigestsSummary;
-  }> = [];
-  const seenTargets = new Set<string>();
-  const referencedInputs = new Set<string>();
+  return withWorkspaceLock(baseReal, async () => {
+    const errors: AutomationIssue[] = [];
+    const planned: Array<{
+      id: string;
+      name?: string;
+      absPath: string;
+      relPath: string;
+      format: Format;
+      provider: string;
+      serialized: string;
+      action: 'create' | 'skip' | 'overwrite';
+      backup?: Buffer;
+      backupMode?: number;
+      digests: AgentDigestsSummary;
+    }> = [];
+    const seenTargets = new Set<string>();
+    const referencedInputs = new Set<string>();
 
-  for (let i = 0; i < rawItems.length; i++) {
-    const rawEntry = rawItems[i];
-    const secretHits = findSecretKeyPaths(rawEntry);
-    if (secretHits.length > 0) {
-      for (const hit of secretHits) {
-        errors.push({
-          index: i,
-          path: hit,
-          message: `Embedded secret field "${hit.join('.')}" is forbidden; reference a saved provider ID instead`,
-          code: 'secret_rejected',
-        });
+    for (let i = 0; i < rawItems.length; i++) {
+      const rawEntry = rawItems[i];
+      const secretHits = findSecretKeyPaths(rawEntry);
+      if (secretHits.length > 0) {
+        for (const hit of secretHits) {
+          errors.push({
+            index: i,
+            path: hit,
+            message: `Embedded secret field "${hit.join('.')}" is forbidden; reference a saved provider ID instead`,
+            code: 'secret_rejected',
+          });
+        }
+        continue;
       }
-      continue;
-    }
 
-    let normalized: { file?: string; format?: Format; document: Record<string, unknown> };
-    if (
-      rawEntry &&
-      typeof rawEntry === 'object' &&
-      !Array.isArray(rawEntry) &&
-      'kind' in rawEntry &&
-      !('document' in rawEntry)
-    ) {
-      normalized = { document: rawEntry as Record<string, unknown> };
-    } else {
-      const parsed = batchAgentItemSchema.safeParse(rawEntry);
-      if (!parsed.success) {
+      let normalized: { file?: string; format?: Format; document: Record<string, unknown> };
+      if (
+        rawEntry &&
+        typeof rawEntry === 'object' &&
+        !Array.isArray(rawEntry) &&
+        'kind' in rawEntry &&
+        !('document' in rawEntry)
+      ) {
+        normalized = { document: rawEntry as Record<string, unknown> };
+      } else {
+        const parsed = batchAgentItemSchema.safeParse(rawEntry);
+        if (!parsed.success) {
+          errors.push({
+            index: i,
+            path: parsed.error.issues[0]?.path.map(String) ?? [],
+            message: parsed.error.issues.map(iss => `${iss.path.join('.') || '(root)'}: ${iss.message}`).join('; '),
+            code: 'validation',
+          });
+          continue;
+        }
+        normalized = parsed.data;
+      }
+
+      const doc = normalized.document;
+      const rawId = typeof doc.id === 'string' ? doc.id : undefined;
+      let format: Format;
+      try {
+        if (normalized.format) {
+          format = normalized.format;
+          if (normalized.file && documentFormat(normalized.file) !== format) {
+            throw new FieldError(['file'], `File extension does not match format "${format}"`);
+          }
+        } else if (normalized.file) {
+          format = documentFormat(normalized.file);
+        } else {
+          format = 'toml';
+        }
+      } catch (error) {
         errors.push({
           index: i,
-          path: parsed.error.issues[0]?.path.map(String) ?? [],
-          message: parsed.error.issues.map(iss => `${iss.path.join('.') || '(root)'}: ${iss.message}`).join('; '),
+          id: rawId,
+          path: ['file'],
+          message: error instanceof Error ? error.message : 'Invalid file format',
           code: 'validation',
         });
         continue;
       }
-      normalized = parsed.data;
-    }
 
-    const doc = normalized.document;
-    const rawId = typeof doc.id === 'string' ? doc.id : undefined;
-    let format: Format;
-    try {
-      if (normalized.format) {
-        format = normalized.format;
-        if (normalized.file && documentFormat(normalized.file) !== format) {
-          throw new FieldError(['file'], `File extension does not match format "${format}"`);
+      const manifestCheck = manifestSchema.safeParse(doc);
+      if (!manifestCheck.success) {
+        errors.push({
+          index: i,
+          id: rawId,
+          path: manifestCheck.error.issues[0]?.path.map(String) ?? ['document'],
+          message: manifestCheck.error.issues.map(iss => `${iss.path.join('.') || '(root)'}: ${iss.message}`).join('; '),
+          code: 'validation',
+        });
+        continue;
+      }
+
+      const defaultFile = `agents/${manifestCheck.data.id}.${format}`;
+      let confined: { absPath: string; relPath: string };
+      try {
+        confined = await resolveConfinedPath(baseResolved, normalized.file ?? defaultFile);
+        if (isForbiddenPublicFilename(confined.absPath)) {
+          throw new FieldError(['file'], `Forbidden filename for agent manifest: ${confined.relPath}`);
         }
-      } else if (normalized.file) {
-        format = documentFormat(normalized.file);
-      } else {
-        format = 'toml';
-      }
-    } catch (error) {
-      errors.push({
-        index: i,
-        id: rawId,
-        path: ['file'],
-        message: error instanceof Error ? error.message : 'Invalid file format',
-        code: 'validation',
-      });
-      continue;
-    }
-
-    const manifestCheck = manifestSchema.safeParse(doc);
-    if (!manifestCheck.success) {
-      errors.push({
-        index: i,
-        id: rawId,
-        path: manifestCheck.error.issues[0]?.path.map(String) ?? ['document'],
-        message: manifestCheck.error.issues.map(iss => `${iss.path.join('.') || '(root)'}: ${iss.message}`).join('; '),
-        code: 'validation',
-      });
-      continue;
-    }
-
-    const defaultFile = `agents/${manifestCheck.data.id}.${format}`;
-    let confined: { absPath: string; relPath: string };
-    try {
-      confined = await resolveConfinedPath(baseResolved, normalized.file ?? defaultFile);
-      assertNotInProtectedDirs(confined.absPath, confined.relPath, protectedDirs, ['file'], 'Agent output');
-      assertAllowedWritePrefix(confined.relPath, opts.allowedPrefixes, ['file']);
-    } catch (error) {
-      errors.push({
-        index: i,
-        id: manifestCheck.data.id,
-        path: error instanceof FieldError ? error.path : ['file'],
-        message: error instanceof Error ? error.message : 'Invalid output path',
-        code: 'path_error',
-      });
-      continue;
-    }
-
-    if (seenTargets.has(confined.absPath)) {
-      errors.push({
-        index: i,
-        id: manifestCheck.data.id,
-        path: ['file'],
-        message: `Duplicate target path in batch: ${confined.relPath}`,
-        code: 'conflict',
-      });
-      continue;
-    }
-    let parentCollision = false;
-    for (const prevTarget of seenTargets) {
-      if (hasAncestorDescendantCollision(confined.absPath, prevTarget)) {
-        errors.push({
-          index: i,
-          id: manifestCheck.data.id,
-          path: ['file'],
-          message: `Target path collides with parent/descendant path in batch: ${confined.relPath}`,
-          code: 'conflict',
-        });
-        parentCollision = true;
-        break;
-      }
-    }
-    if (parentCollision) continue;
-    seenTargets.add(confined.absPath);
-
-    // Confine transitive references (native_config.path and legacy config) via O_NOFOLLOW BEFORE resolving.
-    const nativeCfg = manifestCheck.data.harness.native_config;
-    if (nativeCfg && 'path' in nativeCfg) {
-      try {
-        const nativeCandidate = resolve(dirname(confined.absPath), nativeCfg.path);
-        const nativeRead = await readConfinedRegularFile(
-          baseResolved,
-          nativeCandidate,
-          ['document', 'harness', 'native_config', 'path'],
-          MAX_NATIVE_CONFIG_BYTES,
-        );
-        referencedInputs.add(nativeRead.absPath);
+        assertNotInProtectedDirs(confined.absPath, confined.relPath, protectedDirs, ['file'], 'Agent output');
+        assertAllowedWritePrefix(confined.relPath, opts.allowedPrefixes, ['file']);
       } catch (error) {
         errors.push({
           index: i,
           id: manifestCheck.data.id,
-          path: error instanceof FieldError ? error.path : ['document', 'harness', 'native_config', 'path'],
-          message: error instanceof Error ? error.message : 'Invalid native_config path',
-          code: error instanceof FieldError ? 'path_error' : 'validation',
+          path: error instanceof FieldError ? error.path : ['file'],
+          message: error instanceof Error ? error.message : 'Invalid output path',
+          code: 'path_error',
         });
         continue;
       }
-    }
-    if (typeof doc.config === 'string') {
-      try {
-        const legacyCandidate = resolve(dirname(confined.absPath), doc.config);
-        const legacyRead = await readConfinedRegularFile(
-          baseResolved,
-          legacyCandidate,
-          ['document', 'config'],
-          MAX_NATIVE_CONFIG_BYTES,
-        );
-        referencedInputs.add(legacyRead.absPath);
-      } catch (error) {
+
+      if (seenTargets.has(confined.absPath)) {
         errors.push({
           index: i,
           id: manifestCheck.data.id,
-          path: error instanceof FieldError ? error.path : ['document', 'config'],
-          message: error instanceof Error ? error.message : 'Invalid legacy config path',
-          code: error instanceof FieldError ? 'path_error' : 'validation',
-        });
-        continue;
-      }
-    }
-
-    let resolved;
-    try {
-      resolved = await resolveAgentManifest(doc, confined.absPath, store);
-    } catch (error) {
-      errors.push({
-        index: i,
-        id: manifestCheck.data.id,
-        path: error instanceof FieldError ? error.path : ['document'],
-        message: error instanceof Error ? error.message : 'Invalid agent manifest',
-        code: 'validation',
-      });
-      continue;
-    }
-
-    let exists: boolean;
-    try {
-      exists = await fileExistsNoFollow(confined.absPath);
-    } catch (error) {
-      errors.push({
-        index: i,
-        id: resolved.manifest.id,
-        path: ['file'],
-        message: error instanceof Error ? error.message : 'Unsafe existing target path',
-        code: 'path_error',
-      });
-      continue;
-    }
-
-    let action: 'create' | 'skip' | 'overwrite' = 'create';
-    let backup: Buffer | undefined;
-    let backupMode: number | undefined;
-    if (exists) {
-      if (ifExists === 'error') {
-        errors.push({
-          index: i,
-          id: resolved.manifest.id,
           path: ['file'],
-          message: `Agent file already exists: ${confined.relPath}`,
+          message: `Duplicate target path in batch: ${confined.relPath}`,
           code: 'conflict',
         });
         continue;
       }
-      if (ifExists === 'skip') {
-        action = 'skip';
-      } else {
+      let parentCollision = false;
+      for (const prevTarget of seenTargets) {
+        if (hasAncestorDescendantCollision(confined.absPath, prevTarget)) {
+          errors.push({
+            index: i,
+            id: manifestCheck.data.id,
+            path: ['file'],
+            message: `Target path collides with parent/descendant path in batch: ${confined.relPath}`,
+            code: 'conflict',
+          });
+          parentCollision = true;
+          break;
+        }
+      }
+      if (parentCollision) continue;
+      seenTargets.add(confined.absPath);
+
+      // Confine and read transitive references (native_config.path and legacy config) via O_NOFOLLOW ONCE,
+      // then pass verified in-memory content into resolveAgentManifest (zero reopen TOCTOU).
+      const nativeCfg = manifestCheck.data.harness.native_config;
+      let savedNativeConfig: typeof nativeCfg | undefined;
+      let validationDoc: Record<string, unknown> = doc;
+      if (nativeCfg && 'path' in nativeCfg) {
         try {
-          const prev = await readExistingForOverwriteCheck(baseReal, confined.absPath, confined.relPath, 'agent', ['file']);
-          backup = prev.backup;
-          backupMode = prev.mode;
-          action = 'overwrite';
+          const nativeCandidate = isAbsolute(nativeCfg.path)
+            ? nativeCfg.path
+            : resolve(dirname(confined.absPath), nativeCfg.path);
+          const nativeRead = await readConfinedRegularFile(
+            baseResolved,
+            nativeCandidate,
+            ['document', 'harness', 'native_config', 'path'],
+            MAX_NATIVE_CONFIG_BYTES,
+          );
+          assertNotInProtectedDirs(
+            nativeRead.absPath,
+            nativeRead.relPath,
+            protectedDirs,
+            ['document', 'harness', 'native_config', 'path'],
+            'Native config',
+          );
+          const computedNativeHash = sha256(nativeRead.bytes);
+          if (computedNativeHash !== nativeCfg.sha256) {
+            throw new FieldError(
+              ['document', 'harness', 'native_config', 'sha256'],
+              `Native config SHA-256 mismatch: ${nativeRead.relPath}`,
+            );
+          }
+          referencedInputs.add(nativeRead.absPath);
+          const normalizedNativePath = isAbsolute(nativeCfg.path)
+            ? toManifestRelativePath(confined.absPath, nativeRead.absPath)
+            : nativeCfg.path;
+          savedNativeConfig = {
+            ...nativeCfg,
+            path: normalizedNativePath,
+          };
+          const harnessRec = doc.harness as Record<string, unknown>;
+          validationDoc = {
+            ...doc,
+            harness: {
+              ...harnessRec,
+              native_config: {
+                format: nativeCfg.format,
+                ...(nativeCfg.schema ? { schema: nativeCfg.schema } : {}),
+                content: nativeRead.bytes.toString('utf8'),
+              },
+            },
+          };
         } catch (error) {
           errors.push({
             index: i,
-            id: resolved.manifest.id,
-            path: ['file'],
-            message: error instanceof Error ? error.message : 'Refusing to overwrite non-agent file',
-            code: 'conflict',
+            id: manifestCheck.data.id,
+            path: error instanceof FieldError ? error.path : ['document', 'harness', 'native_config', 'path'],
+            message: error instanceof Error ? error.message : 'Invalid native_config path',
+            code: error instanceof FieldError && error.path.includes('path') ? 'path_error' : 'validation',
           });
           continue;
         }
       }
-    }
-
-    const serialized = serializeDocument(resolved.manifest, format);
-    const digestsRaw = agentDigests(resolved.profile, resolved.native, resolved.nativeText, resolved.env);
-    const digests: AgentDigestsSummary = {
-      source_sha256: sha256(serialized),
-      profile_sha256: digestsRaw.profileDigest,
-      ...(digestsRaw.nativeDigest ? { native_sha256: digestsRaw.nativeDigest } : {}),
-      effective_sha256: digestsRaw.effectiveDigest,
-    };
-
-    planned.push({
-      id: resolved.manifest.id,
-      ...(resolved.manifest.name ? { name: resolved.manifest.name } : {}),
-      absPath: confined.absPath,
-      relPath: confined.relPath,
-      format,
-      provider: manifestProvider(resolved.manifest),
-      serialized,
-      action,
-      backup,
-      backupMode,
-      digests,
-    });
-  }
-
-  // Reject any target that collides with a referenced input in the same batch.
-  for (const item of planned) {
-    if (referencedInputs.has(item.absPath)) {
-      errors.push({
-        id: item.id,
-        path: ['file'],
-        message: `Target output path collides with a referenced input file in the same batch: ${item.relPath}`,
-        code: 'conflict',
-      });
-    }
-  }
-
-  if (errors.length > 0) {
-    return {
-      ok: false,
-      dry_run: dryRun,
-      created: 0,
-      skipped: 0,
-      overwritten: 0,
-      items: [],
-      errors,
-    };
-  }
-
-  let created = 0;
-  let skipped = 0;
-  let overwritten = 0;
-  const results: BatchAgentItemResult[] = [];
-  const rollbackLog: RollbackEntry[] = [];
-
-  try {
-    for (const planItem of planned) {
-      if (planItem.action === 'skip') {
-        skipped++;
-      } else {
-        if (!dryRun) {
-          await ensureConfinedParentDir(baseReal, planItem.absPath);
-          await store.register(planItem.provider, planItem.absPath, () =>
-            atomicWriteFile(planItem.absPath, planItem.serialized, planItem.action === 'overwrite', 0o600),
+      if (typeof doc.config === 'string') {
+        try {
+          const legacyCandidate = isAbsolute(doc.config)
+            ? doc.config
+            : resolve(dirname(confined.absPath), doc.config);
+          const legacyRead = await readConfinedRegularFile(
+            baseResolved,
+            legacyCandidate,
+            ['document', 'config'],
+            MAX_NATIVE_CONFIG_BYTES,
           );
-          rollbackLog.push({
-            path: planItem.absPath,
-            existed: planItem.action === 'overwrite',
-            backup: planItem.backup,
-            mode: planItem.backupMode,
+          assertNotInProtectedDirs(
+            legacyRead.absPath,
+            legacyRead.relPath,
+            protectedDirs,
+            ['document', 'config'],
+            'Legacy config',
+          );
+          referencedInputs.add(legacyRead.absPath);
+        } catch (error) {
+          errors.push({
+            index: i,
+            id: manifestCheck.data.id,
+            path: error instanceof FieldError ? error.path : ['document', 'config'],
+            message: error instanceof Error ? error.message : 'Invalid legacy config path',
+            code: error instanceof FieldError ? 'path_error' : 'validation',
           });
+          continue;
         }
-        if (planItem.action === 'create') created++;
-        else overwritten++;
       }
 
-      results.push({
-        id: planItem.id,
-        ...(planItem.name ? { name: planItem.name } : {}),
-        path: planItem.relPath,
-        format: planItem.format,
-        action: planItem.action,
-        digests: planItem.digests,
+      let resolved;
+      try {
+        resolved = await resolveAgentManifest(validationDoc, confined.absPath, store);
+      } catch (error) {
+        errors.push({
+          index: i,
+          id: manifestCheck.data.id,
+          path: error instanceof FieldError ? error.path : ['document'],
+          message: error instanceof Error ? error.message : 'Invalid agent manifest',
+          code: 'validation',
+        });
+        continue;
+      }
+
+      let exists: boolean;
+      try {
+        exists = await fileExistsNoFollow(confined.absPath);
+      } catch (error) {
+        errors.push({
+          index: i,
+          id: resolved.manifest.id,
+          path: ['file'],
+          message: error instanceof Error ? error.message : 'Unsafe existing target path',
+          code: 'path_error',
+        });
+        continue;
+      }
+
+      let action: 'create' | 'skip' | 'overwrite' = 'create';
+      let backup: Buffer | undefined;
+      let backupMode: number | undefined;
+      if (exists) {
+        if (ifExists === 'error') {
+          errors.push({
+            index: i,
+            id: resolved.manifest.id,
+            path: ['file'],
+            message: `Agent file already exists: ${confined.relPath}`,
+            code: 'conflict',
+          });
+          continue;
+        }
+        if (ifExists === 'skip') {
+          action = 'skip';
+        } else {
+          try {
+            const prev = await readExistingForOverwriteCheck(baseReal, confined.absPath, confined.relPath, 'agent', ['file']);
+            backup = prev.backup;
+            backupMode = prev.mode;
+            action = 'overwrite';
+          } catch (error) {
+            errors.push({
+              index: i,
+              id: resolved.manifest.id,
+              path: ['file'],
+              message: error instanceof Error ? error.message : 'Refusing to overwrite non-agent file',
+              code: 'conflict',
+            });
+            continue;
+          }
+        }
+      }
+
+      const finalManifest = savedNativeConfig
+        ? {
+            ...resolved.manifest,
+            harness: {
+              ...resolved.manifest.harness,
+              native_config: savedNativeConfig,
+            },
+          }
+        : resolved.manifest;
+      const serialized = serializeDocument(finalManifest, format);
+      const digestsRaw = agentDigests(resolved.profile, resolved.native, resolved.nativeText, resolved.env);
+      const digests: AgentDigestsSummary = {
+        source_sha256: sha256(serialized),
+        profile_sha256: digestsRaw.profileDigest,
+        ...(digestsRaw.nativeDigest ? { native_sha256: digestsRaw.nativeDigest } : {}),
+        effective_sha256: digestsRaw.effectiveDigest,
+      };
+
+      planned.push({
+        id: resolved.manifest.id,
+        ...(resolved.manifest.name ? { name: resolved.manifest.name } : {}),
+        absPath: confined.absPath,
+        relPath: confined.relPath,
+        format,
+        provider: manifestProvider(resolved.manifest),
+        serialized,
+        action,
+        backup,
+        backupMode,
+        digests,
       });
     }
-  } catch (error) {
-    await rollbackWrites(rollbackLog);
-    throw error;
-  }
 
-  return {
-    ok: true,
-    dry_run: dryRun,
-    created,
-    skipped,
-    overwritten,
-    items: results,
-    errors: [],
-  };
+    // Reject any target that collides with a referenced input in the same batch.
+    for (const item of planned) {
+      if (referencedInputs.has(item.absPath)) {
+        errors.push({
+          id: item.id,
+          path: ['file'],
+          message: `Target output path collides with a referenced input file in the same batch: ${item.relPath}`,
+          code: 'conflict',
+        });
+      }
+    }
+
+    if (errors.length > 0) {
+      return {
+        ok: false,
+        dry_run: dryRun,
+        created: 0,
+        skipped: 0,
+        overwritten: 0,
+        items: [],
+        errors,
+      };
+    }
+
+    let created = 0;
+    let skipped = 0;
+    let overwritten = 0;
+    const results: BatchAgentItemResult[] = [];
+    const rollbackLog: RollbackEntry[] = [];
+
+    try {
+      for (const planItem of planned) {
+        if (planItem.action === 'skip') {
+          skipped++;
+        } else {
+          if (!dryRun) {
+            await ensureConfinedParentDir(baseReal, planItem.absPath);
+            await store.register(planItem.provider, planItem.absPath, () =>
+              atomicWriteFile(planItem.absPath, planItem.serialized, planItem.action === 'overwrite', 0o600),
+            );
+            rollbackLog.push({
+              path: planItem.absPath,
+              existed: planItem.action === 'overwrite',
+              writtenSha256: sha256(planItem.serialized),
+              backup: planItem.backup,
+              mode: planItem.backupMode,
+            });
+          }
+          if (planItem.action === 'create') created++;
+          else overwritten++;
+        }
+
+        results.push({
+          id: planItem.id,
+          ...(planItem.name ? { name: planItem.name } : {}),
+          path: planItem.relPath,
+          format: planItem.format,
+          action: planItem.action,
+          digests: planItem.digests,
+        });
+      }
+    } catch (error) {
+      const rollbackFailures = await rollbackWrites(rollbackLog);
+      if (rollbackFailures.length > 0) {
+        const msg = error instanceof Error ? error.message : String(error);
+        throw new Error(`${msg} (rollback issues: ${rollbackFailures.join('; ')})`, { cause: error });
+      }
+      throw error;
+    }
+
+    return {
+      ok: true,
+      dry_run: dryRun,
+      created,
+      skipped,
+      overwritten,
+      items: results,
+      errors: [],
+    };
+  });
 }
 
 export const variantMatrixSpecSchema = z.strictObject({
@@ -1368,6 +1554,101 @@ async function synthesizePdfToBuffer(
   }
 }
 
+async function stageAndResolveContest(params: {
+  manifestDraft: Record<string, unknown>;
+  entrypointBytes: Buffer;
+  normalizedEntrypointPath: string;
+  attachments: Array<{ normalizedPath: string; bytes: Buffer }>;
+  judgeBytes?: Buffer;
+  normalizedJudgeAnswersPath?: string;
+}): Promise<{ finalManifestBytes: Buffer; revision: string }> {
+  const stageDir = await mkdtemp(join(tmpdir(), 'cr-contest-stage-'));
+  await chmod(stageDir, 0o700);
+  try {
+    await writeFile(join(stageDir, 'entrypoint.pdf'), params.entrypointBytes, { mode: 0o600, flag: 'wx' });
+    const rawMaterials = params.manifestDraft.materials as Record<string, unknown>;
+    const rawEntrypoint = rawMaterials.entrypoint as Record<string, unknown>;
+    const rawAttachments = Array.isArray(rawMaterials.attachments)
+      ? (rawMaterials.attachments as Array<Record<string, unknown>>)
+      : [];
+    const stagedAttachments: Array<Record<string, unknown>> = [];
+    for (let k = 0; k < params.attachments.length; k++) {
+      const stageName = `att-${k}.bin`;
+      await writeFile(join(stageDir, stageName), params.attachments[k]!.bytes, { mode: 0o600, flag: 'wx' });
+      stagedAttachments.push({
+        ...rawAttachments[k]!,
+        path: stageName,
+      });
+    }
+
+    const rawJudge = params.manifestDraft.judge as Record<string, unknown>;
+    let stagedJudge: Record<string, unknown> = rawJudge;
+    if (rawJudge.kind === 'local' && params.judgeBytes !== undefined) {
+      await writeFile(join(stageDir, 'judge.json'), params.judgeBytes, { mode: 0o600, flag: 'wx' });
+      stagedJudge = {
+        ...rawJudge,
+        answers: {
+          ...(rawJudge.answers as Record<string, unknown>),
+          path: 'judge.json',
+        },
+      };
+    }
+
+    const stagedDraft: Record<string, unknown> = {
+      ...params.manifestDraft,
+      materials: {
+        entrypoint: {
+          ...rawEntrypoint,
+          path: 'entrypoint.pdf',
+        },
+        attachments: stagedAttachments,
+      },
+      judge: stagedJudge,
+    };
+
+    const resolved = await resolveContest(stagedDraft, join(stageDir, 'contest.json'));
+    const { statement: _statement, ...resolvedContest } = resolved.contest;
+    const finalContest = {
+      ...resolvedContest,
+      materials: {
+        entrypoint: {
+          ...resolvedContest.materials.entrypoint,
+          path: params.normalizedEntrypointPath,
+        },
+        attachments: resolvedContest.materials.attachments.map((att, idx) => ({
+          ...att,
+          path: params.attachments[idx]!.normalizedPath,
+        })),
+      },
+      judge:
+        resolvedContest.judge.kind === 'local' && params.normalizedJudgeAnswersPath !== undefined
+          ? {
+              ...resolvedContest.judge,
+              answers: {
+                ...resolvedContest.judge.answers,
+                path: params.normalizedJudgeAnswersPath,
+              },
+            }
+          : resolvedContest.judge,
+    };
+
+    const finalManifestJson = JSON.stringify(finalContest, null, 2) + '\n';
+    const finalManifestBytes = Buffer.from(finalManifestJson, 'utf8');
+    if (finalManifestBytes.length > MAX_CONTEST_MANIFEST_BYTES) {
+      throw new FieldError(
+        ['document'],
+        `Serialized contest manifest (${finalManifestBytes.length} bytes) exceeds limit of ${MAX_CONTEST_MANIFEST_BYTES} bytes`,
+      );
+    }
+    return {
+      finalManifestBytes,
+      revision: resolved.contestRevision,
+    };
+  } finally {
+    await rm(stageDir, { recursive: true, force: true });
+  }
+}
+
 export async function batchImportContests(
   rawItems: unknown,
   opts: BatchImportContestsOptions,
@@ -1420,994 +1701,1037 @@ export async function batchImportContests(
     credentialDirs: opts.credentialDirs,
   });
 
-  const errors: AutomationIssue[] = [];
-  const seenTargets = new Set<string>();
-  const referencedInputs = new Set<string>();
+  return withWorkspaceLock(baseReal, async () => {
+    const errors: AutomationIssue[] = [];
+    const seenTargets = new Set<string>();
+    const referencedInputs = new Set<string>();
 
-  const reserveTarget = (
-    absPath: string,
-    relPath: string,
-    index: number,
-    contestId: string,
-    fieldPath: string[],
-  ): boolean => {
-    if (seenTargets.has(absPath)) {
-      errors.push({
-        index,
-        id: contestId,
-        path: fieldPath,
-        message: `Duplicate target path in batch: ${relPath}`,
-        code: 'conflict',
-      });
-      return false;
-    }
-    for (const prevTarget of seenTargets) {
-      if (hasAncestorDescendantCollision(absPath, prevTarget)) {
+    const reserveTarget = (
+      absPath: string,
+      relPath: string,
+      index: number,
+      contestId: string,
+      fieldPath: string[],
+    ): boolean => {
+      if (seenTargets.has(absPath)) {
         errors.push({
           index,
           id: contestId,
           path: fieldPath,
-          message: `Target path collides with parent/descendant path in batch: ${relPath}`,
+          message: `Duplicate target path in batch: ${relPath}`,
           code: 'conflict',
         });
         return false;
       }
-    }
-    seenTargets.add(absPath);
-    return true;
-  };
-
-  type PlannedContest = {
-    contest_id: string;
-    absPath: string;
-    relPath: string;
-    action: 'create' | 'skip' | 'overwrite';
-    manifestExists: boolean;
-    manifestBackup?: Buffer;
-    manifestBackupMode?: number;
-    manifestDraft: Record<string, unknown>;
-    plannedRevision: string;
-    judgeJsonBytes?: Buffer;
-    judgeAbsPath?: string;
-    judgeRelPath?: string;
-    judgeExists: boolean;
-    judgeBackup?: Buffer;
-    judgeBackupMode?: number;
-    synthPdfBytes?: Buffer;
-    synthPdfAbsPath?: string;
-    synthPdfRelPath?: string;
-    synthPdfExists: boolean;
-    synthPdfBackup?: Buffer;
-    synthPdfBackupMode?: number;
-    pdfInfo?: Pick<PdfInfo, 'page_count' | 'size_bytes' | 'sha256' | 'problem_ids' | 'extractor'>;
-    inferredProblemMap?: ProblemMapInference;
-    outputPaths: Array<{ absPath: string; relPath: string }>;
-  };
-  const planned: PlannedContest[] = [];
-
-  for (let i = 0; i < rawItems.length; i++) {
-    opts.signal?.throwIfAborted();
-    const rawEntry = rawItems[i];
-    const secretHits = findSecretKeyPaths(rawEntry);
-    if (secretHits.length > 0) {
-      for (const hit of secretHits) {
-        errors.push({
-          index: i,
-          path: hit,
-          message: `Embedded secret field "${hit.join('.')}" is forbidden; reference a saved OJ account_id or pool instead`,
-          code: 'secret_rejected',
-        });
+      for (const prevTarget of seenTargets) {
+        if (hasAncestorDescendantCollision(absPath, prevTarget)) {
+          errors.push({
+            index,
+            id: contestId,
+            path: fieldPath,
+            message: `Target path collides with parent/descendant path in batch: ${relPath}`,
+            code: 'conflict',
+          });
+          return false;
+        }
       }
-      continue;
-    }
+      seenTargets.add(absPath);
+      return true;
+    };
 
-    let normalized: z.infer<typeof batchContestItemSchema>;
-    if (
-      rawEntry &&
-      typeof rawEntry === 'object' &&
-      !Array.isArray(rawEntry) &&
-      'contest_id' in rawEntry &&
-      !('document' in rawEntry)
-    ) {
-      const parsed = batchContestItemSchema.safeParse({ document: rawEntry });
-      if (!parsed.success) {
-        errors.push({
-          index: i,
-          path: parsed.error.issues[0]?.path.map(String) ?? [],
-          message: parsed.error.issues.map(iss => `${iss.path.join('.') || '(root)'}: ${iss.message}`).join('; '),
-          code: 'validation',
-        });
-        continue;
-      }
-      normalized = parsed.data;
-    } else {
-      const parsed = batchContestItemSchema.safeParse(rawEntry);
-      if (!parsed.success) {
-        errors.push({
-          index: i,
-          path: parsed.error.issues[0]?.path.map(String) ?? [],
-          message: parsed.error.issues.map(iss => `${iss.path.join('.') || '(root)'}: ${iss.message}`).join('; '),
-          code: 'validation',
-        });
-        continue;
-      }
-      normalized = parsed.data;
-    }
+    type PlannedContest = {
+      contest_id: string;
+      absPath: string;
+      relPath: string;
+      action: 'create' | 'skip' | 'overwrite';
+      manifestExists: boolean;
+      manifestBackup?: Buffer;
+      manifestBackupMode?: number;
+      finalManifestBytes: Buffer;
+      revision: string;
+      judgeJsonBytes?: Buffer;
+      judgeAbsPath?: string;
+      judgeRelPath?: string;
+      judgeExists: boolean;
+      judgeBackup?: Buffer;
+      judgeBackupMode?: number;
+      synthPdfBytes?: Buffer;
+      synthPdfAbsPath?: string;
+      synthPdfRelPath?: string;
+      synthPdfExists: boolean;
+      synthPdfBackup?: Buffer;
+      synthPdfBackupMode?: number;
+      pdfInfo?: Pick<PdfInfo, 'page_count' | 'size_bytes' | 'sha256' | 'problem_ids' | 'extractor'>;
+      inferredProblemMap?: ProblemMapInference;
+      outputPaths: Array<{ absPath: string; relPath: string }>;
+    };
+    const planned: PlannedContest[] = [];
 
-    const { kind: docKind, ...docFields } = normalized.document;
-    if (docKind !== undefined && docKind !== 'contestreplay.dev/contest') {
-      errors.push({
-        index: i,
-        path: ['document', 'kind'],
-        message: 'Unsupported Contest manifest kind',
-        code: 'validation',
-      });
-      continue;
-    }
-
-    const contestIdCheck = idSchema.safeParse(docFields.contest_id);
-    if (!contestIdCheck.success) {
-      errors.push({
-        index: i,
-        path: ['document', 'contest_id'],
-        message: 'Invalid contest_id',
-        code: 'validation',
-      });
-      continue;
-    }
-    const contestId = contestIdCheck.data;
-
-    const targetFile = normalized.file ?? `contests/${contestId}.json`;
-    if (extname(targetFile).toLowerCase() !== '.json') {
-      errors.push({
-        index: i,
-        id: contestId,
-        path: ['file'],
-        message: 'Contest manifest path must end in .json',
-        code: 'validation',
-      });
-      continue;
-    }
-    if (basename(targetFile).toLowerCase().endsWith('.judge.json')) {
-      errors.push({
-        index: i,
-        id: contestId,
-        path: ['file'],
-        message: 'Contest manifest path cannot end in .judge.json',
-        code: 'validation',
-      });
-      continue;
-    }
-
-    let confined: { absPath: string; relPath: string };
-    try {
-      confined = await resolveConfinedPath(baseResolved, targetFile);
-      assertNotInProtectedDirs(confined.absPath, confined.relPath, protectedDirs, ['file'], 'Contest output');
-      assertAllowedWritePrefix(confined.relPath, opts.allowedPrefixes, ['file']);
-    } catch (error) {
-      errors.push({
-        index: i,
-        id: contestId,
-        path: ['file'],
-        message: error instanceof Error ? error.message : 'Invalid contest path',
-        code: 'path_error',
-      });
-      continue;
-    }
-
-    const itemOutputs: Array<{ absPath: string; relPath: string }> = [{ absPath: confined.absPath, relPath: confined.relPath }];
-    if (!reserveTarget(confined.absPath, confined.relPath, i, contestId, ['file'])) continue;
-
-    let manifestExists: boolean;
-    try {
-      manifestExists = await fileExistsNoFollow(confined.absPath);
-    } catch (error) {
-      errors.push({
-        index: i,
-        id: contestId,
-        path: ['file'],
-        message: error instanceof Error ? error.message : 'Unsafe target path',
-        code: 'path_error',
-      });
-      continue;
-    }
-
-    // Prepare judge / answers.
-    const rawJudge =
-      docFields.judge && typeof docFields.judge === 'object' && !Array.isArray(docFields.judge)
-        ? { ...(docFields.judge as Record<string, unknown>) }
-        : undefined;
-    if (!rawJudge || typeof rawJudge.kind !== 'string') {
-      errors.push({
-        index: i,
-        id: contestId,
-        path: ['document', 'judge'],
-        message: 'Missing judge configuration',
-        code: 'validation',
-      });
-      continue;
-    }
-
-    let answers: z.infer<typeof judgeSchema> | undefined;
-    let judgeJsonBytes: Buffer | undefined;
-    let judgeAbsPath: string | undefined;
-    let judgeRelPath: string | undefined;
-    let judgeExists = false;
-    let existingAnswersAbsPath: string | undefined;
-    let problems = docFields.problems;
-    let resolvedJudge: Record<string, unknown> = rawJudge;
-
-    if (rawJudge.kind === 'local') {
-      const hasInlineJudgeProblems = Array.isArray(rawJudge.problems);
-      const hasInlineDocProblems =
-        Array.isArray(problems) &&
-        problems.some(p => p && typeof p === 'object' && Object.hasOwn(p, 'accepted_answers'));
-      if (normalized.judge && hasInlineJudgeProblems) {
-        errors.push({
-          index: i,
-          id: contestId,
-          path: ['judge'],
-          message: 'Supply only one local answer table (either item.judge or document.judge.problems)',
-          code: 'validation',
-        });
-        continue;
-      }
-      if (normalized.judge || hasInlineJudgeProblems || hasInlineDocProblems) {
-        const answersCheck = judgeSchema.safeParse(
-          normalized.judge ?? { schema_version: 1, problems: hasInlineJudgeProblems ? rawJudge.problems : problems },
-        );
-        if (!answersCheck.success) {
+    for (let i = 0; i < rawItems.length; i++) {
+      opts.signal?.throwIfAborted();
+      const rawEntry = rawItems[i];
+      const secretHits = findSecretKeyPaths(rawEntry);
+      if (secretHits.length > 0) {
+        for (const hit of secretHits) {
           errors.push({
             index: i,
-            id: contestId,
-            path: ['judge'],
-            message: answersCheck.error.issues.map(iss => `${iss.path.join('.') || '(root)'}: ${iss.message}`).join('; '),
+            path: hit,
+            message: `Embedded secret field "${hit.join('.')}" is forbidden; reference a saved OJ account_id or pool instead`,
+            code: 'secret_rejected',
+          });
+        }
+        continue;
+      }
+
+      let normalized: z.infer<typeof batchContestItemSchema>;
+      if (
+        rawEntry &&
+        typeof rawEntry === 'object' &&
+        !Array.isArray(rawEntry) &&
+        'contest_id' in rawEntry &&
+        !('document' in rawEntry)
+      ) {
+        const parsed = batchContestItemSchema.safeParse({ document: rawEntry });
+        if (!parsed.success) {
+          errors.push({
+            index: i,
+            path: parsed.error.issues[0]?.path.map(String) ?? [],
+            message: parsed.error.issues.map(iss => `${iss.path.join('.') || '(root)'}: ${iss.message}`).join('; '),
             code: 'validation',
           });
           continue;
         }
-        answers = answersCheck.data;
-        judgeJsonBytes = Buffer.from(JSON.stringify(answers, null, 2) + '\n', 'utf8');
-        if (!normalized.judge && !hasInlineJudgeProblems) problems = undefined;
-        problems ??= answers.problems.map(({ id, max_points }) => ({ id, max_points }));
-
-        const stem = basename(confined.absPath, '.json');
-        const judgeFileRel = relative(baseReal, join(dirname(confined.absPath), `${stem}.judge.json`));
-        try {
-          const jConfined = await resolveConfinedPath(baseReal, judgeFileRel, ['judge']);
-          assertNotInProtectedDirs(jConfined.absPath, jConfined.relPath, protectedDirs, ['judge'], 'Judge output');
-          assertAllowedWritePrefix(jConfined.relPath, opts.allowedPrefixes, ['judge']);
-          judgeAbsPath = jConfined.absPath;
-          judgeRelPath = jConfined.relPath;
-          judgeExists = await fileExistsNoFollow(judgeAbsPath);
-        } catch (error) {
+        normalized = parsed.data;
+      } else {
+        const parsed = batchContestItemSchema.safeParse(rawEntry);
+        if (!parsed.success) {
           errors.push({
             index: i,
-            id: contestId,
-            path: ['judge'],
-            message: error instanceof Error ? error.message : 'Invalid judge file path',
-            code: 'path_error',
+            path: parsed.error.issues[0]?.path.map(String) ?? [],
+            message: parsed.error.issues.map(iss => `${iss.path.join('.') || '(root)'}: ${iss.message}`).join('; '),
+            code: 'validation',
           });
           continue;
         }
-        if (!reserveTarget(judgeAbsPath, judgeRelPath, i, contestId, ['judge'])) continue;
-        itemOutputs.push({ absPath: judgeAbsPath, relPath: judgeRelPath });
-        resolvedJudge = {
-          kind: 'local',
-          answers: { path: `${stem}.judge.json`, redistribution: 'restricted' },
-        };
+        normalized = parsed.data;
       }
-    } else if (normalized.judge) {
-      errors.push({
-        index: i,
-        id: contestId,
-        path: ['judge'],
-        message: `Judge kind "${rawJudge.kind}" does not accept a local answer file`,
-        code: 'validation',
-      });
-      continue;
-    }
 
-    // Prepare materials / PDF (staged synthesis or confined existing PDF).
-    let synthPdfBytes: Buffer | undefined;
-    let synthPdfAbsPath: string | undefined;
-    let synthPdfRelPath: string | undefined;
-    let synthPdfExists = false;
-    let pdfInfo: Pick<PdfInfo, 'page_count' | 'size_bytes' | 'sha256' | 'problem_ids' | 'extractor'> | undefined;
-    let entrypointHash: string | undefined;
-    let entrypointBytesLen: number | undefined;
-    let materials: Record<string, unknown>;
+      const { kind: docKind, ...docFields } = normalized.document;
+      if (docKind !== undefined && docKind !== 'contestreplay.dev/contest') {
+        errors.push({
+          index: i,
+          path: ['document', 'kind'],
+          message: 'Unsupported Contest manifest kind',
+          code: 'validation',
+        });
+        continue;
+      }
 
-    const rawMats =
-      docFields.materials && typeof docFields.materials === 'object' && !Array.isArray(docFields.materials)
-        ? (docFields.materials as Record<string, unknown>)
-        : undefined;
-    const rawEntrypoint =
-      rawMats?.entrypoint && typeof rawMats.entrypoint === 'object' && !Array.isArray(rawMats.entrypoint)
-        ? (rawMats.entrypoint as Record<string, unknown>)
-        : undefined;
+      const contestIdCheck = idSchema.safeParse(docFields.contest_id);
+      if (!contestIdCheck.success) {
+        errors.push({
+          index: i,
+          path: ['document', 'contest_id'],
+          message: 'Invalid contest_id',
+          code: 'validation',
+        });
+        continue;
+      }
+      const contestId = contestIdCheck.data;
 
-    if (normalized.synth_problems) {
-      const stem = basename(confined.absPath, '.json');
-      const pdfFileRel = relative(baseReal, join(dirname(confined.absPath), `${stem}.pdf`));
+      const targetFile = normalized.file ?? `contests/${contestId}.json`;
+      if (extname(targetFile).toLowerCase() !== '.json') {
+        errors.push({
+          index: i,
+          id: contestId,
+          path: ['file'],
+          message: 'Contest manifest path must end in .json',
+          code: 'validation',
+        });
+        continue;
+      }
+
+      let confined: { absPath: string; relPath: string };
       try {
-        const pConfined = await resolveConfinedPath(baseReal, pdfFileRel, ['materials']);
-        assertNotInProtectedDirs(pConfined.absPath, pConfined.relPath, protectedDirs, ['materials'], 'PDF output');
-        assertAllowedWritePrefix(pConfined.relPath, opts.allowedPrefixes, ['materials']);
-        synthPdfAbsPath = pConfined.absPath;
-        synthPdfRelPath = pConfined.relPath;
-        synthPdfExists = await fileExistsNoFollow(synthPdfAbsPath);
+        confined = await resolveConfinedPath(baseResolved, targetFile);
+        if (isForbiddenPublicFilename(confined.absPath)) {
+          throw new FieldError(['file'], `Forbidden filename for contest manifest: ${confined.relPath}`);
+        }
+        assertNotInProtectedDirs(confined.absPath, confined.relPath, protectedDirs, ['file'], 'Contest output');
+        assertAllowedWritePrefix(confined.relPath, opts.allowedPrefixes, ['file']);
       } catch (error) {
         errors.push({
           index: i,
           id: contestId,
-          path: ['materials'],
-          message: error instanceof Error ? error.message : 'Invalid synthesized PDF path',
+          path: ['file'],
+          message: error instanceof Error ? error.message : 'Invalid contest path',
           code: 'path_error',
         });
         continue;
       }
-      if (!reserveTarget(synthPdfAbsPath, synthPdfRelPath, i, contestId, ['materials'])) continue;
-      itemOutputs.push({ absPath: synthPdfAbsPath, relPath: synthPdfRelPath });
 
+      const itemOutputs: Array<{ absPath: string; relPath: string }> = [{ absPath: confined.absPath, relPath: confined.relPath }];
+      if (!reserveTarget(confined.absPath, confined.relPath, i, contestId, ['file'])) continue;
+
+      let manifestExists: boolean;
       try {
-        const staged = await synthesizePdfToBuffer(normalized.synth_problems, {
-          title: normalized.synth_title ?? (typeof docFields.title === 'string' ? docFields.title : undefined),
-          subtitle: normalized.synth_subtitle,
-          allowAsciiFallback: normalized.allow_ascii_fallback === true,
-        });
-        synthPdfBytes = staged.bytes;
-        pdfInfo = staged.pdfInfo;
-        entrypointHash = staged.pdfInfo.sha256;
-        entrypointBytesLen = staged.bytes.length;
+        manifestExists = await fileExistsNoFollow(confined.absPath);
       } catch (error) {
         errors.push({
           index: i,
           id: contestId,
-          path: ['synth_problems'],
-          message: error instanceof Error ? error.message : 'Failed to synthesize PDF',
-          code: 'validation',
+          path: ['file'],
+          message: error instanceof Error ? error.message : 'Unsafe target path',
+          code: 'path_error',
         });
         continue;
       }
 
-      materials = {
-        entrypoint: {
-          kind: 'pdf',
-          path: `${stem}.pdf`,
-          sha256: entrypointHash,
-          redistribution: 'allowed',
-        },
-        attachments: Array.isArray(rawMats?.attachments) ? rawMats.attachments : [],
-      };
-    } else {
-      if (!rawEntrypoint || typeof rawEntrypoint.path !== 'string') {
-        errors.push({
-          index: i,
-          id: contestId,
-          path: ['document', 'materials', 'entrypoint'],
-          message: 'Provide either materials.entrypoint.path or synth_problems',
-          code: 'validation',
-        });
-        continue;
-      }
-      const candidatePdfPath = isAbsolute(rawEntrypoint.path)
-        ? rawEntrypoint.path
-        : resolve(dirname(confined.absPath), rawEntrypoint.path);
-      try {
-        const pdfConfined = await resolveConfinedPath(baseResolved, candidatePdfPath, [
-          'document',
-          'materials',
-          'entrypoint',
-          'path',
-        ]);
-        assertNotForbiddenMaterialPath(
-          pdfConfined.absPath,
-          pdfConfined.relPath,
-          protectedDirs,
-          judgeAbsPath,
-          ['document', 'materials', 'entrypoint', 'path'],
-        );
-        // Verify regular file via O_NOFOLLOW before inspecting.
-        const pdfFile = await readConfinedRegularFile(
-          baseReal,
-          pdfConfined.absPath,
-          ['document', 'materials', 'entrypoint', 'path'],
-          128 * 1024 * 1024,
-        );
-        if (pdfFile.bytes.length < 5 || !pdfFile.bytes.subarray(0, 5).equals(PDF_MAGIC)) {
-          throw new FieldError(['document', 'materials', 'entrypoint', 'path'], `Missing PDF header: ${pdfConfined.relPath}`);
-        }
-        const computedHash = sha256(pdfFile.bytes);
-        if (typeof rawEntrypoint.sha256 === 'string' && rawEntrypoint.sha256 !== computedHash) {
-          throw new FieldError(['document', 'materials', 'entrypoint', 'sha256'], `Entrypoint PDF SHA-256 mismatch: ${pdfConfined.relPath}`);
-        }
-        referencedInputs.add(pdfConfined.absPath);
-        entrypointHash = computedHash;
-        entrypointBytesLen = pdfFile.bytes.length;
-
-        const info = await inspectPdf(pdfConfined.absPath, {
-          useExternalTools: opts.useExternalPdfTools ?? false,
-        });
-        pdfInfo = {
-          page_count: info.page_count,
-          size_bytes: info.size_bytes,
-          sha256: info.sha256,
-          problem_ids: info.problem_ids,
-          extractor: info.extractor,
-        };
-      } catch (error) {
-        errors.push({
-          index: i,
-          id: contestId,
-          path: error instanceof FieldError ? error.path : ['document', 'materials', 'entrypoint', 'path'],
-          message: error instanceof Error ? error.message : 'Could not inspect referenced PDF',
-          code: error instanceof FieldError && error.path.includes('path') ? 'path_error' : 'validation',
-        });
-        continue;
-      }
-      materials = {
-        entrypoint: { ...rawEntrypoint, kind: 'pdf' },
-        attachments: Array.isArray(rawMats?.attachments) ? rawMats.attachments : [],
-      };
-    }
-
-    // Optional auto problem_map inference for remote OJ judges.
-    let inferredProblemMap: ProblemMapInference | undefined;
-    const detectedProblemIds = normalized.synth_problems
-      ? normalized.synth_problems.map(p => p.id)
-      : pdfInfo?.problem_ids ?? [];
-    if (rawJudge.kind !== 'local' && !rawJudge.problem_map && normalized.auto_problem_map !== false) {
-      const validProblems = Array.isArray(problems)
-        ? problems.filter(
-            (p): p is { id: string; max_points: number } =>
-              Boolean(
-                p &&
-                  typeof p === 'object' &&
-                  typeof (p as { id?: unknown }).id === 'string' &&
-                  typeof (p as { max_points?: unknown }).max_points === 'number',
-              ),
-          )
-        : [];
-
-      if (detectedProblemIds.length > 0 && validProblems.length > 0) {
-        const remoteIds = validProblems.map(p => ({ remote_id: p.id }));
-        inferredProblemMap = inferProblemMap(detectedProblemIds, remoteIds);
-        const completeBijection =
-          inferredProblemMap.unmapped_local.length === 0 &&
-          inferredProblemMap.unmapped_remote.length === 0 &&
-          Object.keys(inferredProblemMap.confirmed_map).length === detectedProblemIds.length;
-
-        if (completeBijection) {
-          const remoteById = new Map(validProblems.map(p => [p.id, p]));
-          // Rewrite problems to carry local PDF IDs with matched remote max_points!
-          problems = detectedProblemIds.map(localId => {
-            const remoteId = inferredProblemMap!.confirmed_map[localId]!;
-            const remoteProb = remoteById.get(remoteId)!;
-            return { id: localId, max_points: remoteProb.max_points };
-          });
-          const hasDifference = Object.entries(inferredProblemMap.confirmed_map).some(([k, v]) => k !== v);
-          if (hasDifference) {
-            resolvedJudge = { ...resolvedJudge, problem_map: inferredProblemMap.confirmed_map };
-          }
-        } else {
-          errors.push({
-            index: i,
-            id: contestId,
-            path: ['document', 'judge', 'problem_map'],
-            message: `Incomplete auto problem_map inference (unmapped local: [${inferredProblemMap.unmapped_local.join(', ')}], unmapped remote: [${inferredProblemMap.unmapped_remote.join(', ')}]); provide an explicit judge.problem_map or set auto_problem_map: false`,
-            code: 'validation',
-          });
-          continue;
-        }
-      } else if (normalized.auto_problem_map === true) {
-        errors.push({
-          index: i,
-          id: contestId,
-          path: ['document', 'judge', 'problem_map'],
-          message: 'auto_problem_map enabled but problem IDs could not be detected from PDF or contest problems',
-          code: 'validation',
-        });
-        continue;
-      }
-    }
-
-    const manifestDraft: Record<string, unknown> = {
-      schema_version: 2,
-      ...docFields,
-      materials,
-      ...(problems !== undefined ? { problems } : {}),
-      judge: resolvedJudge,
-    };
-
-    const schemaCheck = contestSchema.safeParse(manifestDraft);
-    if (!schemaCheck.success) {
-      errors.push({
-        index: i,
-        id: contestId,
-        path: ['document', ...(schemaCheck.error.issues[0]?.path.map(String) ?? [])],
-        message: schemaCheck.error.issues.map(iss => `${iss.path.join('.') || '(root)'}: ${iss.message}`).join('; '),
-        code: 'validation',
-      });
-      continue;
-    }
-
-    const parsedContest = schemaCheck.data;
-
-    // Validate PDF byte limit against resolved protocol preset (matching resolveContest).
-    const preset = protocolPresets[resolveProtocolPreset(parsedContest.rules)];
-    const maxPdfBytes = Math.max(40_000_000, preset.pdfMaxBytes);
-    if (entrypointBytesLen !== undefined && entrypointBytesLen > maxPdfBytes) {
-      errors.push({
-        index: i,
-        id: contestId,
-        path: ['document', 'materials', 'entrypoint'],
-        message: `Entrypoint PDF (${entrypointBytesLen} bytes) exceeds limit of ${maxPdfBytes} bytes`,
-        code: 'validation',
-      });
-      continue;
-    }
-
-    // Validate local or remote judge invariants BEFORE touching disk (parity with resolveContest).
-    let finalJudgeHash: string | undefined;
-    let finalProblems = parsedContest.problems;
-
-    if (parsedContest.judge.kind === 'local') {
-      if (answers && judgeJsonBytes) {
-        finalJudgeHash = sha256(judgeJsonBytes);
-        if (
-          finalProblems &&
-          (finalProblems.length !== answers.problems.length ||
-            finalProblems.some(p => !answers!.problems.some(q => q.id === p.id && q.max_points === p.max_points)))
-        ) {
-          errors.push({
-            index: i,
-            id: contestId,
-            path: ['document', 'problems'],
-            message: 'Contest problems do not match local answers file',
-            code: 'validation',
-          });
-          continue;
-        }
-        finalProblems ??= answers.problems.map(({ id, max_points }) => ({ id, max_points }));
-      } else {
-        // External existing judge answers file: confine, O_NOFOLLOW, verify sha256, sanitize parse errors!
-        const ansCandidate = resolve(dirname(confined.absPath), parsedContest.judge.answers.path);
-        let ansConfined: { absPath: string; relPath: string };
-        try {
-          ansConfined = await resolveConfinedPath(baseResolved, ansCandidate, ['document', 'judge', 'answers', 'path']);
-        } catch (error) {
-          errors.push({
-            index: i,
-            id: contestId,
-            path: ['document', 'judge', 'answers', 'path'],
-            message: error instanceof Error ? error.message : 'Invalid local answers file path',
-            code: 'path_error',
-          });
-          continue;
-        }
-        existingAnswersAbsPath = ansConfined.absPath;
-        referencedInputs.add(ansConfined.absPath);
-
-        let ansBytes: Buffer;
-        try {
-          const loaded = await readConfinedRegularFile(
-            baseReal,
-            ansConfined.absPath,
-            ['document', 'judge', 'answers', 'path'],
-            MAX_JUDGE_FILE_BYTES,
-          );
-          ansBytes = loaded.bytes;
-        } catch {
-          // Sanitized fixed public diagnostic message (never leaks raw fs/parse excerpts).
-          errors.push({
-            index: i,
-            id: contestId,
-            path: ['document', 'judge', 'answers', 'path'],
-            message: 'Local answers file could not be read or exceeds size limit',
-            code: 'validation',
-          });
-          continue;
-        }
-
-        const ansHash = sha256(ansBytes);
-        if (parsedContest.judge.answers.sha256 && parsedContest.judge.answers.sha256 !== ansHash) {
-          errors.push({
-            index: i,
-            id: contestId,
-            path: ['document', 'judge', 'answers', 'sha256'],
-            message: 'Local answers file SHA-256 mismatch',
-            code: 'validation',
-          });
-          continue;
-        }
-        finalJudgeHash = ansHash;
-
-        let parsedAnsJson: unknown;
-        try {
-          parsedAnsJson = JSON.parse(ansBytes.toString('utf8'));
-        } catch {
-          errors.push({
-            index: i,
-            id: contestId,
-            path: ['document', 'judge', 'answers', 'path'],
-            message: 'Local answers file is not valid JSON',
-            code: 'validation',
-          });
-          continue;
-        }
-
-        const ansSchemaCheck = judgeSchema.safeParse(parsedAnsJson);
-        if (!ansSchemaCheck.success) {
-          errors.push({
-            index: i,
-            id: contestId,
-            path: ['document', 'judge', 'answers', 'path'],
-            message: 'Local answers file failed judge schema validation',
-            code: 'validation',
-          });
-          continue;
-        }
-
-        const externalJudge = ansSchemaCheck.data;
-        if (
-          finalProblems &&
-          (finalProblems.length !== externalJudge.problems.length ||
-            finalProblems.some(p => !externalJudge.problems.some(q => q.id === p.id && q.max_points === p.max_points)))
-        ) {
-          errors.push({
-            index: i,
-            id: contestId,
-            path: ['document', 'problems'],
-            message: 'Contest problems do not match local answers file',
-            code: 'validation',
-          });
-          continue;
-        }
-        finalProblems ??= externalJudge.problems.map(({ id, max_points }) => ({ id, max_points }));
-      }
-    } else {
-      // Codeforces invariants (identical to resolveContest).
-      if (!finalProblems || finalProblems.length === 0 || Object.keys(parsedContest.judge.languages).length === 0) {
+      // Prepare judge / answers.
+      const rawJudge =
+        docFields.judge && typeof docFields.judge === 'object' && !Array.isArray(docFields.judge)
+          ? { ...(docFields.judge as Record<string, unknown>) }
+          : undefined;
+      if (!rawJudge || typeof rawJudge.kind !== 'string') {
         errors.push({
           index: i,
           id: contestId,
           path: ['document', 'judge'],
-          message: 'Codeforces requires explicit non-empty problems and language IDs',
+          message: 'Missing judge configuration',
           code: 'validation',
         });
         continue;
       }
-      const mapping = parsedContest.judge.problem_map ?? {};
-      if (Object.keys(mapping).some(key => !finalProblems!.some(p => p.id === key))) {
-        errors.push({
-          index: i,
-          id: contestId,
-          path: ['document', 'judge', 'problem_map'],
-          message: 'Unknown problem in Codeforces mapping',
-          code: 'validation',
-        });
-        continue;
-      }
-      const targets = finalProblems.map(p => (Object.hasOwn(mapping, p.id) ? mapping[p.id]! : p.id));
-      if (new Set(targets).size !== targets.length || targets.some(t => !/^[A-Za-z0-9]{1,12}$/.test(t))) {
-        errors.push({
-          index: i,
-          id: contestId,
-          path: ['document', 'judge', 'problem_map'],
-          message: 'Invalid or duplicate Codeforces target',
-          code: 'validation',
-        });
-        continue;
-      }
-    }
 
-    // Re-check entrypoint against external existingAnswersAbsPath now that it is known.
-    if (!normalized.synth_problems && rawEntrypoint && typeof rawEntrypoint.path === 'string' && existingAnswersAbsPath) {
-      const candidatePdfPath = isAbsolute(rawEntrypoint.path)
-        ? rawEntrypoint.path
-        : resolve(dirname(confined.absPath), rawEntrypoint.path);
-      const pdfConfined = await resolveConfinedPath(baseResolved, candidatePdfPath);
-      if (pdfConfined.absPath === existingAnswersAbsPath) {
-        errors.push({
-          index: i,
-          id: contestId,
-          path: ['document', 'materials', 'entrypoint', 'path'],
-          message: `Contest judge answers file cannot be exposed as contest material: ${pdfConfined.relPath}`,
-          code: 'path_error',
-        });
-        continue;
-      }
-    }
+      let answers: z.infer<typeof judgeSchema> | undefined;
+      let judgeJsonBytes: Buffer | undefined;
+      let judgeAbsPath: string | undefined;
+      let judgeRelPath: string | undefined;
+      let judgeExists = false;
+      let existingAnswersAbsPath: string | undefined;
+      let externalJudgeBytes: Buffer | undefined;
+      let normalizedJudgeAnswersPath: string | undefined;
+      let problems = docFields.problems;
+      let resolvedJudge: Record<string, unknown> = rawJudge;
 
-    // Confine and validate EVERY materials.attachments[] entry (O_NOFOLLOW, size limits, duplicates, sha256, forbidden files).
-    let attachmentsFailed = false;
-    const attachmentNames = new Set<string>();
-    let totalAttachmentBytes = 0;
-    const attachmentHashes: Array<[string, string]> = [];
-    const effectiveJudgeAbsPath = judgeAbsPath ?? existingAnswersAbsPath;
-
-    for (let aIdx = 0; aIdx < parsedContest.materials.attachments.length; aIdx++) {
-      const att = parsedContest.materials.attachments[aIdx]!;
-      const fieldPath = ['document', 'materials', 'attachments', String(aIdx)];
-      if (attachmentNames.has(att.name)) {
-        errors.push({
-          index: i,
-          id: contestId,
-          path: [...fieldPath, 'name'],
-          message: `Duplicate attachment name: ${att.name}`,
-          code: 'validation',
-        });
-        attachmentsFailed = true;
-        break;
-      }
-      attachmentNames.add(att.name);
-
-      const attCandidate = isAbsolute(att.path) ? att.path : resolve(dirname(confined.absPath), att.path);
-      try {
-        const attConfined = await resolveConfinedPath(baseResolved, attCandidate, [...fieldPath, 'path']);
-        assertNotForbiddenMaterialPath(
-          attConfined.absPath,
-          attConfined.relPath,
-          protectedDirs,
-          effectiveJudgeAbsPath,
-          [...fieldPath, 'path'],
-        );
-        const attFile = await readConfinedRegularFile(baseReal, attConfined.absPath, [...fieldPath, 'path'], MAX_ATTACHMENT_BYTES);
-        totalAttachmentBytes += attFile.bytes.length;
-        if (totalAttachmentBytes > MAX_TOTAL_ATTACHMENTS_BYTES) {
-          throw new FieldError(['document', 'materials', 'attachments'], 'Attachments exceed 32 MB');
+      if (rawJudge.kind === 'local') {
+        const hasInlineJudgeProblems = Array.isArray(rawJudge.problems);
+        const hasInlineDocProblems =
+          Array.isArray(problems) &&
+          problems.some(p => p && typeof p === 'object' && Object.hasOwn(p, 'accepted_answers'));
+        if (normalized.judge && hasInlineJudgeProblems) {
+          errors.push({
+            index: i,
+            id: contestId,
+            path: ['judge'],
+            message: 'Supply only one local answer table (either item.judge or document.judge.problems)',
+            code: 'validation',
+          });
+          continue;
         }
-        const attHash = sha256(attFile.bytes);
-        if (att.sha256 && att.sha256 !== attHash) {
-          throw new FieldError([...fieldPath, 'sha256'], `Attachment SHA-256 mismatch: ${attConfined.relPath}`);
+        if (normalized.judge || hasInlineJudgeProblems || hasInlineDocProblems) {
+          const answersCheck = judgeSchema.safeParse(
+            normalized.judge ?? { schema_version: 1, problems: hasInlineJudgeProblems ? rawJudge.problems : problems },
+          );
+          if (!answersCheck.success) {
+            errors.push({
+              index: i,
+              id: contestId,
+              path: ['judge'],
+              message: answersCheck.error.issues.map(iss => `${iss.path.join('.') || '(root)'}: ${iss.message}`).join('; '),
+              code: 'validation',
+            });
+            continue;
+          }
+          answers = answersCheck.data;
+          const judgeJson = JSON.stringify(answers, null, 2) + '\n';
+          judgeJsonBytes = Buffer.from(judgeJson, 'utf8');
+          if (judgeJsonBytes.length > MAX_JUDGE_FILE_BYTES) {
+            errors.push({
+              index: i,
+              id: contestId,
+              path: ['judge'],
+              message: `Serialized local judge table (${judgeJsonBytes.length} bytes) exceeds limit of ${MAX_JUDGE_FILE_BYTES} bytes`,
+              code: 'validation',
+            });
+            continue;
+          }
+          if (!normalized.judge && !hasInlineJudgeProblems) problems = undefined;
+          problems ??= answers.problems.map(({ id, max_points }) => ({ id, max_points }));
+
+          const stem = basename(confined.absPath, '.json');
+          const judgeFileRel = relative(baseReal, join(dirname(confined.absPath), `${stem}.judge.json`));
+          try {
+            const jConfined = await resolveConfinedPath(baseReal, judgeFileRel, ['judge']);
+            assertNotInProtectedDirs(jConfined.absPath, jConfined.relPath, protectedDirs, ['judge'], 'Judge output');
+            assertAllowedWritePrefix(jConfined.relPath, opts.allowedPrefixes, ['judge']);
+            judgeAbsPath = jConfined.absPath;
+            judgeRelPath = jConfined.relPath;
+            judgeExists = await fileExistsNoFollow(judgeAbsPath);
+          } catch (error) {
+            errors.push({
+              index: i,
+              id: contestId,
+              path: ['judge'],
+              message: error instanceof Error ? error.message : 'Invalid judge file path',
+              code: 'path_error',
+            });
+            continue;
+          }
+          if (!reserveTarget(judgeAbsPath, judgeRelPath, i, contestId, ['judge'])) continue;
+          itemOutputs.push({ absPath: judgeAbsPath, relPath: judgeRelPath });
+          normalizedJudgeAnswersPath = `${stem}.judge.json`;
+          resolvedJudge = {
+            kind: 'local',
+            answers: { path: normalizedJudgeAnswersPath, redistribution: 'restricted' },
+          };
         }
-        referencedInputs.add(attConfined.absPath);
-        attachmentHashes.push([att.name, attHash]);
-      } catch (error) {
+      } else if (normalized.judge) {
         errors.push({
           index: i,
           id: contestId,
-          path: error instanceof FieldError ? error.path : [...fieldPath, 'path'],
-          message: error instanceof Error ? error.message : 'Invalid attachment file',
-          code: error instanceof FieldError && error.path.includes('path') ? 'path_error' : 'validation',
-        });
-        attachmentsFailed = true;
-        break;
-      }
-    }
-    if (attachmentsFailed) continue;
-
-    // Handle pre-existing manifest and auxiliary (.pdf / .judge.json) files for error, skip, and overwrite!
-    const anyExists = manifestExists || judgeExists || synthPdfExists;
-    let action: 'create' | 'skip' | 'overwrite' = 'create';
-    let manifestBackup: Buffer | undefined;
-    let manifestBackupMode: number | undefined;
-    let judgeBackup: Buffer | undefined;
-    let judgeBackupMode: number | undefined;
-    let synthPdfBackup: Buffer | undefined;
-    let synthPdfBackupMode: number | undefined;
-
-    if (anyExists) {
-      if (ifExists === 'error') {
-        const existingRel = manifestExists
-          ? confined.relPath
-          : judgeExists
-            ? judgeRelPath!
-            : synthPdfRelPath!;
-        const conflictPath = manifestExists ? ['file'] : judgeExists ? ['judge'] : ['materials'];
-        errors.push({
-          index: i,
-          id: contestId,
-          path: conflictPath,
-          message: `Contest output file already exists: ${existingRel}`,
-          code: 'conflict',
+          path: ['judge'],
+          message: `Judge kind "${rawJudge.kind}" does not accept a local answer file`,
+          code: 'validation',
         });
         continue;
       }
-      if (ifExists === 'skip') {
-        action = 'skip';
-      } else {
-        // ifExists === 'overwrite': verify identity of EVERY pre-existing target file before overwriting!
+
+      // Prepare materials / PDF (staged synthesis or confined existing PDF read ONCE via O_NOFOLLOW).
+      let synthPdfBytes: Buffer | undefined;
+      let synthPdfAbsPath: string | undefined;
+      let synthPdfRelPath: string | undefined;
+      let synthPdfExists = false;
+      let entrypointBytes: Buffer;
+      let normalizedEntrypointPath: string;
+      let entrypointConfinedAbsPath: string | undefined;
+      let pdfInfo: Pick<PdfInfo, 'page_count' | 'size_bytes' | 'sha256' | 'problem_ids' | 'extractor'> | undefined;
+      let entrypointHash: string | undefined;
+      let entrypointBytesLen: number | undefined;
+      let materials: Record<string, unknown>;
+
+      const rawMats =
+        docFields.materials && typeof docFields.materials === 'object' && !Array.isArray(docFields.materials)
+          ? (docFields.materials as Record<string, unknown>)
+          : undefined;
+      const rawEntrypoint =
+        rawMats?.entrypoint && typeof rawMats.entrypoint === 'object' && !Array.isArray(rawMats.entrypoint)
+          ? (rawMats.entrypoint as Record<string, unknown>)
+          : undefined;
+
+      if (normalized.synth_problems) {
+        const stem = basename(confined.absPath, '.json');
+        const pdfFileRel = relative(baseReal, join(dirname(confined.absPath), `${stem}.pdf`));
         try {
-          if (manifestExists) {
-            const prev = await readExistingForOverwriteCheck(baseReal, confined.absPath, confined.relPath, 'contest', ['file']);
-            manifestBackup = prev.backup;
-            manifestBackupMode = prev.mode;
+          const pConfined = await resolveConfinedPath(baseReal, pdfFileRel, ['materials']);
+          if (isForbiddenPublicFilename(pConfined.absPath)) {
+            throw new FieldError(['materials'], `Forbidden filename for PDF output: ${pConfined.relPath}`);
           }
-          if (judgeExists && judgeAbsPath && judgeRelPath) {
-            const prev = await readExistingForOverwriteCheck(baseReal, judgeAbsPath, judgeRelPath, 'judge', ['judge']);
-            judgeBackup = prev.backup;
-            judgeBackupMode = prev.mode;
-          }
-          if (synthPdfExists && synthPdfAbsPath && synthPdfRelPath) {
-            const prev = await readExistingForOverwriteCheck(baseReal, synthPdfAbsPath, synthPdfRelPath, 'pdf', ['materials']);
-            synthPdfBackup = prev.backup;
-            synthPdfBackupMode = prev.mode;
-          }
-          action = manifestExists ? 'overwrite' : 'create';
+          assertNotInProtectedDirs(pConfined.absPath, pConfined.relPath, protectedDirs, ['materials'], 'PDF output');
+          assertAllowedWritePrefix(pConfined.relPath, opts.allowedPrefixes, ['materials']);
+          synthPdfAbsPath = pConfined.absPath;
+          synthPdfRelPath = pConfined.relPath;
+          synthPdfExists = await fileExistsNoFollow(synthPdfAbsPath);
         } catch (error) {
           errors.push({
             index: i,
             id: contestId,
-            path: error instanceof FieldError ? error.path : ['file'],
-            message: error instanceof Error ? error.message : 'Refusing to overwrite unrelated existing file',
-            code: 'conflict',
+            path: ['materials'],
+            message: error instanceof Error ? error.message : 'Invalid synthesized PDF path',
+            code: 'path_error',
+          });
+          continue;
+        }
+        if (!reserveTarget(synthPdfAbsPath, synthPdfRelPath, i, contestId, ['materials'])) continue;
+        itemOutputs.push({ absPath: synthPdfAbsPath, relPath: synthPdfRelPath });
+
+        try {
+          const staged = await synthesizePdfToBuffer(normalized.synth_problems, {
+            title: normalized.synth_title ?? (typeof docFields.title === 'string' ? docFields.title : undefined),
+            subtitle: normalized.synth_subtitle,
+            allowAsciiFallback: normalized.allow_ascii_fallback === true,
+          });
+          synthPdfBytes = staged.bytes;
+          entrypointBytes = staged.bytes;
+          pdfInfo = staged.pdfInfo;
+          entrypointHash = staged.pdfInfo.sha256;
+          entrypointBytesLen = staged.bytes.length;
+        } catch (error) {
+          errors.push({
+            index: i,
+            id: contestId,
+            path: ['synth_problems'],
+            message: error instanceof Error ? error.message : 'Failed to synthesize PDF',
+            code: 'validation',
+          });
+          continue;
+        }
+
+        normalizedEntrypointPath = `${stem}.pdf`;
+        materials = {
+          entrypoint: {
+            kind: 'pdf',
+            path: normalizedEntrypointPath,
+            sha256: entrypointHash,
+            redistribution: 'allowed',
+          },
+          attachments: Array.isArray(rawMats?.attachments) ? rawMats.attachments : [],
+        };
+      } else {
+        if (!rawEntrypoint || typeof rawEntrypoint.path !== 'string') {
+          errors.push({
+            index: i,
+            id: contestId,
+            path: ['document', 'materials', 'entrypoint'],
+            message: 'Provide either materials.entrypoint.path or synth_problems',
+            code: 'validation',
+          });
+          continue;
+        }
+        const candidatePdfPath = isAbsolute(rawEntrypoint.path)
+          ? rawEntrypoint.path
+          : resolve(dirname(confined.absPath), rawEntrypoint.path);
+        try {
+          const pdfConfined = await resolveConfinedPath(baseResolved, candidatePdfPath, [
+            'document',
+            'materials',
+            'entrypoint',
+            'path',
+          ]);
+          assertNotForbiddenMaterialPath(
+            pdfConfined.absPath,
+            pdfConfined.relPath,
+            protectedDirs,
+            judgeAbsPath,
+            ['document', 'materials', 'entrypoint', 'path'],
+          );
+          // Read ONCE via O_NOFOLLOW, then inspect verified bytes in a private 0o700 temp snapshot.
+          const pdfFile = await readConfinedRegularFile(
+            baseReal,
+            pdfConfined.absPath,
+            ['document', 'materials', 'entrypoint', 'path'],
+            128 * 1024 * 1024,
+          );
+          if (pdfFile.bytes.length < 5 || !pdfFile.bytes.subarray(0, 5).equals(PDF_MAGIC)) {
+            throw new FieldError(['document', 'materials', 'entrypoint', 'path'], `Missing PDF header: ${pdfConfined.relPath}`);
+          }
+          const computedHash = sha256(pdfFile.bytes);
+          if (typeof rawEntrypoint.sha256 === 'string' && rawEntrypoint.sha256 !== computedHash) {
+            throw new FieldError(['document', 'materials', 'entrypoint', 'sha256'], `Entrypoint PDF SHA-256 mismatch: ${pdfConfined.relPath}`);
+          }
+          referencedInputs.add(pdfConfined.absPath);
+          entrypointConfinedAbsPath = pdfConfined.absPath;
+          entrypointBytes = pdfFile.bytes;
+          entrypointHash = computedHash;
+          entrypointBytesLen = pdfFile.bytes.length;
+          normalizedEntrypointPath = isAbsolute(rawEntrypoint.path)
+            ? toManifestRelativePath(confined.absPath, pdfConfined.absPath)
+            : rawEntrypoint.path;
+
+          const info = await inspectPdfBytes(pdfFile.bytes, pdfConfined.relPath, {
+            useExternalTools: opts.useExternalPdfTools ?? false,
+          });
+          pdfInfo = {
+            page_count: info.page_count,
+            size_bytes: info.size_bytes,
+            sha256: info.sha256,
+            problem_ids: info.problem_ids,
+            extractor: info.extractor,
+          };
+        } catch (error) {
+          errors.push({
+            index: i,
+            id: contestId,
+            path: error instanceof FieldError ? error.path : ['document', 'materials', 'entrypoint', 'path'],
+            message: error instanceof Error ? error.message : 'Could not inspect referenced PDF',
+            code: error instanceof FieldError && error.path.includes('path') ? 'path_error' : 'validation',
+          });
+          continue;
+        }
+        materials = {
+          entrypoint: { ...rawEntrypoint, kind: 'pdf', path: normalizedEntrypointPath },
+          attachments: Array.isArray(rawMats?.attachments) ? rawMats.attachments : [],
+        };
+      }
+
+      // Optional auto problem_map inference for remote OJ judges.
+      let inferredProblemMap: ProblemMapInference | undefined;
+      const detectedProblemIds = normalized.synth_problems
+        ? normalized.synth_problems.map(p => p.id)
+        : pdfInfo?.problem_ids ?? [];
+      if (rawJudge.kind !== 'local' && !rawJudge.problem_map && normalized.auto_problem_map !== false) {
+        const validProblems = Array.isArray(problems)
+          ? problems.filter(
+              (p): p is { id: string; max_points: number } =>
+                Boolean(
+                  p &&
+                    typeof p === 'object' &&
+                    typeof (p as { id?: unknown }).id === 'string' &&
+                    typeof (p as { max_points?: unknown }).max_points === 'number',
+                ),
+            )
+          : [];
+
+        if (detectedProblemIds.length > 0 && validProblems.length > 0) {
+          const remoteIds = validProblems.map(p => ({ remote_id: p.id }));
+          inferredProblemMap = inferProblemMap(detectedProblemIds, remoteIds);
+          const completeBijection =
+            inferredProblemMap.unmapped_local.length === 0 &&
+            inferredProblemMap.unmapped_remote.length === 0 &&
+            Object.keys(inferredProblemMap.confirmed_map).length === detectedProblemIds.length;
+
+          if (completeBijection) {
+            const remoteById = new Map(validProblems.map(p => [p.id, p]));
+            // Rewrite problems to carry local PDF IDs with matched remote max_points!
+            problems = detectedProblemIds.map(localId => {
+              const remoteId = inferredProblemMap!.confirmed_map[localId]!;
+              const remoteProb = remoteById.get(remoteId)!;
+              return { id: localId, max_points: remoteProb.max_points };
+            });
+            const hasDifference = Object.entries(inferredProblemMap.confirmed_map).some(([k, v]) => k !== v);
+            if (hasDifference) {
+              resolvedJudge = { ...resolvedJudge, problem_map: inferredProblemMap.confirmed_map };
+            }
+          } else {
+            errors.push({
+              index: i,
+              id: contestId,
+              path: ['document', 'judge', 'problem_map'],
+              message: `Incomplete auto problem_map inference (unmapped local: [${inferredProblemMap.unmapped_local.join(', ')}], unmapped remote: [${inferredProblemMap.unmapped_remote.join(', ')}]); provide an explicit judge.problem_map or set auto_problem_map: false`,
+              code: 'validation',
+            });
+            continue;
+          }
+        } else if (normalized.auto_problem_map === true) {
+          errors.push({
+            index: i,
+            id: contestId,
+            path: ['document', 'judge', 'problem_map'],
+            message: 'auto_problem_map enabled but problem IDs could not be detected from PDF or contest problems',
+            code: 'validation',
           });
           continue;
         }
       }
+
+      const manifestDraft: Record<string, unknown> = {
+        schema_version: 2,
+        ...docFields,
+        materials,
+        ...(problems !== undefined ? { problems } : {}),
+        judge: resolvedJudge,
+      };
+
+      const schemaCheck = contestSchema.safeParse(manifestDraft);
+      if (!schemaCheck.success) {
+        errors.push({
+          index: i,
+          id: contestId,
+          path: ['document', ...(schemaCheck.error.issues[0]?.path.map(String) ?? [])],
+          message: schemaCheck.error.issues.map(iss => `${iss.path.join('.') || '(root)'}: ${iss.message}`).join('; '),
+          code: 'validation',
+        });
+        continue;
+      }
+
+      const parsedContest = schemaCheck.data;
+
+      // Validate PDF byte limit against resolved protocol preset (matching resolveContest).
+      const preset = protocolPresets[resolveProtocolPreset(parsedContest.rules)];
+      const maxPdfBytes = Math.max(40_000_000, preset.pdfMaxBytes);
+      if (entrypointBytesLen !== undefined && entrypointBytesLen > maxPdfBytes) {
+        errors.push({
+          index: i,
+          id: contestId,
+          path: ['document', 'materials', 'entrypoint'],
+          message: `Entrypoint PDF (${entrypointBytesLen} bytes) exceeds limit of ${maxPdfBytes} bytes`,
+          code: 'validation',
+        });
+        continue;
+      }
+
+      // Validate local or remote judge invariants BEFORE touching disk (parity with resolveContest).
+      let finalProblems = parsedContest.problems;
+
+      if (parsedContest.judge.kind === 'local') {
+        if (answers && judgeJsonBytes) {
+          if (
+            finalProblems &&
+            (finalProblems.length !== answers.problems.length ||
+              finalProblems.some(p => !answers!.problems.some(q => q.id === p.id && q.max_points === p.max_points)))
+          ) {
+            errors.push({
+              index: i,
+              id: contestId,
+              path: ['document', 'problems'],
+              message: 'Contest problems do not match local answers file',
+              code: 'validation',
+            });
+            continue;
+          }
+          finalProblems ??= answers.problems.map(({ id, max_points }) => ({ id, max_points }));
+        } else {
+          // External existing judge answers file: confine, protect dirs, O_NOFOLLOW, verify sha256, sanitize parse errors!
+          const ansCandidate = isAbsolute(parsedContest.judge.answers.path)
+            ? parsedContest.judge.answers.path
+            : resolve(dirname(confined.absPath), parsedContest.judge.answers.path);
+          let ansConfined: { absPath: string; relPath: string };
+          try {
+            ansConfined = await resolveConfinedPath(baseResolved, ansCandidate, ['document', 'judge', 'answers', 'path']);
+            assertNotInProtectedDirs(
+              ansConfined.absPath,
+              ansConfined.relPath,
+              protectedDirs,
+              ['document', 'judge', 'answers', 'path'],
+              'Local answers file',
+            );
+          } catch (error) {
+            errors.push({
+              index: i,
+              id: contestId,
+              path: ['document', 'judge', 'answers', 'path'],
+              message: error instanceof Error ? error.message : 'Invalid local answers file path',
+              code: 'path_error',
+            });
+            continue;
+          }
+          existingAnswersAbsPath = ansConfined.absPath;
+          referencedInputs.add(ansConfined.absPath);
+          normalizedJudgeAnswersPath = isAbsolute(parsedContest.judge.answers.path)
+            ? toManifestRelativePath(confined.absPath, ansConfined.absPath)
+            : parsedContest.judge.answers.path;
+          resolvedJudge = {
+            ...resolvedJudge,
+            answers: {
+              ...(resolvedJudge.answers as Record<string, unknown>),
+              path: normalizedJudgeAnswersPath,
+            },
+          };
+          manifestDraft.judge = resolvedJudge;
+
+          let ansBytes: Buffer;
+          try {
+            const loaded = await readConfinedRegularFile(
+              baseReal,
+              ansConfined.absPath,
+              ['document', 'judge', 'answers', 'path'],
+              MAX_JUDGE_FILE_BYTES,
+            );
+            ansBytes = loaded.bytes;
+          } catch {
+            // Sanitized fixed public diagnostic message (never leaks raw fs/parse excerpts).
+            errors.push({
+              index: i,
+              id: contestId,
+              path: ['document', 'judge', 'answers', 'path'],
+              message: 'Local answers file could not be read or exceeds size limit',
+              code: 'validation',
+            });
+            continue;
+          }
+
+          const ansHash = sha256(ansBytes);
+          if (parsedContest.judge.answers.sha256 && parsedContest.judge.answers.sha256 !== ansHash) {
+            errors.push({
+              index: i,
+              id: contestId,
+              path: ['document', 'judge', 'answers', 'sha256'],
+              message: 'Local answers file SHA-256 mismatch',
+              code: 'validation',
+            });
+            continue;
+          }
+          externalJudgeBytes = ansBytes;
+
+          let parsedAnsJson: unknown;
+          try {
+            parsedAnsJson = JSON.parse(ansBytes.toString('utf8'));
+          } catch {
+            errors.push({
+              index: i,
+              id: contestId,
+              path: ['document', 'judge', 'answers', 'path'],
+              message: 'Local answers file is not valid JSON',
+              code: 'validation',
+            });
+            continue;
+          }
+
+          const ansSchemaCheck = judgeSchema.safeParse(parsedAnsJson);
+          if (!ansSchemaCheck.success) {
+            errors.push({
+              index: i,
+              id: contestId,
+              path: ['document', 'judge', 'answers', 'path'],
+              message: 'Local answers file failed judge schema validation',
+              code: 'validation',
+            });
+            continue;
+          }
+
+          const externalJudge = ansSchemaCheck.data;
+          if (
+            finalProblems &&
+            (finalProblems.length !== externalJudge.problems.length ||
+              finalProblems.some(p => !externalJudge.problems.some(q => q.id === p.id && q.max_points === p.max_points)))
+          ) {
+            errors.push({
+              index: i,
+              id: contestId,
+              path: ['document', 'problems'],
+              message: 'Contest problems do not match local answers file',
+              code: 'validation',
+            });
+            continue;
+          }
+          finalProblems ??= externalJudge.problems.map(({ id, max_points }) => ({ id, max_points }));
+        }
+      } else {
+        // Codeforces invariants (identical to resolveContest).
+        if (!finalProblems || finalProblems.length === 0 || Object.keys(parsedContest.judge.languages).length === 0) {
+          errors.push({
+            index: i,
+            id: contestId,
+            path: ['document', 'judge'],
+            message: 'Codeforces requires explicit non-empty problems and language IDs',
+            code: 'validation',
+          });
+          continue;
+        }
+        const mapping = parsedContest.judge.problem_map ?? {};
+        if (Object.keys(mapping).some(key => !finalProblems!.some(p => p.id === key))) {
+          errors.push({
+            index: i,
+            id: contestId,
+            path: ['document', 'judge', 'problem_map'],
+            message: 'Unknown problem in Codeforces mapping',
+            code: 'validation',
+          });
+          continue;
+        }
+        const targets = finalProblems.map(p => (Object.hasOwn(mapping, p.id) ? mapping[p.id]! : p.id));
+        if (new Set(targets).size !== targets.length || targets.some(t => !/^[A-Za-z0-9]{1,12}$/.test(t))) {
+          errors.push({
+            index: i,
+            id: contestId,
+            path: ['document', 'judge', 'problem_map'],
+            message: 'Invalid or duplicate Codeforces target',
+            code: 'validation',
+          });
+          continue;
+        }
+      }
+
+      // Re-check entrypoint against external existingAnswersAbsPath now that it is known.
+      if (entrypointConfinedAbsPath && existingAnswersAbsPath && entrypointConfinedAbsPath === existingAnswersAbsPath) {
+        errors.push({
+          index: i,
+          id: contestId,
+          path: ['document', 'materials', 'entrypoint', 'path'],
+          message: `Contest judge answers file cannot be exposed as contest material: ${relative(baseReal, entrypointConfinedAbsPath)}`,
+          code: 'path_error',
+        });
+        continue;
+      }
+
+      // Confine and validate EVERY materials.attachments[] entry (O_NOFOLLOW, size limits, duplicates, sha256, forbidden files, content-based judge detection).
+      let attachmentsFailed = false;
+      const attachmentNames = new Set<string>();
+      let totalAttachmentBytes = 0;
+      const stagedAttachments: Array<{ normalizedPath: string; bytes: Buffer }> = [];
+      const effectiveJudgeAbsPath = judgeAbsPath ?? existingAnswersAbsPath;
+
+      for (let aIdx = 0; aIdx < parsedContest.materials.attachments.length; aIdx++) {
+        const att = parsedContest.materials.attachments[aIdx]!;
+        const fieldPath = ['document', 'materials', 'attachments', String(aIdx)];
+        if (attachmentNames.has(att.name)) {
+          errors.push({
+            index: i,
+            id: contestId,
+            path: [...fieldPath, 'name'],
+            message: `Duplicate attachment name: ${att.name}`,
+            code: 'validation',
+          });
+          attachmentsFailed = true;
+          break;
+        }
+        attachmentNames.add(att.name);
+
+        const attCandidate = isAbsolute(att.path) ? att.path : resolve(dirname(confined.absPath), att.path);
+        try {
+          const attConfined = await resolveConfinedPath(baseResolved, attCandidate, [...fieldPath, 'path']);
+          assertNotForbiddenMaterialPath(
+            attConfined.absPath,
+            attConfined.relPath,
+            protectedDirs,
+            effectiveJudgeAbsPath,
+            [...fieldPath, 'path'],
+          );
+          const attFile = await readConfinedRegularFile(baseReal, attConfined.absPath, [...fieldPath, 'path'], MAX_ATTACHMENT_BYTES);
+          if (isJudgeAnswerBytes(attFile.bytes)) {
+            throw new FieldError(
+              [...fieldPath, 'path'],
+              `Judge answer file cannot be exposed as contest material: ${attConfined.relPath}`,
+            );
+          }
+          totalAttachmentBytes += attFile.bytes.length;
+          if (totalAttachmentBytes > MAX_TOTAL_ATTACHMENTS_BYTES) {
+            throw new FieldError(['document', 'materials', 'attachments'], 'Attachments exceed 32 MB');
+          }
+          const attHash = sha256(attFile.bytes);
+          if (att.sha256 && att.sha256 !== attHash) {
+            throw new FieldError([...fieldPath, 'sha256'], `Attachment SHA-256 mismatch: ${attConfined.relPath}`);
+          }
+          referencedInputs.add(attConfined.absPath);
+          const normalizedAttPath = isAbsolute(att.path)
+            ? toManifestRelativePath(confined.absPath, attConfined.absPath)
+            : att.path;
+          stagedAttachments.push({ normalizedPath: normalizedAttPath, bytes: attFile.bytes });
+        } catch (error) {
+          errors.push({
+            index: i,
+            id: contestId,
+            path: error instanceof FieldError ? error.path : [...fieldPath, 'path'],
+            message: error instanceof Error ? error.message : 'Invalid attachment file',
+            code: error instanceof FieldError && error.path.includes('path') ? 'path_error' : 'validation',
+          });
+          attachmentsFailed = true;
+          break;
+        }
+      }
+      if (attachmentsFailed) continue;
+
+      // Handle pre-existing manifest and auxiliary (.pdf / .judge.json) files for error, skip, and overwrite!
+      const anyExists = manifestExists || judgeExists || synthPdfExists;
+      let action: 'create' | 'skip' | 'overwrite' = 'create';
+      let manifestBackup: Buffer | undefined;
+      let manifestBackupMode: number | undefined;
+      let judgeBackup: Buffer | undefined;
+      let judgeBackupMode: number | undefined;
+      let synthPdfBackup: Buffer | undefined;
+      let synthPdfBackupMode: number | undefined;
+
+      if (anyExists) {
+        if (ifExists === 'error') {
+          const existingRel = manifestExists
+            ? confined.relPath
+            : judgeExists
+              ? judgeRelPath!
+              : synthPdfRelPath!;
+          const conflictPath = manifestExists ? ['file'] : judgeExists ? ['judge'] : ['materials'];
+          errors.push({
+            index: i,
+            id: contestId,
+            path: conflictPath,
+            message: `Contest output file already exists: ${existingRel}`,
+            code: 'conflict',
+          });
+          continue;
+        }
+        if (ifExists === 'skip') {
+          action = 'skip';
+        } else {
+          // ifExists === 'overwrite': verify identity of EVERY pre-existing target file before overwriting!
+          try {
+            if (manifestExists) {
+              const prev = await readExistingForOverwriteCheck(baseReal, confined.absPath, confined.relPath, 'contest', ['file']);
+              manifestBackup = prev.backup;
+              manifestBackupMode = prev.mode;
+            }
+            if (judgeExists && judgeAbsPath && judgeRelPath) {
+              const prev = await readExistingForOverwriteCheck(baseReal, judgeAbsPath, judgeRelPath, 'judge', ['judge']);
+              judgeBackup = prev.backup;
+              judgeBackupMode = prev.mode;
+            }
+            if (synthPdfExists && synthPdfAbsPath && synthPdfRelPath) {
+              const prev = await readExistingForOverwriteCheck(baseReal, synthPdfAbsPath, synthPdfRelPath, 'pdf', ['materials']);
+              synthPdfBackup = prev.backup;
+              synthPdfBackupMode = prev.mode;
+            }
+            action = manifestExists ? 'overwrite' : 'create';
+          } catch (error) {
+            errors.push({
+              index: i,
+              id: contestId,
+              path: error instanceof FieldError ? error.path : ['file'],
+              message: error instanceof Error ? error.message : 'Refusing to overwrite unrelated existing file',
+              code: 'conflict',
+            });
+            continue;
+          }
+        }
+      }
+
+      // Stage verified bytes in a private 0o700 temp directory and run resolveContest validation
+      // for BOTH dryRun: true and dryRun: false (zero TOCTOU reopen, exact 1MB/4MB byte limits).
+      let stagedResolved: { finalManifestBytes: Buffer; revision: string };
+      try {
+        stagedResolved = await stageAndResolveContest({
+          manifestDraft,
+          entrypointBytes,
+          normalizedEntrypointPath,
+          attachments: stagedAttachments,
+          judgeBytes: judgeJsonBytes ?? externalJudgeBytes,
+          normalizedJudgeAnswersPath,
+        });
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : 'Contest validation failed';
+        const safeMsg =
+          msg.includes('Invalid JSON') && parsedContest.judge.kind === 'local'
+            ? 'Local answers file is not valid JSON'
+            : msg;
+        errors.push({
+          index: i,
+          id: contestId,
+          path: error instanceof FieldError ? error.path : ['document'],
+          message: safeMsg,
+          code: 'validation',
+        });
+        continue;
+      }
+
+      planned.push({
+        contest_id: contestId,
+        absPath: confined.absPath,
+        relPath: confined.relPath,
+        action,
+        manifestExists,
+        manifestBackup,
+        manifestBackupMode,
+        finalManifestBytes: stagedResolved.finalManifestBytes,
+        revision: stagedResolved.revision,
+        judgeJsonBytes,
+        judgeAbsPath,
+        judgeRelPath,
+        judgeExists,
+        judgeBackup,
+        judgeBackupMode,
+        synthPdfBytes,
+        synthPdfAbsPath,
+        synthPdfRelPath,
+        synthPdfExists,
+        synthPdfBackup,
+        synthPdfBackupMode,
+        pdfInfo,
+        inferredProblemMap,
+        outputPaths: itemOutputs,
+      });
     }
 
-    // Compute planned contestRevision matching resolveContest.
-    const cf = parsedContest.judge.kind === 'codeforces' ? parsedContest.judge : undefined;
-    const judgeDefinition =
-      parsedContest.judge.kind === 'local'
-        ? { kind: 'local', sha256: finalJudgeHash }
-        : {
-            kind: parsedContest.judge.kind,
-            contest_id: parsedContest.judge.contest_id,
-            problem_map: finalProblems!.map(p => [p.id, Object.hasOwn(cf?.problem_map ?? {}, p.id) ? cf!.problem_map![p.id] : p.id]),
-            languages: Object.entries(parsedContest.judge.languages).sort(([a], [b]) => a.localeCompare(b)),
-          };
-    const plannedRevision = sha256(
-      JSON.stringify({
-        materials: [entrypointHash, ...attachmentHashes],
-        problems: finalProblems,
-        rules: parsedContest.rules,
-        judge: judgeDefinition,
-      }),
-    );
-
-    planned.push({
-      contest_id: contestId,
-      absPath: confined.absPath,
-      relPath: confined.relPath,
-      action,
-      manifestExists,
-      manifestBackup,
-      manifestBackupMode,
-      manifestDraft,
-      plannedRevision,
-      judgeJsonBytes,
-      judgeAbsPath,
-      judgeRelPath,
-      judgeExists,
-      judgeBackup,
-      judgeBackupMode,
-      synthPdfBytes,
-      synthPdfAbsPath,
-      synthPdfRelPath,
-      synthPdfExists,
-      synthPdfBackup,
-      synthPdfBackupMode,
-      pdfInfo,
-      inferredProblemMap,
-      outputPaths: itemOutputs,
-    });
-  }
-
-  // Reject any output path colliding with any referenced input path in the same batch.
-  for (const item of planned) {
-    for (const out of item.outputPaths) {
-      if (referencedInputs.has(out.absPath)) {
-        errors.push({
-          id: item.contest_id,
-          path: ['file'],
-          message: `Target output path collides with a referenced input file in the same batch: ${out.relPath}`,
-          code: 'conflict',
-        });
+    // Reject any output path colliding with any referenced input path in the same batch.
+    for (const item of planned) {
+      for (const out of item.outputPaths) {
+        if (referencedInputs.has(out.absPath)) {
+          errors.push({
+            id: item.contest_id,
+            path: ['file'],
+            message: `Target output path collides with a referenced input file in the same batch: ${out.relPath}`,
+            code: 'conflict',
+          });
+        }
       }
     }
-  }
 
-  if (errors.length > 0) {
-    return {
-      ok: false,
-      dry_run: dryRun,
-      created: 0,
-      skipped: 0,
-      overwritten: 0,
-      items: [],
-      errors,
-    };
-  }
+    if (errors.length > 0) {
+      return {
+        ok: false,
+        dry_run: dryRun,
+        created: 0,
+        skipped: 0,
+        overwritten: 0,
+        items: [],
+        errors,
+      };
+    }
 
-  let created = 0;
-  let skipped = 0;
-  let overwritten = 0;
-  const results: BatchContestItemResult[] = [];
-  const rollbackLog: RollbackEntry[] = [];
+    let created = 0;
+    let skipped = 0;
+    let overwritten = 0;
+    const results: BatchContestItemResult[] = [];
+    const rollbackLog: RollbackEntry[] = [];
 
-  try {
-    for (const item of planned) {
-      if (item.action === 'skip') {
-        skipped++;
+    try {
+      for (const item of planned) {
+        if (item.action === 'skip') {
+          skipped++;
+          results.push({
+            contest_id: item.contest_id,
+            path: item.relPath,
+            ...(item.judgeRelPath ? { judge_path: item.judgeRelPath } : {}),
+            ...(item.synthPdfRelPath ? { pdf_path: item.synthPdfRelPath } : {}),
+            action: 'skip',
+            ...(item.pdfInfo ? { pdf_info: item.pdfInfo } : {}),
+            ...(item.inferredProblemMap ? { inferred_problem_map: item.inferredProblemMap } : {}),
+          });
+          continue;
+        }
+
+        if (!dryRun) {
+          await ensureConfinedParentDir(baseReal, item.absPath);
+
+          if (item.synthPdfBytes && item.synthPdfAbsPath) {
+            await atomicWriteFile(item.synthPdfAbsPath, item.synthPdfBytes, item.synthPdfExists, 0o600);
+            rollbackLog.push({
+              path: item.synthPdfAbsPath,
+              existed: item.synthPdfExists,
+              writtenSha256: sha256(item.synthPdfBytes),
+              backup: item.synthPdfBackup,
+              mode: item.synthPdfBackupMode,
+            });
+          }
+
+          if (item.judgeJsonBytes && item.judgeAbsPath) {
+            await atomicWriteFile(item.judgeAbsPath, item.judgeJsonBytes, item.judgeExists, 0o600);
+            rollbackLog.push({
+              path: item.judgeAbsPath,
+              existed: item.judgeExists,
+              writtenSha256: sha256(item.judgeJsonBytes),
+              backup: item.judgeBackup,
+              mode: item.judgeBackupMode,
+            });
+          }
+
+          await atomicWriteFile(item.absPath, item.finalManifestBytes, item.manifestExists, 0o600);
+          rollbackLog.push({
+            path: item.absPath,
+            existed: item.manifestExists,
+            writtenSha256: sha256(item.finalManifestBytes),
+            backup: item.manifestBackup,
+            mode: item.manifestBackupMode,
+          });
+        }
+
+        if (item.action === 'create') created++;
+        else overwritten++;
+
         results.push({
           contest_id: item.contest_id,
           path: item.relPath,
           ...(item.judgeRelPath ? { judge_path: item.judgeRelPath } : {}),
           ...(item.synthPdfRelPath ? { pdf_path: item.synthPdfRelPath } : {}),
-          action: 'skip',
+          action: item.action,
+          revision: item.revision,
           ...(item.pdfInfo ? { pdf_info: item.pdfInfo } : {}),
           ...(item.inferredProblemMap ? { inferred_problem_map: item.inferredProblemMap } : {}),
         });
-        continue;
       }
-
-      let revision: string | undefined = dryRun ? item.plannedRevision : undefined;
-
-      if (!dryRun) {
-        await ensureConfinedParentDir(baseReal, item.absPath);
-
-        if (item.synthPdfBytes && item.synthPdfAbsPath) {
-          await atomicWriteFile(item.synthPdfAbsPath, item.synthPdfBytes, item.synthPdfExists, 0o600);
-          rollbackLog.push({
-            path: item.synthPdfAbsPath,
-            existed: item.synthPdfExists,
-            backup: item.synthPdfBackup,
-            mode: item.synthPdfBackupMode,
-          });
-        }
-
-        if (item.judgeJsonBytes && item.judgeAbsPath) {
-          await atomicWriteFile(item.judgeAbsPath, item.judgeJsonBytes, item.judgeExists, 0o600);
-          rollbackLog.push({
-            path: item.judgeAbsPath,
-            existed: item.judgeExists,
-            backup: item.judgeBackup,
-            mode: item.judgeBackupMode,
-          });
-        }
-
-        let resolved;
-        try {
-          resolved = await resolveContest(item.manifestDraft, item.absPath);
-        } catch (error) {
-          // Sanitize any unexpected private judge parse error.
-          const msg = error instanceof Error ? error.message : 'Contest validation failed';
-          if (msg.includes('Invalid JSON') && item.manifestDraft.judge && (item.manifestDraft.judge as { kind?: string }).kind === 'local') {
-            throw new Error('Local answers file is not valid JSON');
-          }
-          throw error;
-        }
-        const { statement: _statement, ...finalDocument } = resolved.contest;
-        revision = resolved.contestRevision;
-        await atomicWriteFile(item.absPath, JSON.stringify(finalDocument, null, 2) + '\n', item.manifestExists, 0o600);
-        rollbackLog.push({
-          path: item.absPath,
-          existed: item.manifestExists,
-          backup: item.manifestBackup,
-          mode: item.manifestBackupMode,
-        });
+    } catch (error) {
+      const rollbackFailures = await rollbackWrites(rollbackLog);
+      if (rollbackFailures.length > 0) {
+        const msg = error instanceof Error ? error.message : String(error);
+        throw new Error(`${msg} (rollback issues: ${rollbackFailures.join('; ')})`, { cause: error });
       }
-
-      if (item.action === 'create') created++;
-      else overwritten++;
-
-      results.push({
-        contest_id: item.contest_id,
-        path: item.relPath,
-        ...(item.judgeRelPath ? { judge_path: item.judgeRelPath } : {}),
-        ...(item.synthPdfRelPath ? { pdf_path: item.synthPdfRelPath } : {}),
-        action: item.action,
-        ...(revision ? { revision } : {}),
-        ...(item.pdfInfo ? { pdf_info: item.pdfInfo } : {}),
-        ...(item.inferredProblemMap ? { inferred_problem_map: item.inferredProblemMap } : {}),
-      });
+      throw error;
     }
-  } catch (error) {
-    await rollbackWrites(rollbackLog);
-    throw error;
-  }
 
-  return {
-    ok: true,
-    dry_run: dryRun,
-    created,
-    skipped,
-    overwritten,
-    items: results,
-    errors: [],
-  };
+    return {
+      ok: true,
+      dry_run: dryRun,
+      created,
+      skipped,
+      overwritten,
+      items: results,
+      errors: [],
+    };
+  });
 }

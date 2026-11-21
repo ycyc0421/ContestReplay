@@ -1,9 +1,10 @@
-import { constants, chmodSync, closeSync, fstatSync, lstatSync, mkdirSync, openSync, unlinkSync } from 'node:fs';
+import { constants, chmodSync, closeSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, unlinkSync } from 'node:fs';
 import { lstat, open, readdir, realpath } from 'node:fs/promises';
-import { dirname, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { z } from 'zod';
 import { agentKind } from './agent-manifest.js';
+import { isForbiddenPublicFilename } from './automation.js';
 import { loadAgent, loadContest, sha256 } from './config.js';
 import { Connections, type Connection } from './connections.js';
 import { speedTierSchema } from './harnesses.js';
@@ -89,7 +90,11 @@ interface DepStat {
   size: number | null;
 }
 
-async function statDep(absPath: string): Promise<DepStat> {
+async function statDep(baseReal: string, absPath: string): Promise<DepStat> {
+  const rel = relative(baseReal, absPath);
+  if (!rel || rel === '.' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    return { path: absPath, mtime_ms: -2, size: -2 };
+  }
   try {
     const info = await lstat(absPath);
     if (info.isSymbolicLink() || !info.isFile()) {
@@ -101,7 +106,7 @@ async function statDep(absPath: string): Promise<DepStat> {
   }
 }
 
-async function depsUnchanged(depsJson: string | null): Promise<boolean> {
+async function depsUnchanged(baseReal: string, depsJson: string | null): Promise<boolean> {
   if (!depsJson) return true;
   let deps: DepStat[];
   try {
@@ -111,8 +116,56 @@ async function depsUnchanged(depsJson: string | null): Promise<boolean> {
     return false;
   }
   for (const dep of deps) {
-    const current = await statDep(dep.path);
+    const current = await statDep(baseReal, dep.path);
     if (current.mtime_ms !== dep.mtime_ms || current.size !== dep.size) {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function isConfinedNoSymlink(
+  baseReal: string,
+  candidatePath: string,
+  opts?: { forbidPublicFilename?: boolean; rawRoot?: string; rootReal?: string },
+): Promise<boolean> {
+  if (!candidatePath || candidatePath.includes('\0')) return false;
+  const rel = relative(baseReal, candidatePath);
+  if (!rel || rel === '.' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    return false;
+  }
+  const parts = rel.split(sep);
+  if (parts.some(seg => !seg || seg === '.' || seg === '..' || seg.startsWith('.'))) {
+    return false;
+  }
+  if (parts[0] === 'runs') return false;
+  if (
+    opts?.rawRoot &&
+    opts.rawRoot !== baseReal &&
+    (candidatePath === opts.rawRoot || candidatePath.startsWith(opts.rawRoot + sep))
+  ) {
+    return false;
+  }
+  if (
+    opts?.rootReal &&
+    opts.rootReal !== baseReal &&
+    (candidatePath === opts.rootReal || candidatePath.startsWith(opts.rootReal + sep))
+  ) {
+    return false;
+  }
+  if (opts?.forbidPublicFilename && isForbiddenPublicFilename(candidatePath)) {
+    return false;
+  }
+  let current = baseReal;
+  for (let i = 0; i < parts.length; i++) {
+    current = join(current, parts[i]!);
+    try {
+      const info = await lstat(current);
+      if (info.isSymbolicLink()) return false;
+      if (i < parts.length - 1 && !info.isDirectory()) return false;
+      if (i === parts.length - 1 && !info.isFile()) return false;
+    } catch (error) {
+      if (isEnoent(error)) break;
       return false;
     }
   }
@@ -131,27 +184,34 @@ function collectAgentDepPaths(fullPath: string, raw: Record<string, unknown>): s
   return [...new Set(paths)].sort();
 }
 
-function collectContestDepPaths(fullPath: string, raw: Record<string, unknown>): string[] {
+function collectContestDepPaths(
+  fullPath: string,
+  raw: Record<string, unknown>,
+): { materialPaths: string[]; judgePaths: string[]; allPaths: string[] } {
   const dir = dirname(fullPath);
-  const paths: string[] = [];
+  const materialPaths: string[] = [];
+  const judgePaths: string[] = [];
   const materials = record(raw.materials);
   const entrypoint = record(materials.entrypoint);
   const entryPath = textVal(entrypoint.path);
-  if (entryPath) paths.push(resolve(dir, entryPath));
+  if (entryPath) materialPaths.push(resolve(dir, entryPath));
   const statement = record(raw.statement);
   const stmtPath = textVal(statement.path);
-  if (stmtPath) paths.push(resolve(dir, stmtPath));
+  if (stmtPath) materialPaths.push(resolve(dir, stmtPath));
   if (Array.isArray(materials.attachments)) {
     for (const att of materials.attachments) {
       const attPath = textVal(record(att).path);
-      if (attPath) paths.push(resolve(dir, attPath));
+      if (attPath) materialPaths.push(resolve(dir, attPath));
     }
   }
   const judge = record(raw.judge);
   const answers = record(judge.answers);
   const ansPath = textVal(answers.path) ?? textVal(judge.path);
-  if (ansPath) paths.push(resolve(dir, ansPath));
-  return [...new Set(paths)].sort();
+  if (ansPath) judgePaths.push(resolve(dir, ansPath));
+  const uniqueMaterials = [...new Set(materialPaths)].sort();
+  const uniqueJudge = [...new Set(judgePaths)].sort();
+  const allPaths = [...new Set([...uniqueMaterials, ...uniqueJudge])].sort();
+  return { materialPaths: uniqueMaterials, judgePaths: uniqueJudge, allPaths };
 }
 
 function providerMetaHash(provider: Connection | undefined): string {
@@ -488,6 +548,7 @@ interface RunQueryRow {
   agent_id: string;
   agent_revision: string;
   profile_sha256: string | null;
+  effective_sha256: string | null;
   speed_tier: string | null;
   contest_id: string;
   data_version: number;
@@ -502,7 +563,7 @@ interface RunQueryRow {
 
 function runMatchesCurrentRevision(
   r: RunQueryRow,
-  agent: { agent_revision: string | null; speed_tier: string | null },
+  agent: { agent_revision: string | null; effective_sha256: string | null; speed_tier: string | null },
   contest: { contest_revision: string | null; contest_sha256: string | null; protocol_sha256: string | null },
 ): boolean {
   if (agent.agent_revision !== null) {
@@ -512,16 +573,21 @@ function runMatchesCurrentRevision(
       return false;
     }
   }
-  if (r.speed_tier !== null) {
-    if ((r.speed_tier || 'standard') !== (agent.speed_tier || 'standard')) return false;
+  if (agent.effective_sha256 !== null) {
+    if (r.effective_sha256 === null || r.effective_sha256 !== agent.effective_sha256) return false;
   }
-  if (contest.contest_revision !== null && r.contest_revision !== null) {
-    if (r.contest_revision !== contest.contest_revision) return false;
-  } else if (contest.contest_sha256 !== null && r.contest_sha256 !== null) {
-    if (r.contest_sha256 !== contest.contest_sha256) return false;
+  if ((r.speed_tier || 'standard') !== (agent.speed_tier || 'standard')) return false;
+  if (contest.contest_revision !== null || contest.contest_sha256 !== null) {
+    if (contest.contest_revision !== null && r.contest_revision !== null) {
+      if (r.contest_revision !== contest.contest_revision) return false;
+    } else if (contest.contest_sha256 !== null && r.contest_sha256 !== null) {
+      if (r.contest_sha256 !== contest.contest_sha256) return false;
+    } else {
+      return false;
+    }
   }
-  if (contest.protocol_sha256 !== null && r.protocol_sha256 !== null) {
-    if (r.protocol_sha256 !== contest.protocol_sha256) return false;
+  if (contest.protocol_sha256 !== null) {
+    if (r.protocol_sha256 === null || r.protocol_sha256 !== contest.protocol_sha256) return false;
   }
   return true;
 }
@@ -544,18 +610,24 @@ export class WorkspaceIndex {
   }
 
   private ensureSafeWorkspaceDir(): void {
+    const parentDir = dirname(this.dbPath);
+    let info;
     try {
-      const info = lstatSync(this.workspaceDir);
-      if (info.isSymbolicLink() || !info.isDirectory()) {
-        throw new Error(`Refusing to open symlinked or non-directory workspace root: ${this.workspaceDir}`);
-      }
+      info = lstatSync(parentDir);
     } catch (error) {
       if (!isEnoent(error)) throw error;
-      mkdirSync(this.workspaceDir, { recursive: true, mode: 0o700 });
-      const created = lstatSync(this.workspaceDir);
-      if (created.isSymbolicLink() || !created.isDirectory()) {
-        throw new Error(`Refusing to open symlinked or non-directory workspace root: ${this.workspaceDir}`);
-      }
+      mkdirSync(parentDir, { recursive: true, mode: 0o700 });
+      info = lstatSync(parentDir);
+    }
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new Error(`Refusing to open symlinked or non-directory workspace root: ${parentDir}`);
+    }
+    const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+    if (uid !== undefined && info.uid !== uid) {
+      throw new Error(`Refusing to open workspace root not owned by current user: ${parentDir}`);
+    }
+    if ((info.mode & 0o077) !== 0) {
+      chmodSync(parentDir, 0o700);
     }
   }
 
@@ -591,17 +663,22 @@ export class WorkspaceIndex {
     this.ensureSafeWorkspaceDir();
     this.assertSafeSqliteFiles();
 
-    // Pre-create / verify dbPath with O_NOFOLLOW and 0o600 so it is NEVER briefly world-readable.
+    // Pre-create / verify dbPath with O_NOFOLLOW and fchmodSync(fd, 0o600) on the verified descriptor
+    // BEFORE closing fd so there is zero pathname chmod race and dbPath is never world-readable.
     const fd = openSync(this.dbPath, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
     try {
       const info = fstatSync(fd);
       if (!info.isFile()) {
         throw new Error(`Refusing to open non-regular SQLite index path: ${this.dbPath}`);
       }
+      const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+      if (uid !== undefined && info.uid !== uid) {
+        throw new Error(`Refusing to open SQLite index not owned by current user: ${this.dbPath}`);
+      }
+      fchmodSync(fd, 0o600);
     } finally {
       closeSync(fd);
     }
-    chmodSync(this.dbPath, 0o600);
 
     let db: DatabaseSync | undefined;
     try {
@@ -648,15 +725,28 @@ export class WorkspaceIndex {
   }
 
   private hardenFileModes(): void {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
     for (const filePath of this.sqliteFiles()) {
+      let fd: number | undefined;
       try {
-        const info = lstatSync(filePath);
-        if (info.isSymbolicLink() || !info.isFile()) {
+        fd = openSync(filePath, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+        const info = fstatSync(fd);
+        if (!info.isFile()) {
           throw new Error(`Refusing to touch non-regular SQLite index path: ${filePath}`);
         }
-        chmodSync(filePath, 0o600);
+        if (uid !== undefined && info.uid !== uid) {
+          throw new Error(`Refusing to touch SQLite index path not owned by current user: ${filePath}`);
+        }
+        fchmodSync(fd, 0o600);
       } catch (error) {
-        if (!isEnoent(error)) throw error;
+        const code = (error as NodeJS.ErrnoException)?.code;
+        if (code === 'ENOENT') continue;
+        if (code === 'ELOOP') {
+          throw new Error(`Refusing to touch non-regular SQLite index path: ${filePath}`);
+        }
+        throw error;
+      } finally {
+        if (fd !== undefined) closeSync(fd);
       }
     }
   }
@@ -851,6 +941,7 @@ export class WorkspaceIndex {
     const rawBase = resolve(opts.base ?? process.cwd());
     const base = await realpath(rawBase).catch(() => rawBase);
     const root = resolve(opts.root ?? this.workspaceDir);
+    const rootReal = await realpath(root).catch(() => root);
     const store = opts.store ?? new Connections();
     const nowIso = new Date().toISOString();
 
@@ -869,13 +960,20 @@ export class WorkspaceIndex {
       runs_pruned: 0,
     };
 
-    await this.syncConfigs(base, store, nowIso, stats);
+    await this.syncConfigs(base, root, rootReal, store, nowIso, stats);
     await this.syncBatchesAndRuns(root, nowIso, stats);
     this.hardenFileModes();
     return stats;
   }
 
-  private async syncConfigs(base: string, store: Connections, nowIso: string, stats: SyncStats): Promise<void> {
+  private async syncConfigs(
+    base: string,
+    rawRoot: string,
+    rootReal: string,
+    store: Connections,
+    nowIso: string,
+    stats: SyncStats,
+  ): Promise<void> {
     // Metadata-only store.list(); never reads credential files or OS keyring.
     const providersList = await store.list().catch(() => [] as Connection[]);
     const providerById = new Map<string, Connection>(providersList.map(p => [p.id, p]));
@@ -989,6 +1087,7 @@ export class WorkspaceIndex {
       for (const name of entries) {
         if (name.startsWith('.') || SKIPPED_DIRS.has(name)) continue;
         const fullPath = join(currentDir, name);
+        if (fullPath === rawRoot || fullPath === rootReal) continue;
         let info;
         try {
           info = await lstat(fullPath);
@@ -1012,7 +1111,7 @@ export class WorkspaceIndex {
           if (prev.kind === 'other') continue;
           if (prev.kind === 'contest') {
             const cachedContest = cachedContests.get(relPath);
-            if (cachedContest && (await depsUnchanged(cachedContest.deps_json))) {
+            if (cachedContest && (await depsUnchanged(base, cachedContest.deps_json))) {
               seenContestPaths.add(relPath);
               stats.contests_reused++;
               continue;
@@ -1024,7 +1123,7 @@ export class WorkspaceIndex {
               const expectedProviderHash =
                 cachedAgent.provider === null ? null : providerMetaHash(providerById.get(cachedAgent.provider));
               const providerMatches = cachedAgent.provider_meta_hash === expectedProviderHash;
-              if (providerMatches && (await depsUnchanged(cachedAgent.deps_json))) {
+              if (providerMatches && (await depsUnchanged(base, cachedAgent.deps_json))) {
                 seenAgentPaths.add(relPath);
                 stats.agents_reused++;
                 continue;
@@ -1033,7 +1132,7 @@ export class WorkspaceIndex {
           }
         }
 
-        if (size > MAX_CONFIG_BYTES) {
+        if (size > MAX_CONFIG_BYTES || isForbiddenPublicFilename(fullPath)) {
           scannedUpserts.push({ path: relPath, kind: 'other', mtime_ms: mtimeMs, size });
           continue;
         }
@@ -1047,17 +1146,32 @@ export class WorkspaceIndex {
           continue;
         }
 
-        const isAgent = raw.kind === agentKind || 'agent_id' in raw || ('harness' in raw && 'model' in raw);
-        const isContest = !isAgent && 'contest_id' in raw;
+        const isAgent =
+          !('run_id' in raw) &&
+          !('accepted_answers' in raw) &&
+          !('contest_id' in raw) &&
+          (raw.kind === agentKind || 'agent_id' in raw || ('harness' in raw && 'model' in raw));
+        const isContest = !isAgent && !('run_id' in raw) && !('accepted_answers' in raw) && 'contest_id' in raw;
 
         if (isAgent) {
           seenAgentPaths.add(relPath);
           const depPaths = collectAgentDepPaths(fullPath, raw);
-          const depStats = await Promise.all(depPaths.map(statDep));
-          const loaded = await loadAgent(fullPath, store).then(
-            value => ({ value }),
-            error => ({ error }),
-          );
+          const depStats = await Promise.all(depPaths.map(p => statDep(base, p)));
+          let depsSafe = await isConfinedNoSymlink(base, fullPath, { rawRoot, rootReal });
+          if (depsSafe) {
+            for (const depPath of depPaths) {
+              if (!(await isConfinedNoSymlink(base, depPath, { rawRoot, rootReal }))) {
+                depsSafe = false;
+                break;
+              }
+            }
+          }
+          const loaded = depsSafe
+            ? await loadAgent(fullPath, store).then(
+                value => ({ value }),
+                error => ({ error }),
+              )
+            : { error: new Error('Dependency escapes workspace or traverses a symlink') };
           const harnessObj = record(raw.harness);
           const provider =
             textVal(raw.provider) ?? textVal(raw.connection) ?? ('value' in loaded ? loaded.value.connection : undefined);
@@ -1099,12 +1213,31 @@ export class WorkspaceIndex {
           stats.agents_indexed++;
         } else if (isContest) {
           seenContestPaths.add(relPath);
-          const depPaths = collectContestDepPaths(fullPath, raw);
-          const depStats = await Promise.all(depPaths.map(statDep));
-          const loaded = await loadContest(fullPath).then(
-            value => ({ value }),
-            error => ({ error }),
-          );
+          const { materialPaths, judgePaths, allPaths } = collectContestDepPaths(fullPath, raw);
+          const depStats = await Promise.all(allPaths.map(p => statDep(base, p)));
+          let depsSafe = await isConfinedNoSymlink(base, fullPath, { rawRoot, rootReal });
+          if (depsSafe) {
+            for (const matPath of materialPaths) {
+              if (!(await isConfinedNoSymlink(base, matPath, { forbidPublicFilename: true, rawRoot, rootReal }))) {
+                depsSafe = false;
+                break;
+              }
+            }
+          }
+          if (depsSafe) {
+            for (const jPath of judgePaths) {
+              if (!(await isConfinedNoSymlink(base, jPath, { forbidPublicFilename: false, rawRoot, rootReal }))) {
+                depsSafe = false;
+                break;
+              }
+            }
+          }
+          const loaded = depsSafe
+            ? await loadContest(fullPath).then(
+                value => ({ value }),
+                error => ({ error }),
+              )
+            : { error: new Error('Dependency escapes workspace or traverses a symlink') };
           const judgeObj = record(raw.judge);
           const rulesObj = record(raw.rules);
           const materialsObj = record(raw.materials);
@@ -1885,7 +2018,7 @@ export class WorkspaceIndex {
     }
     const agentRows = this.db
       .prepare(
-        `SELECT path, id, name, harness, speed_tier, agent_revision, valid FROM agents ${agentWhere.length ? `WHERE ${agentWhere.join(' AND ')}` : ''} ORDER BY id ASC, valid DESC, path ASC`,
+        `SELECT path, id, name, harness, speed_tier, agent_revision, effective_sha256, valid FROM agents ${agentWhere.length ? `WHERE ${agentWhere.join(' AND ')}` : ''} ORDER BY id ASC, valid DESC, path ASC`,
       )
       .all(...agentParams) as unknown as Array<{
       path: string;
@@ -1894,30 +2027,9 @@ export class WorkspaceIndex {
       harness: string;
       speed_tier: string | null;
       agent_revision: string | null;
+      effective_sha256: string | null;
       valid: number;
     }>;
-
-    const dedupAgents: Array<{
-      id: string;
-      name: string | null;
-      path: string;
-      harness: string;
-      speed_tier: string | null;
-      agent_revision: string | null;
-    }> = [];
-    const seenAgentIds = new Set<string>();
-    for (const a of agentRows) {
-      if (seenAgentIds.has(a.id)) continue;
-      seenAgentIds.add(a.id);
-      dedupAgents.push({
-        id: a.id,
-        name: a.name,
-        path: a.path,
-        harness: a.harness,
-        speed_tier: a.speed_tier,
-        agent_revision: a.agent_revision,
-      });
-    }
 
     const contestWhere: string[] = [];
     const contestParams: SQLInputValue[] = [];
@@ -1943,36 +2055,7 @@ export class WorkspaceIndex {
       valid: number;
     }>;
 
-    const dedupContests: Array<{
-      id: string;
-      title: string;
-      data_version: number;
-      path: string;
-      judge_kind: string;
-      attachment_count: number;
-      contest_revision: string | null;
-      contest_sha256: string | null;
-      protocol_sha256: string | null;
-    }> = [];
-    const seenContestKeys = new Set<string>();
-    for (const c of contestRows) {
-      const key = `${c.id}\0${c.data_version}`;
-      if (seenContestKeys.has(key)) continue;
-      seenContestKeys.add(key);
-      dedupContests.push({
-        id: c.id,
-        title: c.title,
-        data_version: c.data_version,
-        path: c.path,
-        judge_kind: c.judge_kind,
-        attachment_count: c.attachment_count,
-        contest_revision: c.contest_revision,
-        contest_sha256: c.contest_sha256,
-        protocol_sha256: c.protocol_sha256,
-      });
-    }
-
-    if (!dedupAgents.length || !dedupContests.length) return [];
+    if (!agentRows.length || !contestRows.length) return [];
 
     // Filter runs by opts.agentIds / opts.contestIds so SQLite indexes are utilized.
     const runWhere: string[] = [];
@@ -1993,6 +2076,7 @@ export class WorkspaceIndex {
           agent_id,
           agent_revision,
           profile_sha256,
+          effective_sha256,
           speed_tier,
           contest_id,
           data_version,
@@ -2021,9 +2105,10 @@ export class WorkspaceIndex {
       list.push(r);
     }
 
+    // Key coverage entries by (agent.path, contest.path) so distinct valid manifests sharing an ID are NEVER dropped!
     const cells: CoverageCell[] = [];
-    for (const a of dedupAgents) {
-      for (const c of dedupContests) {
+    for (const a of agentRows) {
+      for (const c of contestRows) {
         const key = `${a.id}\0${c.id}\0${c.data_version}`;
         const cellRuns = runsByCellKey.get(key) ?? [];
         let completedCount = 0;

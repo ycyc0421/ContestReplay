@@ -3,12 +3,12 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { loadAgent, loadContest, sha256 } from '../dist/config.js';
 import { Connections } from '../dist/connections.js';
 import { synthesizeTextContestPdf } from '../dist/pdf-synth.js';
 import { specSchema } from '../dist/plan.js';
-import { protocolDigest } from '../dist/protocol.js';
+import { protocolDigest, protocolDigestForPreset } from '../dist/protocol.js';
 import { toBatchSpec, WorkspaceIndex } from '../dist/sqlite-index.js';
 
 async function makeTempDir(t, prefix) {
@@ -122,10 +122,12 @@ async function writeRunFixture(
     agentName,
     agentRevision = 'a'.repeat(64),
     profileSha256,
+    effectiveSha256,
     speedTier = 'standard',
     contestId,
     dataVersion,
     contestRevision,
+    protocolSha256 = protocolDigestForPreset('short'),
     status,
     reason,
     score,
@@ -137,6 +139,10 @@ async function writeRunFixture(
 ) {
   const dir = join(root, runId);
   await mkdir(dir, { recursive: true });
+  const agentDigests = {
+    ...(profileSha256 ? { profile_sha256: profileSha256 } : {}),
+    ...(effectiveSha256 ? { effective_sha256: effectiveSha256 } : {}),
+  };
   await writeFile(
     join(dir, 'run.json'),
     JSON.stringify({
@@ -145,11 +151,12 @@ async function writeRunFixture(
       contest_id: contestId,
       data_version: dataVersion,
       ...(contestRevision ? { contest_revision: contestRevision } : {}),
+      ...(protocolSha256 ? { protocol_sha256: protocolSha256 } : {}),
       agent_id: agentId,
       ...(agentName ? { agent_name: agentName } : {}),
       agent_revision: agentRevision,
-      ...(profileSha256 ? { agent_digests: { profile_sha256: profileSha256 } } : {}),
-      model: { model: 'gpt-5.3-codex', speed_tier: speedTier },
+      ...(Object.keys(agentDigests).length ? { agent_digests: agentDigests } : {}),
+      model: { model: 'gpt-5.3-codex', ...(speedTier !== null ? { speed_tier: speedTier } : {}) },
       started_at: createdAt,
     }),
   );
@@ -197,6 +204,7 @@ async function writeBatchFixture(root, batchId, jobs, createdAt) {
           agent_id: j.agentId,
           agent_revision: j.agentRevision ?? 'a'.repeat(64),
           ...(j.profileSha256 ? { profile_sha256: j.profileSha256 } : {}),
+          ...(j.effectiveSha256 ? { effective_sha256: j.effectiveSha256 } : {}),
           ...(j.speedTier ? { speed_tier: j.speedTier } : {}),
           agent_sha256: '3'.repeat(64),
           contest_path: `/tmp/${j.contestId}.json`,
@@ -261,6 +269,7 @@ test('WorkspaceIndex syncs agents, contests, batches, runs incrementally and pru
     agentId: 'alpha',
     agentName: 'Alpha Agent',
     profileSha256: loadedAlpha.profileDigest,
+    effectiveSha256: loadedAlpha.effectiveDigest,
     speedTier: 'fast',
     contestId: 'round-1',
     dataVersion: 1,
@@ -275,6 +284,7 @@ test('WorkspaceIndex syncs agents, contests, batches, runs incrementally and pru
     agentId: 'alpha',
     agentName: 'Alpha Agent',
     profileSha256: loadedAlpha.profileDigest,
+    effectiveSha256: loadedAlpha.effectiveDigest,
     speedTier: 'fast',
     contestId: 'round-2',
     dataVersion: 1,
@@ -290,6 +300,7 @@ test('WorkspaceIndex syncs agents, contests, batches, runs incrementally and pru
       {
         agentId: 'alpha',
         profileSha256: loadedAlpha.profileDigest,
+        effectiveSha256: loadedAlpha.effectiveDigest,
         speedTier: 'fast',
         contestId: 'round-1',
         dataVersion: 1,
@@ -300,6 +311,7 @@ test('WorkspaceIndex syncs agents, contests, batches, runs incrementally and pru
       {
         agentId: 'alpha',
         profileSha256: loadedAlpha.profileDigest,
+        effectiveSha256: loadedAlpha.effectiveDigest,
         speedTier: 'fast',
         contestId: 'round-2',
         dataVersion: 1,
@@ -454,6 +466,7 @@ test('WorkspaceIndex enforces revision-aware coverage, distinguishes active runn
     runId: runDone,
     agentId: 'alpha',
     profileSha256: loadedAlpha.profileDigest,
+    effectiveSha256: loadedAlpha.effectiveDigest,
     speedTier: 'standard',
     contestId: 'local-r1',
     dataVersion: 1,
@@ -506,6 +519,7 @@ test('WorkspaceIndex enforces revision-aware coverage, distinguishes active runn
     runId: randomUUID(),
     agentId: 'alpha',
     profileSha256: loadedAlphaHigh.profileDigest,
+    effectiveSha256: loadedAlphaHigh.effectiveDigest,
     speedTier: 'standard',
     contestId: 'local-r1',
     dataVersion: 1,
@@ -517,6 +531,7 @@ test('WorkspaceIndex enforces revision-aware coverage, distinguishes active runn
     runId: randomUUID(),
     agentId: 'alpha',
     profileSha256: loadedAlphaHigh.profileDigest,
+    effectiveSha256: loadedAlphaHigh.effectiveDigest,
     speedTier: 'standard',
     contestId: 'local-r1',
     dataVersion: 1,
@@ -630,6 +645,7 @@ test('WorkspaceIndex rejects symlinked root/sidecars, recovers from corrupt sqli
     runId: bigRunId,
     agentId: 'dep-agent',
     profileSha256: loadedDepAgent.profileDigest,
+    effectiveSha256: loadedDepAgent.effectiveDigest,
     speedTier: 'fast',
     contestId: 'dep-contest',
     dataVersion: 1,
@@ -655,4 +671,229 @@ test('WorkspaceIndex rejects symlinked root/sidecars, recovers from corrupt sqli
   const covAfterPrune = recovered.queryCoverage({ agentIds: ['dep-agent'], contestIds: ['dep-contest'] });
   assert.equal(covAfterPrune[0].completed_count, 0);
   assert.equal(covAfterPrune[0].total_runs, 0);
+});
+
+test('WorkspaceIndex confines custom root & transitive deps, enforces strict effective/contest/protocol revision checks, and preserves duplicate-ID distinct revisions', async t => {
+  const base = await makeTempDir(t, 'cr-idx-strict-base-');
+  const outsideDir = await makeTempDir(t, 'cr-idx-strict-out-');
+  const connDir = await makeTempDir(t, 'cr-idx-strict-conn-');
+  await chmod(connDir, 0o700);
+  const store = new Connections(connDir);
+  await store.create({
+    id: 'p-strict',
+    label: 'Strict Provider',
+    protocol: 'responses',
+    base_url: 'https://api.openai.com/v1',
+    secret: 'sk-strict-secret-1234',
+    supports_fast: true,
+  });
+
+  // 1. Custom root INSIDE base with loose 0o755 permissions -> tightened to 0o700 and NOT walked by syncConfigs!
+  const customRoot = join(base, 'custom-workspace');
+  await mkdir(customRoot, { recursive: true, mode: 0o755 });
+  await chmod(customRoot, 0o755);
+  await mkdir(join(customRoot, 'nested'), { recursive: true });
+  await writeFile(
+    join(customRoot, 'nested', 'fake-agent.json'),
+    JSON.stringify({
+      kind: 'contestreplay.dev/agent',
+      schema_version: 1,
+      id: 'should-not-be-walked',
+      model: 'gpt-5.3-codex',
+      provider: 'p-strict',
+      harness: { kind: 'codex', version: '0.170.0', options: {} },
+    }),
+  );
+
+  // 2. Agent with escaping native_config.path & Contest with symlinked attachment -> NEVER followed, recorded valid=false with safe fixed issue!
+  const outsideNative = 'model_verbosity = "high"\n';
+  await writeFile(join(outsideDir, 'outside-native.toml'), outsideNative);
+  await writeFile(join(outsideDir, 'outside-att.txt'), 'secret outside');
+
+  await mkdir(join(base, 'agents'), { recursive: true });
+  await writeFile(
+    join(base, 'agents', 'esc-agent.json'),
+    JSON.stringify({
+      kind: 'contestreplay.dev/agent',
+      schema_version: 1,
+      id: 'esc-agent',
+      model: 'gpt-5.3-codex',
+      provider: 'p-strict',
+      harness: {
+        kind: 'codex',
+        version: '0.170.0',
+        options: {},
+        native_config: {
+          format: 'toml',
+          path: relative(join(base, 'agents'), join(outsideDir, 'outside-native.toml')),
+          sha256: sha256(outsideNative),
+        },
+      },
+    }),
+  );
+
+  const symContestDir = join(base, 'contests', 'sym-att');
+  await mkdir(symContestDir, { recursive: true });
+  await synthesizeTextContestPdf(
+    [{ id: 'A', title: 'Alpha', body: 'Solve A.' }],
+    join(symContestDir, 'problems.pdf'),
+    { title: 'Sym Att' },
+  );
+  await writeFile(
+    join(symContestDir, 'judge.json'),
+    JSON.stringify({ schema_version: 1, problems: [{ id: 'A', max_points: 100, accepted_answers: ['1'] }] }),
+  );
+  await symlink(join(outsideDir, 'outside-att.txt'), join(symContestDir, 'link-att.txt'));
+  await writeFile(
+    join(symContestDir, 'contest.json'),
+    JSON.stringify({
+      schema_version: 2,
+      contest_id: 'sym-att',
+      data_version: 1,
+      title: 'Sym Att Contest',
+      source: { name: 'Fixture' },
+      materials: {
+        entrypoint: { kind: 'pdf', path: 'problems.pdf' },
+        attachments: [{ name: 'att.txt', path: 'link-att.txt' }],
+      },
+      judge: { kind: 'local', answers: { path: 'judge.json' } },
+    }),
+  );
+
+  // 3. Two valid agent manifests with the SAME id ("dup-id") and DIFFERENT revisions (medium vs high)
+  const dupV1Path = join(base, 'agents', 'dup-v1.json');
+  const dupV2Path = join(base, 'agents', 'dup-v2.json');
+  await writeFile(
+    dupV1Path,
+    JSON.stringify({
+      kind: 'contestreplay.dev/agent',
+      schema_version: 1,
+      id: 'dup-id',
+      model: 'gpt-5.3-codex',
+      speed_tier: 'fast',
+      provider: 'p-strict',
+      harness: { kind: 'codex', version: '0.170.0', options: { reasoning_effort: 'medium' } },
+    }),
+  );
+  await writeFile(
+    dupV2Path,
+    JSON.stringify({
+      kind: 'contestreplay.dev/agent',
+      schema_version: 1,
+      id: 'dup-id',
+      model: 'gpt-5.3-codex',
+      speed_tier: 'fast',
+      provider: 'p-strict',
+      harness: { kind: 'codex', version: '0.170.0', options: { reasoning_effort: 'high' } },
+    }),
+  );
+
+  const validContestPath = await writeContestFixture(base, 'strict-r1', 1);
+  const loadedV1 = await loadAgent(dupV1Path, store);
+  const loadedContest = await loadContest(validContestPath);
+
+  // 4. Write runs that fail strict revision checks:
+  // (a) matching profile_sha256, DIFFERENT effective_sha256
+  await writeRunFixture(customRoot, {
+    runId: randomUUID(),
+    agentId: 'dup-id',
+    profileSha256: loadedV1.profileDigest,
+    effectiveSha256: 'f'.repeat(64),
+    speedTier: 'fast',
+    contestId: 'strict-r1',
+    dataVersion: 1,
+    contestRevision: loadedContest.contestRevision,
+    protocolSha256: protocolDigestForPreset('short'),
+    status: 'completed',
+    score: 100,
+    maxScore: 200,
+    createdAt: '2026-01-01T10:00:00.000Z',
+  });
+  // (b) matching profile+effective, MISSING contest_revision (and no contest_sha256)
+  await writeRunFixture(customRoot, {
+    runId: randomUUID(),
+    agentId: 'dup-id',
+    profileSha256: loadedV1.profileDigest,
+    effectiveSha256: loadedV1.effectiveDigest,
+    speedTier: 'fast',
+    contestId: 'strict-r1',
+    dataVersion: 1,
+    contestRevision: undefined,
+    protocolSha256: protocolDigestForPreset('short'),
+    status: 'completed',
+    score: 100,
+    maxScore: 200,
+    createdAt: '2026-01-01T11:00:00.000Z',
+  });
+  // (c) matching profile+effective+contest, MISSING protocol_sha256
+  await writeRunFixture(customRoot, {
+    runId: randomUUID(),
+    agentId: 'dup-id',
+    profileSha256: loadedV1.profileDigest,
+    effectiveSha256: loadedV1.effectiveDigest,
+    speedTier: 'fast',
+    contestId: 'strict-r1',
+    dataVersion: 1,
+    contestRevision: loadedContest.contestRevision,
+    protocolSha256: null,
+    status: 'completed',
+    score: 100,
+    maxScore: 200,
+    createdAt: '2026-01-01T12:00:00.000Z',
+  });
+  // (d) matching profile+effective+contest+protocol, NULL speed_tier against 'fast' agent
+  await writeRunFixture(customRoot, {
+    runId: randomUUID(),
+    agentId: 'dup-id',
+    profileSha256: loadedV1.profileDigest,
+    effectiveSha256: loadedV1.effectiveDigest,
+    speedTier: null,
+    contestId: 'strict-r1',
+    dataVersion: 1,
+    contestRevision: loadedContest.contestRevision,
+    protocolSha256: protocolDigestForPreset('short'),
+    status: 'completed',
+    score: 100,
+    maxScore: 200,
+    createdAt: '2026-01-01T13:00:00.000Z',
+  });
+
+  const index = new WorkspaceIndex(customRoot);
+  t.after(() => index.close());
+  // Parent directory tightened to 0o700
+  const rootStat = await stat(customRoot);
+  assert.equal(rootStat.mode & 0o077, 0);
+
+  await index.sync({ base, root: customRoot, store });
+
+  // Custom root inside base was NOT walked!
+  const allAgents = index.listAgents();
+  assert.ok(!allAgents.items.some(a => a.id === 'should-not-be-walked'));
+
+  // Escaping agent and symlinked-attachment contest both recorded invalid with safe fixed issue!
+  const escAgent = allAgents.items.find(a => a.id === 'esc-agent');
+  assert.ok(escAgent);
+  assert.equal(escAgent.valid, false);
+  assert.deepEqual(escAgent.issues, ['Dependency escapes workspace or traverses a symlink']);
+
+  const symContest = index.listContests().items.find(c => c.id === 'sym-att');
+  assert.ok(symContest);
+  assert.equal(symContest.valid, false);
+  assert.deepEqual(symContest.issues, ['Dependency escapes workspace or traverses a symlink']);
+
+  // Both duplicate-ID valid agent manifests are preserved in queryCoverage & findUncoveredCells!
+  const cov = index.queryCoverage({ agentIds: ['dup-id'], contestIds: ['strict-r1'] });
+  assert.equal(cov.length, 2);
+  assert.deepEqual(cov.map(c => c.agent_path).sort(), ['agents/dup-v1.json', 'agents/dup-v2.json']);
+
+  // NONE of the 4 strict-mismatch runs credited as current completion; all 4 counted in historical totals!
+  for (const cell of cov) {
+    assert.equal(cell.completed_count, 0);
+    assert.equal(cell.total_runs, 0);
+    assert.equal(cell.historical_completed_count, 4);
+    assert.equal(cell.historical_total_runs, 4);
+  }
+  const gaps = index.findUncoveredCells({ agentIds: ['dup-id'], contestIds: ['strict-r1'] });
+  assert.equal(gaps.total_gaps, 2);
+  assert.deepEqual(gaps.cells.map(g => g.agent).sort(), ['agents/dup-v1.json', 'agents/dup-v2.json']);
 });

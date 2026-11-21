@@ -937,4 +937,227 @@ test('CLI deterministic exit codes for missing args, unknown commands/flags, --s
   const missingPdf = runCli(['contest', 'inspect-pdf', join(base, 'does-not-exist.pdf'), '--json']);
   assert.notEqual(missingPdf.status, 0);
   assert.equal(JSON.parse(missingPdf.stdout).ok, false);
+
+  // 7. cr bench run (no args), cr bench run contest.json --json (missing --agent), and cr studio --port 99999 --json all exit 3!
+  const benchNoArgs = runCli(['bench', 'run', '--json']);
+  assert.equal(benchNoArgs.status, 3, benchNoArgs.stdout + benchNoArgs.stderr);
+  assert.equal(JSON.parse(benchNoArgs.stdout).code, 'validation_error');
+
+  const benchNoArgsPlain = runCli(['bench', 'run']);
+  assert.equal(benchNoArgsPlain.status, 3, benchNoArgsPlain.stdout + benchNoArgsPlain.stderr);
+
+  const benchMissingAgent = runCli(['bench', 'run', 'examples/demo/contest.json', '--json']);
+  assert.equal(benchMissingAgent.status, 3, benchMissingAgent.stdout + benchMissingAgent.stderr);
+  assert.equal(JSON.parse(benchMissingAgent.stdout).code, 'validation_error');
+
+  const studioBadPort = runCli(['studio', '--port', '99999', '--json']);
+  assert.equal(studioBadPort.status, 3, studioBadPort.stdout + studioBadPort.stderr);
+  assert.equal(JSON.parse(studioBadPort.stdout).code, 'validation_error');
+
+  // 8. Malformed automation JSON input files return fixed diagnostic without echoing private text!
+  const SECRET_EXCERPT = 'PRIVATE_MALFORMED_SECRET_TEXT_77777';
+  const badJsonPath = join(base, 'malformed.json');
+  await writeFile(badJsonPath, `{ invalid json ${SECRET_EXCERPT} `);
+  for (const cmdArgs of [
+    ['agent', 'batch-apply', badJsonPath, '--base', base, '--json'],
+    ['agent', 'variants', badJsonPath, '--base', base, '--json'],
+    ['contest', 'batch-import', badJsonPath, '--workspace', root, '--base', base, '--json'],
+    ['contest', 'synth-pdf', badJsonPath, '--out', join(base, 'never.pdf'), '--json'],
+  ]) {
+    const res = runCli(cmdArgs);
+    assert.equal(res.status, 3, `${cmdArgs.join(' ')}: ${res.stdout}${res.stderr}`);
+    const parsed = JSON.parse(res.stdout);
+    assert.equal(parsed.ok, false);
+    assert.equal(parsed.code, 'validation_error');
+    assert.equal(parsed.error, 'Invalid JSON input file');
+    assert.ok(!res.stdout.includes(SECRET_EXCERPT), `Leaked private text for ${cmdArgs.join(' ')}`);
+    assert.ok(!res.stderr.includes(SECRET_EXCERPT), `Leaked private text on stderr for ${cmdArgs.join(' ')}`);
+  }
+});
+
+test('MCP cr_catalog_list invokes 0 secret methods via prototype spy, and cr_plan_preview blocks forbidden filenames, content-based judge attachments, and malformed JSON leakage', async t => {
+  const prevStorage = process.env.CR_CREDENTIAL_STORAGE;
+  process.env.CR_CREDENTIAL_STORAGE = 'file';
+  t.after(() => {
+    if (prevStorage === undefined) delete process.env.CR_CREDENTIAL_STORAGE;
+    else process.env.CR_CREDENTIAL_STORAGE = prevStorage;
+  });
+
+  const base = await makeTempDir(t, 'cr-mcp-spy-base-');
+  const root = await makeTempDir(t, 'cr-mcp-spy-root-');
+  const connDir = await makeTempDir(t, 'cr-mcp-spy-conn-');
+  const ojDir = await makeTempDir(t, 'cr-mcp-spy-oj-');
+  await chmod(connDir, 0o700);
+  await chmod(ojDir, 0o700);
+
+  const store = new Connections(connDir);
+  await store.create({
+    id: 'p-spy',
+    label: 'Spy Provider',
+    protocol: 'responses',
+    base_url: 'https://api.openai.com/v1',
+    secret: 'sk-spy-secret-0000',
+  });
+
+  const ojAccounts = new OjAccounts(ojDir);
+  await ojAccounts.create({
+    id: 'cf-spy',
+    label: 'Spy OJ',
+    platform: 'codeforces',
+    handle: 'spy_bot',
+    pool: 'spy-pool',
+    transport: 'cookie',
+    secret: 'JSESSIONID=SPY_SECRET_0000',
+  });
+
+  const server = createWorkbenchMcpServer({
+    base,
+    root,
+    store,
+    ojAccounts,
+    useExternalPdfTools: false,
+  });
+  const client = new Client({ name: 'test-spy-client', version: '1.0.0' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  t.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  // 1. Prototype call-counter spy proving 0 calls to secret/status-probing methods during cr_catalog_list!
+  const spyCounts = {
+    ojResolveSecret: 0,
+    ojGet: 0,
+    ojList: 0,
+    connKey: 0,
+    connProvider: 0,
+    connListProviders: 0,
+  };
+  const origOjResolveSecret = OjAccounts.prototype.resolveSecret;
+  const origOjGet = OjAccounts.prototype.get;
+  const origOjList = OjAccounts.prototype.list;
+  const origConnKey = Connections.prototype.key;
+  const origConnProvider = Connections.prototype.provider;
+  const origConnListProviders = Connections.prototype.listProviders;
+
+  OjAccounts.prototype.resolveSecret = function (...args) {
+    spyCounts.ojResolveSecret++;
+    return origOjResolveSecret.apply(this, args);
+  };
+  OjAccounts.prototype.get = function (...args) {
+    spyCounts.ojGet++;
+    return origOjGet.apply(this, args);
+  };
+  OjAccounts.prototype.list = function (...args) {
+    spyCounts.ojList++;
+    return origOjList.apply(this, args);
+  };
+  Connections.prototype.key = function (...args) {
+    spyCounts.connKey++;
+    return origConnKey.apply(this, args);
+  };
+  Connections.prototype.provider = function (...args) {
+    spyCounts.connProvider++;
+    return origConnProvider.apply(this, args);
+  };
+  Connections.prototype.listProviders = function (...args) {
+    spyCounts.connListProviders++;
+    return origConnListProviders.apply(this, args);
+  };
+
+  try {
+    for (const kind of ['providers', 'oj_accounts', 'agents', 'contests']) {
+      const res = parseToolJson(await client.callTool({ name: 'cr_catalog_list', arguments: { kind } }));
+      assert.equal(res.data.ok, true);
+    }
+    assert.deepEqual(spyCounts, {
+      ojResolveSecret: 0,
+      ojGet: 0,
+      ojList: 0,
+      connKey: 0,
+      connProvider: 0,
+      connListProviders: 0,
+    });
+  } finally {
+    OjAccounts.prototype.resolveSecret = origOjResolveSecret;
+    OjAccounts.prototype.get = origOjGet;
+    OjAccounts.prototype.list = origOjList;
+    Connections.prototype.key = origConnKey;
+    Connections.prototype.provider = origConnProvider;
+    Connections.prototype.listProviders = origConnListProviders;
+  }
+
+  // 2. cr_plan_preview rejects judge.json / package.json as contest or attachment, rejects disguised judge attachments, and sanitizes malformed JSON!
+  await mkdir(join(base, 'agents'), { recursive: true });
+  await mkdir(join(base, 'contests'), { recursive: true });
+  await writeFile(
+    join(base, 'agents', 'a1.json'),
+    JSON.stringify({
+      kind: 'contestreplay.dev/agent',
+      schema_version: 1,
+      id: 'a1',
+      model: 'gpt-5.3-codex',
+      provider: 'p-spy',
+      harness: { kind: 'codex', version: '0.170.0', options: {} },
+    }),
+  );
+  await synthesizeTextContestPdf(
+    [{ id: 'A', title: 'Alpha', body: 'Solve A.' }],
+    join(base, 'contests', 'p.pdf'),
+    { title: 'P' },
+  );
+  const judgeBody = JSON.stringify({
+    schema_version: 1,
+    problems: [{ id: 'A', max_points: 100, accepted_answers: ['42'] }],
+  });
+  await writeFile(join(base, 'contests', 'judge.json'), judgeBody);
+  await writeFile(join(base, 'contests', 'package.json'), '{"name":"pkg"}');
+  await writeFile(join(base, 'contests', 'disguised.txt'), judgeBody);
+
+  // 2a. Top-level judge.json / package.json rejected
+  for (const badContest of ['contests/judge.json', 'contests/package.json']) {
+    const res = await client.callTool({
+      name: 'cr_plan_preview',
+      arguments: { spec: { schema_version: 2, cells: [{ agent: 'agents/a1.json', contest: badContest }] } },
+    });
+    assert.equal(res.isError, true, `expected ${badContest} to be rejected in cr_plan_preview`);
+  }
+
+  // 2b. judge.json, package.json, and disguised.txt rejected as attachments in cr_plan_preview
+  for (const att of ['judge.json', 'package.json', 'disguised.txt']) {
+    const manifestName = `contests/bad-att-${att.replace(/\./g, '-')}.json`;
+    await writeFile(
+      join(base, manifestName),
+      JSON.stringify({
+        schema_version: 2,
+        contest_id: 'bad-att',
+        data_version: 1,
+        title: 'Bad Att',
+        source: { name: 'Local' },
+        materials: {
+          entrypoint: { kind: 'pdf', path: 'p.pdf' },
+          attachments: [{ name: 'att.dat', path: att }],
+        },
+        judge: { kind: 'local', answers: { path: 'judge.json' } },
+      }),
+    );
+    const res = await client.callTool({
+      name: 'cr_plan_preview',
+      arguments: { spec: { schema_version: 2, cells: [{ agent: 'agents/a1.json', contest: manifestName }] } },
+    });
+    assert.equal(res.isError, true, `expected attachment ${att} to be rejected in cr_plan_preview`);
+  }
+
+  // 2c. Malformed JSON in cr_plan_preview MUST NOT echo private file text!
+  const SECRET_LINE = 'TOP_SECRET_MALFORMED_CONTEST_LINE_54321';
+  await writeFile(join(base, 'contests', 'broken.json'), `{ broken json ${SECRET_LINE} `);
+  const brokenRes = await client.callTool({
+    name: 'cr_plan_preview',
+    arguments: { spec: { schema_version: 2, cells: [{ agent: 'agents/a1.json', contest: 'contests/broken.json' }] } },
+  });
+  assert.equal(brokenRes.isError, true);
+  const brokenText = parseToolJson(brokenRes).text;
+  assert.ok(!brokenText.includes(SECRET_LINE), 'Leaked raw malformed JSON content in cr_plan_preview!');
+  assert.match(brokenText, /Invalid JSON: contests\/broken\.json/);
 });

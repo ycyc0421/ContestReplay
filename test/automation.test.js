@@ -851,3 +851,244 @@ test('overwrite identity checks, pre-existing auxiliary files, intra-batch colli
   assert.equal(badOutDir.ok, false);
   assert.equal(badOutDir.errors[0].code, 'path_error');
 });
+
+test('forbidden public filenames, content-based judge attachment rejection, size limits parity, symlinked-base path rewriting, and hash-verified rollback', async t => {
+  const realBase = await makeTempDir(t, 'cr-polish-real-');
+  const linkHolder = await makeTempDir(t, 'cr-polish-link-');
+  const root = await makeTempDir(t, 'cr-polish-root-');
+  const connDir = await makeTempDir(t, 'cr-polish-conn-');
+  await chmod(connDir, 0o700);
+  const store = new Connections(connDir);
+  await store.create({
+    id: 'p-polish',
+    label: 'Polish Provider',
+    protocol: 'responses',
+    base_url: 'https://api.openai.com/v1',
+    secret: 'sk-polish-secret-1234',
+  });
+
+  const symBase = join(linkHolder, 'ws-link');
+  await symlink(realBase, symBase);
+
+  const agentDoc = (id) => ({
+    kind: 'contestreplay.dev/agent',
+    schema_version: 1,
+    id,
+    model: 'gpt-5.3-codex',
+    provider: 'p-polish',
+    harness: { kind: 'codex', version: '0.170.0', options: { reasoning_effort: 'medium' } },
+  });
+
+  // 1. Forbidden public filenames rejected on CREATE (non-existent targets) for BOTH agents and contests!
+  for (const forbidden of ['agents/judge.json', 'agents/foo.judge.json', 'agents/package.json', 'agents/run.json']) {
+    const res = await batchApplyAgents(
+      [{ file: forbidden, format: 'json', document: agentDoc('forbid-a') }],
+      { base: realBase, root, store, dryRun: false, ifExists: 'error' },
+    );
+    assert.equal(res.ok, false, `expected ${forbidden} to be rejected for agent create`);
+    assert.equal(await exists(join(realBase, forbidden)), false);
+  }
+
+  for (const forbidden of ['contests/judge.json', 'contests/foo.judge.json', 'contests/package.json', 'contests/run.json']) {
+    const res = await batchImportContests(
+      [{
+        file: forbidden,
+        document: {
+          schema_version: 2,
+          contest_id: 'forbid-c',
+          data_version: 1,
+          title: 'Forbidden',
+          source: { name: 'Test' },
+          judge: { kind: 'local', problems: [{ id: 'A', max_points: 100, accepted_answers: ['1'] }] },
+        },
+        synth_problems: [{ id: 'A', title: 'A', body: 'Solve A.' }],
+      }],
+      { root, base: realBase, dryRun: false, ifExists: 'error' },
+    );
+    assert.equal(res.ok, false, `expected ${forbidden} to be rejected for contest create`);
+    assert.equal(await exists(join(realBase, forbidden)), false);
+  }
+
+  // 2. judge.json, package.json, run.json, AND arbitrary-extension JSON judge answer file rejected as attachments!
+  await mkdir(join(realBase, 'contests'), { recursive: true });
+  await synthesizeTextContestPdf(
+    [{ id: 'A', title: 'Alpha', body: 'Solve A.' }],
+    join(realBase, 'contests', 'base.pdf'),
+    { title: 'Base PDF' },
+  );
+  const validJudgeJson = JSON.stringify({
+    schema_version: 1,
+    problems: [{ id: 'A', max_points: 100, accepted_answers: ['secret-42'] }],
+  });
+  await writeFile(join(realBase, 'contests', 'answers.judge.json'), validJudgeJson);
+  await writeFile(join(realBase, 'contests', 'judge.json'), validJudgeJson);
+  await writeFile(join(realBase, 'contests', 'package.json'), '{"name":"pkg"}');
+  await writeFile(join(realBase, 'contests', 'run.json'), '{"run_id":"r1"}');
+  await writeFile(join(realBase, 'contests', 'disguised-answers.txt'), validJudgeJson);
+
+  for (const attFile of ['judge.json', 'package.json', 'run.json', 'disguised-answers.txt']) {
+    const res = await batchImportContests(
+      [{
+        file: 'contests/att-check.json',
+        document: {
+          schema_version: 2,
+          contest_id: 'att-check',
+          data_version: 1,
+          title: 'Att Check',
+          source: { name: 'Test' },
+          materials: {
+            entrypoint: { kind: 'pdf', path: 'base.pdf' },
+            attachments: [{ name: 'leaked.dat', path: attFile }],
+          },
+          judge: { kind: 'local', answers: { path: 'answers.judge.json' } },
+        },
+      }],
+      { root, base: realBase, dryRun: true },
+    );
+    assert.equal(res.ok, false, `expected attachment ${attFile} to be rejected`);
+  }
+
+  // 3. > 4,000,000-byte judge table rejected identically in BOTH dryRun: true and dryRun: false with ZERO files written
+  const hugeAnswers = Array.from({ length: 1200 }, () => 'x'.repeat(3500));
+  const hugeJudgeItem = {
+    file: 'contests/huge-judge.json',
+    document: {
+      schema_version: 2,
+      contest_id: 'huge-judge',
+      data_version: 1,
+      title: 'Huge Judge',
+      source: { name: 'Test' },
+      judge: {
+        kind: 'local',
+        problems: [{ id: 'A', max_points: 100, accepted_answers: hugeAnswers }],
+      },
+    },
+    synth_problems: [{ id: 'A', title: 'A', body: 'A' }],
+  };
+  const hugeJudgeDry = await batchImportContests([hugeJudgeItem], { root, base: realBase, dryRun: true });
+  const hugeJudgeLive = await batchImportContests([hugeJudgeItem], { root, base: realBase, dryRun: false });
+  assert.equal(hugeJudgeDry.ok, false);
+  assert.equal(hugeJudgeLive.ok, false);
+  assert.match(hugeJudgeDry.errors[0].message, /4000000/);
+  assert.match(hugeJudgeLive.errors[0].message, /4000000/);
+  assert.equal(await exists(join(realBase, 'contests', 'huge-judge.json')), false);
+  assert.equal(await exists(join(realBase, 'contests', 'huge-judge.pdf')), false);
+  assert.equal(await exists(join(realBase, 'contests', 'huge-judge.judge.json')), false);
+
+  // 4. > 1,000,000-byte contest manifest rejected identically in BOTH dryRun: true and dryRun: false with ZERO files written
+  const hugeTitle = 'T'.repeat(1_000_500);
+  const hugeManifestItem = {
+    file: 'contests/huge-manifest.json',
+    document: {
+      schema_version: 2,
+      contest_id: 'huge-manifest',
+      data_version: 1,
+      title: hugeTitle,
+      source: { name: 'Test' },
+      judge: { kind: 'local', problems: [{ id: 'A', max_points: 100, accepted_answers: ['1'] }] },
+    },
+    synth_problems: [{ id: 'A', title: 'A', body: 'A' }],
+  };
+  const hugeManDry = await batchImportContests([hugeManifestItem], { root, base: realBase, dryRun: true });
+  const hugeManLive = await batchImportContests([hugeManifestItem], { root, base: realBase, dryRun: false });
+  assert.equal(hugeManDry.ok, false);
+  assert.equal(hugeManLive.ok, false);
+  assert.match(hugeManDry.errors[0].message, /1000000/);
+  assert.match(hugeManLive.errors[0].message, /1000000/);
+  assert.equal(await exists(join(realBase, 'contests', 'huge-manifest.json')), false);
+  assert.equal(await exists(join(realBase, 'contests', 'huge-manifest.pdf')), false);
+  assert.equal(await exists(join(realBase, 'contests', 'huge-manifest.judge.json')), false);
+
+  // 5. Absolute transitive paths under symlinked base are rewritten to relative paths before saving!
+  await mkdir(join(realBase, 'agents'), { recursive: true });
+  await mkdir(join(realBase, 'shared'), { recursive: true });
+  const nativeText = 'model_verbosity = "high"\n';
+  await writeFile(join(realBase, 'shared', 'override.toml'), nativeText);
+  await writeFile(join(realBase, 'shared', 'helper.txt'), 'helper content\n');
+
+  const absAgentRes = await batchApplyAgents(
+    [{
+      file: join(symBase, 'agents', 'rel-agent.json'),
+      format: 'json',
+      document: {
+        ...agentDoc('rel-agent'),
+        harness: {
+          kind: 'codex',
+          version: '0.170.0',
+          options: { reasoning_effort: 'high' },
+          native_config: {
+            format: 'toml',
+            path: join(symBase, 'shared', 'override.toml'),
+            sha256: sha256(nativeText),
+          },
+        },
+      },
+    }],
+    { base: symBase, root, store, dryRun: false, ifExists: 'error' },
+  );
+  assert.equal(absAgentRes.ok, true, JSON.stringify(absAgentRes.errors));
+  const savedAgentJson = JSON.parse(await readFile(join(realBase, 'agents', 'rel-agent.json'), 'utf8'));
+  assert.equal(savedAgentJson.harness.native_config.path, '../shared/override.toml');
+  const reloadedAgent = await loadAgent(join(realBase, 'agents', 'rel-agent.json'), store);
+  assert.equal(reloadedAgent.agent.agent_id, 'rel-agent');
+
+  const absContestRes = await batchImportContests(
+    [{
+      file: join(symBase, 'contests', 'rel-contest.json'),
+      document: {
+        schema_version: 2,
+        contest_id: 'rel-contest',
+        data_version: 1,
+        title: 'Rebased Paths Contest',
+        source: { name: 'Test' },
+        materials: {
+          entrypoint: { kind: 'pdf', path: join(symBase, 'contests', 'base.pdf') },
+          attachments: [{ name: 'helper.txt', path: join(symBase, 'shared', 'helper.txt') }],
+        },
+        judge: { kind: 'local', answers: { path: join(symBase, 'contests', 'answers.judge.json') } },
+      },
+    }],
+    { root, base: symBase, dryRun: false, ifExists: 'error' },
+  );
+  assert.equal(absContestRes.ok, true, JSON.stringify(absContestRes.errors));
+  const savedContestJson = JSON.parse(await readFile(join(realBase, 'contests', 'rel-contest.json'), 'utf8'));
+  assert.equal(savedContestJson.materials.entrypoint.path, 'base.pdf');
+  assert.equal(savedContestJson.materials.attachments[0].path, '../shared/helper.txt');
+  assert.equal(savedContestJson.judge.answers.path, 'answers.judge.json');
+  const reloadedContest = await loadContest(join(realBase, 'contests', 'rel-contest.json'));
+  assert.equal(reloadedContest.contest.contest_id, 'rel-contest');
+
+  // 6. Rollback verifies sha256 and NEVER clobbers an externally modified file, reporting rollback issues explicitly!
+  const externalContent = '# CONCURRENT WRITER CONTENT\n';
+  let registerCount = 0;
+  const racingStore = Object.create(store);
+  racingStore.register = async (providerId, filePath, writeFn) => {
+    registerCount++;
+    if (registerCount === 1) {
+      await store.register(providerId, filePath, writeFn);
+      // Simulate concurrent external writer modifying item 0 after this batch wrote it!
+      await writeFile(filePath, externalContent, { mode: 0o600 });
+      return;
+    }
+    throw new Error('simulated publish failure on item 2');
+  };
+
+  await assert.rejects(
+    () =>
+      batchApplyAgents(
+        [
+          { file: 'agents/race-1.toml', format: 'toml', document: agentDoc('race-1') },
+          { file: 'agents/race-2.toml', format: 'toml', document: agentDoc('race-2') },
+        ],
+        { base: realBase, root, store: racingStore, dryRun: false, ifExists: 'error' },
+      ),
+    err => {
+      assert.match(err.message, /simulated publish failure on item 2/);
+      assert.match(err.message, /rollback issues.*modified concurrently/i);
+      return true;
+    },
+  );
+  // Externally modified file MUST NOT be deleted or overwritten by rollback!
+  assert.equal(await readFile(join(realBase, 'agents', 'race-1.toml'), 'utf8'), externalContent);
+  assert.equal(await exists(join(realBase, 'agents', 'race-2.toml')), false);
+});
