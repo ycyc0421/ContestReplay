@@ -95,6 +95,21 @@ async function readSecretStdin(maxLength: number, label: string): Promise<string
   return trimmed;
 }
 
+function sanitizeParseArgsError(code: string, message: string): string {
+  if (code === 'ERR_PARSE_ARGS_UNKNOWN_OPTION') {
+    const match = message.match(/Unknown option '(--?[A-Za-z0-9][A-Za-z0-9_-]{0,63})'/);
+    return match ? `Unknown option ${match[1]}` : 'Unknown command-line option';
+  }
+  if (code === 'ERR_PARSE_ARGS_INVALID_OPTION_VALUE') {
+    const match = message.match(/Option '(--?[A-Za-z0-9][A-Za-z0-9_-]{0,63})/);
+    return match ? `Invalid value for option ${match[1]}` : 'Invalid command-line option value';
+  }
+  if (code === 'ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL') {
+    return 'Unexpected positional argument';
+  }
+  return 'Invalid command-line arguments';
+}
+
 function classifyCliError(error: unknown, started: boolean, structured: boolean): { exitCode: number; code: string; message: string } {
   if (started) {
     return { exitCode: 2, code: 'run_failed', message: 'Run failed while recording results; see the run directory.' };
@@ -102,7 +117,11 @@ function classifyCliError(error: unknown, started: boolean, structured: boolean)
   if (error instanceof CliError) {
     return { exitCode: error.exitCode, code: error.code, message: error.message };
   }
+  const errCode = (error as NodeJS.ErrnoException)?.code;
   const message = error instanceof Error ? error.message : 'Command failed';
+  if (typeof errCode === 'string' && errCode.startsWith('ERR_PARSE_ARGS_')) {
+    return { exitCode: 3, code: 'validation_error', message: sanitizeParseArgsError(errCode, message) };
+  }
   if (!structured) {
     return { exitCode: 1, code: 'error', message };
   }
@@ -122,10 +141,10 @@ function classifyCliError(error: unknown, started: boolean, structured: boolean)
     if (error.status === 404 || error.status === 503) return { exitCode: 4, code: 'missing_credential', message };
     return { exitCode: 1, code: 'error', message };
   }
-  if ((error as NodeJS.ErrnoException)?.code === 'EEXIST') {
+  if (errCode === 'EEXIST') {
     return { exitCode: 3, code: 'conflict', message };
   }
-  if (/Set [A-Z0-9_]+ in the runner environment|Approve the endpoint|credential unavailable|missing_model_key|secret-stdin/i.test(message)) {
+  if (/Set [A-Z0-9_]+ in the runner environment|Approve the endpoint|credential unavailable|missing_model_key|Pipe the .* via stdin with --secret-stdin/i.test(message)) {
     return { exitCode: 4, code: 'missing_credential', message };
   }
   return { exitCode: 1, code: 'error', message };
@@ -145,7 +164,7 @@ function unwrapBatchArray(raw: unknown): unknown[] {
   throw new CliError('Expected a JSON array or an object with an "items" array', 3, 'validation_error');
 }
 function position(list: string[], optional = false) {
-  if (list.length > 1 || (!optional && list.length !== 1)) throw new Error(usage);
+  if (list.length > 1 || (!optional && list.length !== 1)) throw new CliError(usage, 3, 'validation_error');
   return list[0];
 }
 async function abortable<T>(fn: (signal: AbortSignal) => Promise<T>) {
@@ -477,7 +496,7 @@ async function main(args: string[]) {
       const info = await inspectPdf(pdfFile);
       const preset = protocolPresets[presetName];
       const limits = checkPdfLimits(info, { maxPages: preset.pdfMaxPages, maxBytes: preset.pdfMaxBytes });
-      if (v.json) print({ ok: limits.ok, protocol_preset: presetName, info, limits });
+      if (v.json) print({ ok: true, protocol_preset: presetName, info, limits });
       else {
         console.log(`${info.path}: ${info.page_count} page(s), ${info.size_bytes} bytes, problems=[${info.problem_ids.join(', ')}]`);
         if (!limits.ok) for (const iss of limits.issues) console.error(`limit warning: ${iss}`);
@@ -540,20 +559,44 @@ async function main(args: string[]) {
         const contestIds = v.contest?.length ? v.contest : undefined;
         if (v['emit-spec']) {
           const diff = index.findUncoveredCells({ agentIds, contestIds, minRepeats });
-          print(toBatchSpec(diff));
+          const spec = toBatchSpec(diff);
+          if (v.json) {
+            print({
+              ok: true,
+              total_gaps: diff.total_gaps,
+              waves_required: diff.waves_required,
+              truncated: diff.truncated,
+              incompatible_skipped: diff.incompatible_skipped,
+              batch_spec: spec,
+            });
+          } else {
+            print(spec);
+          }
           return 0;
         }
         if (v['missing-only']) {
           const diff = index.findUncoveredCells({ agentIds, contestIds, minRepeats });
-          if (v.json) print({ ok: true, ...diff });
+          if (v.json) print({ ok: true, ...diff, batch_spec: toBatchSpec(diff) });
           else for (const cell of diff.cells) console.log(`${cell.agent_id} × ${cell.contest_id}@v${cell.data_version}: ${cell.reason} (missing ${cell.missing_repeats})`);
           return 0;
         }
         const cells = index.queryCoverage({ agentIds, contestIds });
         const diff = index.findUncoveredCells({ agentIds, contestIds, minRepeats });
-        if (v.json) print({ ok: true, cells, total_cells: cells.length, total_gaps: diff.total_gaps, gaps: diff.cells });
+        if (v.json) {
+          print({
+            ok: true,
+            cells,
+            total_cells: cells.length,
+            total_gaps: diff.total_gaps,
+            waves_required: diff.waves_required,
+            truncated: diff.truncated,
+            incompatible_skipped: diff.incompatible_skipped,
+            gaps: diff.cells,
+            batch_spec: toBatchSpec(diff),
+          });
+        }
         else for (const cell of cells) {
-          console.log(`${cell.agent_id} × ${cell.contest_id}@v${cell.data_version}: completed=${cell.completed_count} void=${cell.void_count} total=${cell.total_runs} latest=${cell.latest_status ?? 'unrun'}`);
+          console.log(`${cell.agent_id} × ${cell.contest_id}@v${cell.data_version}: completed=${cell.completed_count} void=${cell.void_count} running=${cell.running_count} total=${cell.total_runs} latest=${cell.latest_status ?? 'unrun'}`);
         }
         return 0;
       } finally {
@@ -730,7 +773,7 @@ async function main(args: string[]) {
       await abortable(async signal => { await serveStudio(workdir(values.workspace), port, signal); });
       return 0;
     }
-    throw new Error(usage);
+    throw new CliError(usage, 3, 'validation_error');
   } catch (error) {
     const classified = classifyCliError(error, started, wantsJson || isAutomationCommand);
     if (wantsJson && !isMcp) {

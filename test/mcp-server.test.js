@@ -2,14 +2,16 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { sha256 } from '../dist/config.js';
 import { Connections } from '../dist/connections.js';
 import { createWorkbenchMcpServer } from '../dist/mcp-server.js';
 import { OjAccounts } from '../dist/oj-accounts.js';
+import { synthesizeTextContestPdf } from '../dist/pdf-synth.js';
 import { verifyPushSignature } from '../dist/push.js';
 
 async function makeTempDir(t, prefix) {
@@ -463,4 +465,476 @@ test('CLI automation --json subcommands, oj-account, push-target, coverage, pdf 
   const pushRem = runCli(['push-target', 'remove', 'hook1', '--json']);
   assert.equal(pushRem.status, 0);
   assert.equal(JSON.parse(pushRem.stdout).removed, 'hook1');
+});
+
+test('MCP zero-secret-read catalog, symlinked base validation, write prefix & overwrite guards, and cr_plan_preview parity', async t => {
+  const prevStorage = process.env.CR_CREDENTIAL_STORAGE;
+  process.env.CR_CREDENTIAL_STORAGE = 'file';
+  t.after(() => {
+    if (prevStorage === undefined) delete process.env.CR_CREDENTIAL_STORAGE;
+    else process.env.CR_CREDENTIAL_STORAGE = prevStorage;
+  });
+
+  const realBase = await makeTempDir(t, 'cr-mcp-hard-base-');
+  const linkHolder = await makeTempDir(t, 'cr-mcp-hard-link-');
+  const outsideDir = await makeTempDir(t, 'cr-mcp-hard-out-');
+  const root = await makeTempDir(t, 'cr-mcp-hard-root-');
+  const connDir = await makeTempDir(t, 'cr-mcp-hard-conn-');
+  const ojDir = await makeTempDir(t, 'cr-mcp-hard-oj-');
+  await chmod(connDir, 0o700);
+  await chmod(ojDir, 0o700);
+
+  const symBase = join(linkHolder, 'ws-link');
+  await symlink(realBase, symBase);
+
+  const store = new Connections(connDir);
+  await store.create({
+    id: 'p-locked',
+    label: 'Locked Provider',
+    protocol: 'responses',
+    base_url: 'https://api.openai.com/v1',
+    secret: 'sk-locked-secret-0000',
+    supports_fast: true,
+  });
+
+  const ojAccounts = new OjAccounts(ojDir);
+  await ojAccounts.create({
+    id: 'cf-locked',
+    label: 'Locked OJ',
+    platform: 'codeforces',
+    handle: 'locked_bot',
+    pool: 'locked-pool',
+    transport: 'cookie',
+    secret: 'JSESSIONID=LOCKED_SECRET_0000',
+  });
+
+  // Lock down ALL credential secret files to mode 0o000 (skip assertion only if running as root uid 0).
+  const lockedPaths = [];
+  for (const dir of [join(connDir, 'credentials'), join(ojDir, 'credentials')]) {
+    const files = await readdir(dir);
+    assert.ok(files.length >= 1, `expected credential file in ${dir}`);
+    for (const f of files) {
+      const full = join(dir, f);
+      await chmod(full, 0o000);
+      lockedPaths.push(full);
+    }
+  }
+  t.after(async () => {
+    for (const p of lockedPaths) {
+      await chmod(p, 0o600).catch(() => {});
+    }
+  });
+
+  const server = createWorkbenchMcpServer({
+    base: symBase,
+    root,
+    store,
+    ojAccounts,
+    useExternalPdfTools: false,
+  });
+  const client = new Client({ name: 'test-hardening-client', version: '1.0.0' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  t.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  // 1. cr_catalog_list (providers & oj_accounts) succeeds EVEN WITH 0o000 secret files -> ZERO secret reads!
+  const provList = parseToolJson(await client.callTool({ name: 'cr_catalog_list', arguments: { kind: 'providers' } }));
+  assert.equal(provList.data.ok, true);
+  assert.equal(provList.data.total, 1);
+  assert.equal(provList.data.items[0].id, 'p-locked');
+  assert.ok(!provList.text.includes('sk-locked-secret-0000'));
+
+  const ojList = parseToolJson(await client.callTool({ name: 'cr_catalog_list', arguments: { kind: 'oj_accounts' } }));
+  assert.equal(ojList.data.ok, true);
+  assert.equal(ojList.data.total, 1);
+  assert.equal(ojList.data.items[0].id, 'cf-locked');
+  assert.ok(!ojList.text.includes('LOCKED_SECRET_0000'));
+
+  // 2. cr_agent_validate works under symlinked base and rejects escaping native_config.path
+  const validAgentDoc = {
+    kind: 'contestreplay.dev/agent',
+    schema_version: 1,
+    id: 'sym-val-agent',
+    model: 'gpt-5.3-codex',
+    provider: 'p-locked',
+    harness: { kind: 'codex', version: '0.170.0', options: { reasoning_effort: 'medium' } },
+  };
+  const valSym = parseToolJson(await client.callTool({ name: 'cr_agent_validate', arguments: { document: validAgentDoc } }));
+  assert.equal(valSym.data.ok, true);
+  assert.equal(valSym.data.valid, true);
+
+  const outNativeText = 'model_verbosity = "low"\n';
+  await writeFile(join(outsideDir, 'escape-native.toml'), outNativeText);
+  const relEscNative = relative(join(realBase, 'agents'), join(outsideDir, 'escape-native.toml'));
+  const valEsc = await client.callTool({
+    name: 'cr_agent_validate',
+    arguments: {
+      document: {
+        ...validAgentDoc,
+        harness: {
+          ...validAgentDoc.harness,
+          native_config: { format: 'toml', path: relEscNative, sha256: sha256(outNativeText) },
+        },
+      },
+    },
+  });
+  assert.equal(valEsc.isError, true);
+  assert.equal(parseToolJson(valEsc).data.valid, false);
+
+  // 3. cr_agent_batch_apply & cr_contest_batch_import restrict writes to agents/ & contests/ and refuse overwriting package.json / run.json
+  const pkgBytes = '{"name":"do-not-touch"}\n';
+  const runBytes = '{"schema_version":2,"run_id":"do-not-touch"}\n';
+  await writeFile(join(realBase, 'package.json'), pkgBytes);
+  await mkdir(join(realBase, 'agents'), { recursive: true });
+  await writeFile(join(realBase, 'agents', 'run.json'), runBytes);
+  await mkdir(join(realBase, 'contests'), { recursive: true });
+  await writeFile(join(realBase, 'contests', 'package.json'), pkgBytes);
+
+  const badAgentDir = await client.callTool({
+    name: 'cr_agent_batch_apply',
+    arguments: { items: [{ file: 'other/a.toml', format: 'toml', document: validAgentDoc }], dry_run: false },
+  });
+  assert.equal(badAgentDir.isError, true);
+  assert.match(parseToolJson(badAgentDir).text, /approved directory/i);
+
+  const badAgentOverwrite = await client.callTool({
+    name: 'cr_agent_batch_apply',
+    arguments: {
+      items: [{ file: 'agents/run.json', format: 'json', document: validAgentDoc }],
+      dry_run: false,
+      if_exists: 'overwrite',
+    },
+  });
+  assert.equal(badAgentOverwrite.isError, true);
+  assert.equal(await readFile(join(realBase, 'agents', 'run.json'), 'utf8'), runBytes);
+
+  const badContestDir = await client.callTool({
+    name: 'cr_contest_batch_import',
+    arguments: {
+      items: [{
+        file: 'other/c.json',
+        document: {
+          schema_version: 2,
+          contest_id: 'c-other',
+          data_version: 1,
+          title: 'Other',
+          source: { name: 'X' },
+          judge: { kind: 'local', problems: [{ id: 'A', max_points: 100, accepted_answers: ['1'] }] },
+        },
+        synth_problems: [{ id: 'A', title: 'A', body: 'A' }],
+      }],
+      dry_run: false,
+    },
+  });
+  assert.equal(badContestDir.isError, true);
+  assert.match(parseToolJson(badContestDir).text, /approved directory/i);
+
+  const badContestOverwrite = await client.callTool({
+    name: 'cr_contest_batch_import',
+    arguments: {
+      items: [{
+        file: 'contests/package.json',
+        document: {
+          schema_version: 2,
+          contest_id: 'c-pkg',
+          data_version: 1,
+          title: 'Pkg',
+          source: { name: 'X' },
+          judge: { kind: 'local', problems: [{ id: 'A', max_points: 100, accepted_answers: ['1'] }] },
+        },
+        synth_problems: [{ id: 'A', title: 'A', body: 'A' }],
+      }],
+      dry_run: false,
+      if_exists: 'overwrite',
+    },
+  });
+  assert.equal(badContestOverwrite.isError, true);
+  assert.equal(await readFile(join(realBase, 'contests', 'package.json'), 'utf8'), pkgBytes);
+
+  // 4. cr_plan_preview parity: duplicate canonical paths, duplicate revisions, escaping transitive paths, and isError on incompatible (!valid)
+  const applyAgents = await client.callTool({
+    name: 'cr_agent_batch_apply',
+    arguments: {
+      items: [
+        { file: 'agents/a1.toml', format: 'toml', document: validAgentDoc },
+        { file: 'agents/a1-dup.toml', format: 'toml', document: validAgentDoc },
+        {
+          file: 'agents/builtin.toml',
+          format: 'toml',
+          document: {
+            kind: 'contestreplay.dev/agent',
+            schema_version: 1,
+            id: 'builtin-agent',
+            model: 'gpt-4.1-2025-04-14',
+            provider: 'p-locked',
+            harness: { kind: 'builtin-responses', version: '0.1.0', options: { temperature: 0 } },
+          },
+        },
+      ],
+      dry_run: false,
+    },
+  });
+  assert.equal(parseToolJson(applyAgents).data.ok, true);
+
+  // Write a Codeforces contest and a local contest
+  const importContests = await client.callTool({
+    name: 'cr_contest_batch_import',
+    arguments: {
+      items: [
+        {
+          file: 'contests/local-c.json',
+          document: {
+            schema_version: 2,
+            contest_id: 'local-c',
+            data_version: 1,
+            title: 'Local C',
+            source: { name: 'Local' },
+            judge: { kind: 'local', problems: [{ id: 'A', max_points: 100, accepted_answers: ['1'] }] },
+          },
+          synth_problems: [{ id: 'A', title: 'A', body: 'Solve A.' }],
+        },
+        {
+          file: 'contests/cf-c.json',
+          document: {
+            schema_version: 2,
+            contest_id: 'cf-c',
+            data_version: 1,
+            title: 'CF C',
+            source: { name: 'CF' },
+            problems: [{ id: 'A', max_points: 500 }],
+            judge: { kind: 'codeforces', contest_id: 1999, handle: 'bot', languages: { cpp20: 89 } },
+          },
+          synth_problems: [{ id: 'A', title: 'A', body: 'Solve A.' }],
+        },
+      ],
+      dry_run: false,
+    },
+  });
+  assert.equal(parseToolJson(importContests).data.ok, true);
+
+  // 4a. Duplicate canonical path (agents/a1.toml vs ./agents/a1.toml)
+  const dupCanon = await client.callTool({
+    name: 'cr_plan_preview',
+    arguments: {
+      spec: {
+        schema_version: 1,
+        agents: ['agents/a1.toml', './agents/a1.toml'],
+        contests: ['contests/local-c.json'],
+      },
+    },
+  });
+  assert.equal(dupCanon.isError, true);
+  assert.match(parseToolJson(dupCanon).text, /Duplicate input paths/i);
+
+  // 4b. Duplicate revision across distinct files (agents/a1.toml & agents/a1-dup.toml)
+  const dupRev = await client.callTool({
+    name: 'cr_plan_preview',
+    arguments: {
+      spec: {
+        schema_version: 1,
+        agents: ['agents/a1.toml', 'agents/a1-dup.toml'],
+        contests: ['contests/local-c.json'],
+      },
+    },
+  });
+  assert.equal(dupRev.isError, true);
+  assert.match(parseToolJson(dupRev).text, /Duplicate Agent revision/i);
+
+  // 4c. Escaping transitive path inside a contest manifest on disk (materials.attachments[].path escaping base)
+  await writeFile(join(outsideDir, 'outside-att.txt'), 'secret outside');
+  await writeFile(
+    join(realBase, 'contests', 'esc-att.json'),
+    JSON.stringify({
+      schema_version: 2,
+      contest_id: 'esc-att',
+      data_version: 1,
+      title: 'Escaping Attachment',
+      source: { name: 'Local' },
+      materials: {
+        entrypoint: { kind: 'pdf', path: 'local-c.pdf' },
+        attachments: [{ name: 'out.txt', path: relative(join(realBase, 'contests'), join(outsideDir, 'outside-att.txt')) }],
+      },
+      judge: { kind: 'local', answers: { path: 'local-c.judge.json' } },
+    }),
+  );
+  const escTransitive = await client.callTool({
+    name: 'cr_plan_preview',
+    arguments: {
+      spec: {
+        schema_version: 2,
+        cells: [{ agent: 'agents/a1.toml', contest: 'contests/esc-att.json' }],
+      },
+    },
+  });
+  assert.equal(escTransitive.isError, true);
+  assert.match(parseToolJson(escTransitive).text, /must stay inside workspace base/i);
+
+  // 4d. Incompatible cell (builtin-responses x codeforces) returns valid: false AND isError: true!
+  const incompat = await client.callTool({
+    name: 'cr_plan_preview',
+    arguments: {
+      spec: {
+        schema_version: 2,
+        cells: [{ agent: 'agents/builtin.toml', contest: 'contests/cf-c.json' }],
+      },
+    },
+  });
+  assert.equal(incompat.isError, true);
+  const incompatData = parseToolJson(incompat).data;
+  assert.equal(incompatData.ok, false);
+  assert.equal(incompatData.valid, false);
+  assert.equal(incompatData.incompatible_count, 1);
+});
+
+test('cr mcp stdio E2E returns pure JSON-RPC on stdout, empty stderr, and exits cleanly on stdin EOF', async t => {
+  const base = await makeTempDir(t, 'cr-mcp-stdio-base-');
+  const root = await makeTempDir(t, 'cr-mcp-stdio-root-');
+  const connDir = await makeTempDir(t, 'cr-mcp-stdio-conn-');
+  const ojDir = await makeTempDir(t, 'cr-mcp-stdio-oj-');
+  await chmod(connDir, 0o700);
+  await chmod(ojDir, 0o700);
+
+  const env = {
+    ...process.env,
+    CR_CONNECTIONS_DIR: connDir,
+    CR_OJ_ACCOUNTS_DIR: ojDir,
+    CR_CREDENTIAL_STORAGE: 'file',
+  };
+
+  const result = await new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(process.execPath, ['dist/cli.js', 'mcp', '--workspace', root, '--base', base], {
+      env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    let sentList = false;
+    let closedStdin = false;
+
+    child.stdout.setEncoding('utf8').on('data', chunk => {
+      stdout += chunk;
+      const lines = stdout.split('\n').filter(Boolean);
+      for (const line of lines) {
+        let msg;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (msg.id === 1 && !sentList) {
+          sentList = true;
+          child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+          child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }) + '\n');
+        } else if (msg.id === 2 && !closedStdin) {
+          closedStdin = true;
+          child.stdin.end();
+        }
+      }
+    });
+    child.stderr.setEncoding('utf8').on('data', chunk => { stderr += chunk; });
+    child.once('error', rejectPromise);
+    child.once('close', (code, signal) => resolvePromise({ code, signal, stdout, stderr }));
+
+    child.stdin.write(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2025-03-26',
+          capabilities: {},
+          clientInfo: { name: 'stdio-e2e', version: '1.0.0' },
+        },
+      }) + '\n',
+    );
+  });
+
+  assert.equal(result.code, 0, `expected exit 0, got code=${result.code} signal=${result.signal} stderr=${result.stderr}`);
+  assert.equal(result.stderr, '', `expected empty stderr, got: ${result.stderr}`);
+
+  const lines = result.stdout.trim().split('\n').filter(Boolean);
+  assert.ok(lines.length >= 2, `expected >=2 JSON-RPC lines, got ${lines.length}`);
+  const parsedMessages = lines.map(line => JSON.parse(line));
+  const initResp = parsedMessages.find(m => m.id === 1);
+  const listResp = parsedMessages.find(m => m.id === 2);
+  assert.equal(initResp.result.serverInfo.name, 'contestreplay-workbench');
+  assert.ok(listResp.result.tools.some(tool => tool.name === 'cr_catalog_list'));
+});
+
+test('CLI deterministic exit codes for missing args, unknown commands/flags, --secret-stdin=val, 0-gap emit-spec, and inspect-pdf exit alignment', async t => {
+  const base = await makeTempDir(t, 'cr-cli-err-base-');
+  const root = await makeTempDir(t, 'cr-cli-err-root-');
+  const connDir = await makeTempDir(t, 'cr-cli-err-conn-');
+  const ojDir = await makeTempDir(t, 'cr-cli-err-oj-');
+  await chmod(connDir, 0o700);
+  await chmod(ojDir, 0o700);
+
+  const env = {
+    ...process.env,
+    CR_CONNECTIONS_DIR: connDir,
+    CR_OJ_ACCOUNTS_DIR: ojDir,
+    CR_CREDENTIAL_STORAGE: 'file',
+  };
+  const runCli = (args, input) =>
+    spawnSync(process.execPath, ['dist/cli.js', ...args], { encoding: 'utf8', env, input });
+
+  // 1. Missing positional arg -> exit 3 (validation_error)
+  const missingPos = runCli(['agent', 'batch-apply', '--json']);
+  assert.equal(missingPos.status, 3, missingPos.stdout + missingPos.stderr);
+  assert.equal(JSON.parse(missingPos.stdout).code, 'validation_error');
+
+  // 2. Unknown command -> exit 3 (validation_error)
+  const unknownCmd = runCli(['bogus-cmd', '--json']);
+  assert.equal(unknownCmd.status, 3, unknownCmd.stdout + unknownCmd.stderr);
+  assert.equal(JSON.parse(unknownCmd.stdout).code, 'validation_error');
+
+  // 3. Unknown flag -> exit 3 (validation_error)
+  const unknownFlag = runCli(['coverage', '--bogus', '--json']);
+  assert.equal(unknownFlag.status, 3, unknownFlag.stdout + unknownFlag.stderr);
+  assert.equal(JSON.parse(unknownFlag.stdout).code, 'validation_error');
+
+  // 4. --secret-stdin=LEAKED_VALUE -> exit 3 (validation_error), NOT 4 or 1, and NEVER echoes LEAKED_VALUE!
+  const SECRET_FLAG_VAL = 'DO_NOT_ECHO_CLI_ARG_99999';
+  const badSecretFlag = runCli([
+    'oj-account', 'add', 'x', '--platform', 'codeforces', '--handle', 'h', `--secret-stdin=${SECRET_FLAG_VAL}`, '--json',
+  ]);
+  assert.equal(badSecretFlag.status, 3, badSecretFlag.stdout + badSecretFlag.stderr);
+  const badSecretJson = JSON.parse(badSecretFlag.stdout);
+  assert.equal(badSecretJson.ok, false);
+  assert.equal(badSecretJson.code, 'validation_error');
+  assert.ok(!badSecretFlag.stdout.includes(SECRET_FLAG_VAL));
+  assert.ok(!badSecretFlag.stderr.includes(SECRET_FLAG_VAL));
+
+  // 5. cr coverage --emit-spec with 0 gaps handles batch_spec === null cleanly
+  const covZeroJson = runCli(['coverage', '--workspace', root, '--base', base, '--emit-spec', '--json']);
+  assert.equal(covZeroJson.status, 0, covZeroJson.stdout + covZeroJson.stderr);
+  const covZeroParsed = JSON.parse(covZeroJson.stdout);
+  assert.equal(covZeroParsed.ok, true);
+  assert.equal(covZeroParsed.total_gaps, 0);
+  assert.equal(covZeroParsed.batch_spec, null);
+
+  const covZeroPlain = runCli(['coverage', '--workspace', root, '--base', base, '--emit-spec']);
+  assert.equal(covZeroPlain.status, 0, covZeroPlain.stdout + covZeroPlain.stderr);
+  assert.equal(JSON.parse(covZeroPlain.stdout), null);
+
+  // 6. cr contest inspect-pdf --json aligns exit code with ok (even when limits.ok is false -> ok: true, exit 0; missing file -> ok: false, non-zero)
+  const bigPdfPath = join(base, 'many-pages.pdf');
+  const manyProblems = Array.from({ length: 40 }, (_, idx) => ({
+    id: `P${idx + 1}`,
+    title: `Problem ${idx + 1}`,
+    body: 'Repeat line\n'.repeat(60),
+  }));
+  await synthesizeTextContestPdf(manyProblems, bigPdfPath, { title: 'Long PDF' });
+  const overLimit = runCli(['contest', 'inspect-pdf', bigPdfPath, '--preset', 'short', '--json']);
+  assert.equal(overLimit.status, 0, overLimit.stdout + overLimit.stderr);
+  const overLimitJson = JSON.parse(overLimit.stdout);
+  assert.equal(overLimitJson.ok, true);
+  assert.equal(overLimitJson.limits.ok, false);
+
+  const missingPdf = runCli(['contest', 'inspect-pdf', join(base, 'does-not-exist.pdf'), '--json']);
+  assert.notEqual(missingPdf.status, 0);
+  assert.equal(JSON.parse(missingPdf.stdout).ok, false);
 });
