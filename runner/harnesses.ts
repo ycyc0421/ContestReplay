@@ -4,8 +4,17 @@ import { parseDocumentText, serializeDocument } from './serialization.js';
 export const harnessKind = z.enum(['codex', 'builtin-responses']);
 export type HarnessKind = z.infer<typeof harnessKind>;
 export const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+export const speedTiers = ['standard', 'fast', 'ultrafast'] as const;
+export type SpeedTier = (typeof speedTiers)[number];
+export const speedTierSchema = z.enum(speedTiers);
+export const serviceTiers = ['default', 'standard', 'fast', 'priority'] as const;
+export type ServiceTier = (typeof serviceTiers)[number];
+export const serviceTierSchema = z.enum(serviceTiers);
 const effortSchema = z.enum(efforts);
-const codexOptions = z.strictObject({ reasoning_effort: z.union([effortSchema, z.literal('default')]).optional() });
+const codexOptions = z.strictObject({
+  reasoning_effort: z.union([effortSchema, z.literal('default')]).optional(),
+  service_tier: serviceTierSchema.optional(),
+});
 const temperature = z.number().min(0).max(2);
 const builtinOptions = z.strictObject({ temperature: z.preprocess(value => typeof value === 'string' && value.trim() ? Number(value) : value, temperature.default(0)) });
 const locale = z.enum(['C', 'C.UTF-8', 'POSIX']);
@@ -21,8 +30,12 @@ export const codexModel = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,127}$
 const adapters = {
   codex: {
     label: 'Codex', version: '0.170.0', image: 'cr-codex:0.170.0', native_format: 'toml', supports_overrides: true,
-    fields: [{ id: 'reasoning_effort', label: '推理强度', kind: 'select', required: false, default: 'default',
-      options: ['default', ...efforts].map(value => ({ value, label: value === 'default' ? '使用模型默认值' : value })) }],
+    fields: [
+      { id: 'reasoning_effort', label: '推理强度', kind: 'select', required: false, default: 'default',
+        options: ['default', ...efforts].map(value => ({ value, label: value === 'default' ? '使用模型默认值' : value })) },
+      { id: 'service_tier', label: '服务档位', kind: 'select', required: false, default: 'default',
+        options: serviceTiers.map(value => ({ value, label: value === 'default' ? '使用模型默认值' : value })) },
+    ],
     options: codexOptions, model: codexModel, env: codexEnv,
   },
   'builtin-responses': {
@@ -48,18 +61,20 @@ export function parseNative(kind: HarnessKind, content: string): NativeOverride 
   if (!result.success) throw new Error('Only model_verbosity (low, medium, high) may be overridden; safety, provider, MCP and environment settings are runner-managed');
   return result.data;
 }
-export function codexEffective(model: string, reasoning?: string, native?: NativeOverride) {
+export function codexEffective(model: string, reasoning?: string, native?: NativeOverride, serviceTier?: string) {
   return {
     ...(native?.model_verbosity ? { model_verbosity: native.model_verbosity } : {}),
-    model, model_provider: 'cr', ...(reasoning ? { model_reasoning_effort: reasoning } : {}),
+    model, model_provider: 'cr',
+    ...(reasoning ? { model_reasoning_effort: reasoning } : {}),
+    ...(serviceTier && serviceTier !== 'default' ? { service_tier: serviceTier } : {}),
     approval_policy: 'never', sandbox_mode: 'danger-full-access', web_search: 'disabled', analytics: { enabled: false },
     model_providers: { cr: { name: 'ContestReplay relay', base_url: 'http://127.0.0.1:8745/v1', wire_api: 'responses', request_max_retries: 0, stream_max_retries: 0 } },
     mcp_servers: { contest: { command: 'node', args: ['/app/bridge.js', 'mcp'], required: true } },
   };
 }
-export function effectiveFor(profile: { harness: HarnessKind; model: string; reasoning_effort?: string; temperature?: number }, native?: NativeOverride) {
+export function effectiveFor(profile: { harness: HarnessKind; model: string; reasoning_effort?: string; service_tier?: string; temperature?: number }, native?: NativeOverride) {
   const format = harness(profile.harness).native_format;
-  const config = profile.harness === 'codex' ? codexEffective(profile.model, profile.reasoning_effort, native)
+  const config = profile.harness === 'codex' ? codexEffective(profile.model, profile.reasoning_effort, native, profile.service_tier)
     : { model: profile.model, temperature: profile.temperature ?? 0 };
   return { format, config, content: serializeDocument(config, format) };
 }

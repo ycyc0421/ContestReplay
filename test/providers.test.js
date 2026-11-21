@@ -121,6 +121,39 @@ test('both Agent reference forms pin endpoints without pinning secret rotation; 
   assert.equal((await request('/api/catalog/agents')).value.agents.length, 2);
 });
 
+test('Providers default to passthrough protocol, support speed flags, and enforce protocol compatibility in key()', async t => {
+  const previous = process.env.CR_CREDENTIAL_STORAGE;
+  process.env.CR_CREDENTIAL_STORAGE = 'file';
+  t.after(() => { if (previous === undefined) delete process.env.CR_CREDENTIAL_STORAGE; else process.env.CR_CREDENTIAL_STORAGE = previous; });
+  const { request, store } = await fixture(t);
+
+  // Default protocol is passthrough when omitted; supports_fast / supports_ultrafast persist
+  const created = await request('/api/providers', 'POST', {
+    id: 'multi', label: 'Multi Protocol', base_url: endpoint, secret, supports_fast: true, supports_ultrafast: false,
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.value));
+  assert.equal(created.value.protocol, 'passthrough');
+  assert.equal(created.value.supports_fast, true);
+  assert.equal(created.value.supports_ultrafast, false);
+
+  // passthrough allows any harness expected wire protocol
+  assert.equal(await store.key('multi', { base_url: endpoint, api: 'responses' }), secret);
+  assert.equal(await store.key('multi', { base_url: endpoint, api: 'chat-completions' }), secret);
+  assert.equal(await store.key('multi', { base_url: endpoint, api: 'anthropic-messages' }), secret);
+
+  // PATCH updates protocol & supports_ultrafast without clobbering unspecified fields
+  const patched = await request('/api/providers/multi', 'PATCH', { protocol: 'anthropic-messages', supports_ultrafast: true });
+  assert.equal(patched.status, 200);
+  assert.equal(patched.value.protocol, 'anthropic-messages');
+  assert.equal(patched.value.supports_fast, true);
+  assert.equal(patched.value.supports_ultrafast, true);
+
+  // Explicit protocol rejects mismatched expected api, accepts matching api or passthrough
+  assert.equal(await store.key('multi', { base_url: endpoint, api: 'anthropic-messages' }), secret);
+  assert.equal(await store.key('multi', { base_url: endpoint, api: 'passthrough' }), secret);
+  await assert.rejects(store.key('multi', { base_url: endpoint, api: 'responses' }), /endpoint changed/);
+});
+
 test('credential redaction keeps JSON valid and handles split diagnostic writes', () => {
   const key = 'some-test-key-"escaped"';
   const result = credentialJson({ value: `Bearer ${key}` }, key);

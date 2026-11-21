@@ -1,6 +1,6 @@
 import { createServer, connect, type Socket } from 'node:net';
-import { copyFile, mkdir } from 'node:fs/promises';
-import { readdirSync } from 'node:fs';
+import { copyFile, mkdir, symlink } from 'node:fs/promises';
+import { existsSync, readdirSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 
@@ -21,16 +21,24 @@ if (process.argv[2] === 'mcp') {
     client.on('error', close); upstream.on('error', close);
     client.on('close', close); upstream.on('close', close);
   });
+  const persistSessions = existsSync('/workspace/.sessions');
   await Promise.all([
     new Promise<void>((resolve, reject) => {
       server.once('error', reject);
       server.listen(8745, '127.0.0.1', resolve);
     }),
-    mkdir('/workspace/.codex', { mode: 0o700 }).then(() => copyFile('/inputs/config.toml', '/workspace/.codex/config.toml')),
+    mkdir('/workspace/.codex', { recursive: true, mode: 0o700 }).then(async () => {
+      await copyFile('/inputs/config.toml', '/workspace/.codex/config.toml');
+      if (persistSessions) {
+        await symlink('/workspace/.sessions', '/workspace/.codex/sessions').catch(err => {
+          if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+        });
+      }
+    }),
   ]);
   const images = readdirSync('/inputs/pages').filter(f => /^page-\d+\.png$/.test(f)).sort((a, b) => a.localeCompare(b, 'en', { numeric: true }));
   if (!images.length) throw new Error('No rendered contest pages');
-  const child = spawn('codex', ['exec', '--json', '--ephemeral', '--skip-git-repo-check', '--ignore-rules', '--strict-config',
+  const child = spawn('codex', ['exec', '--json', ...(persistSessions ? [] : ['--ephemeral']), '--skip-git-repo-check', '--ignore-rules', '--strict-config',
     '--dangerously-bypass-approvals-and-sandbox', ...images.flatMap(file => ['--image', join('/inputs/pages', file)]), '-'], { stdio: ['pipe', 'inherit', 'inherit'] });
   child.stdin.on('error', () => {});
   process.stdin.pipe(child.stdin);

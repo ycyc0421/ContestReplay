@@ -8,6 +8,7 @@ import { makePlan, planFromFile, planSchema, readJson } from './plan.js';
 import { saveAgent, saveAgentManifest, saveContest, codeforcesContest } from './author.js';
 import { agentKind } from './agent-manifest.js';
 import { harness, harnessKind } from './harnesses.js';
+import { scoringModes, type ScoringMode } from './protocol.js';
 import { exportBatch, exportRun, mergeResults, rankResults, resultBundle } from './results.js';
 import { dispatch, enqueue, getBatch, listBatches, lookupRun, readRunLog, requestBatchStop, requestRunCancel, summarize, workdir } from './queue.js';
 
@@ -16,8 +17,8 @@ const usage = `Usage:
   cr contest init <contest.json> --pdf <relative-path> --answers <relative-path> [--id <id>] [--title <title>]
   cr contest import-codeforces <contest.json> --contest <number> --pdf <path> --handle <handle> --languages <json>
   cr contest validate <contest.json>
-  cr agent init <agent.toml|agent.yaml|agent.json> --id <id> --harness <kind> --model <model> --provider <id> [--vendor <id>] [--reasoning-effort <level>] [--temperature <value>]
-  cr agent init <agent.toml> --id <id> --harness <kind> --model <model> [--api <protocol>] [--base-url <url>] [--key-env <name>] [--reasoning-effort <level>] [--family <id>]
+  cr agent init <agent.toml|agent.yaml|agent.json> --id <id> --harness <kind> --model <model> --provider <id> [--name <label>] [--vendor <id>] [--speed-tier <standard|fast|ultrafast>] [--reasoning-effort <level>] [--service-tier <tier>] [--temperature <value>]
+  cr agent init <agent.toml> --id <id> --harness <kind> --model <model> [--name <label>] [--speed-tier <standard|fast|ultrafast>] [--api <protocol>] [--base-url <url>] [--key-env <name>] [--reasoning-effort <level>] [--service-tier <tier>] [--family <id>]
   cr agent validate <agent.toml|agent.yaml|agent.json>
   cr batch plan <batch.json> [--out <plan.json>]
   cr batch run <plan.json> [--workspace <dir>] [--json]
@@ -29,8 +30,8 @@ const usage = `Usage:
   cr run cancel <run-id> [--workspace <dir>]
   cr results export (--batch <id> | --run <id>) [--workspace <dir>] [--out <file>]
   cr results merge <results.json>... [--out <file>]
-  cr results rank <results.json> [--vendor <id>] [--family <legacy-id>]
-  cr provider add <id> [--label <label>] --base-url <url> --secret-stdin
+  cr results rank <results.json> [--vendor <id>] [--family <legacy-id>] [--scoring <icpc|cf|ioi|last_ac>] [--group-by <model|revision>]
+  cr provider add <id> [--label <label>] [--protocol <passthrough|responses|chat-completions|anthropic-messages>] [--supports-fast] [--supports-ultrafast] --base-url <url> --secret-stdin
   cr provider rotate <id> --secret-stdin
   cr connection add|rotate ...  # legacy alias
   cr studio [--workspace <dir>] [--port <number>]`;
@@ -77,7 +78,9 @@ async function main(args: string[]) {
       return result.status === 'completed' ? 0 : 2;
     }
     if ((group === 'provider' || group === 'connection') && (command === 'add' || command === 'rotate')) {
-      const { positionals, values: v } = parseArgs({ args: rest, allowPositionals: true, options: { label: str, 'base-url': str, 'secret-stdin': bool } });
+      const { positionals, values: v } = parseArgs({ args: rest, allowPositionals: true, options: {
+        label: str, protocol: str, 'base-url': str, 'secret-stdin': bool, 'supports-fast': bool, 'supports-ultrafast': bool,
+      } });
       const id = position(positionals)!;
       if (!v['secret-stdin'] || process.stdin.isTTY) throw new Error('Pipe the API key via stdin with --secret-stdin; never use a command-line argument');
       let secret = '';
@@ -87,7 +90,11 @@ async function main(args: string[]) {
       }
       const store = new Connections();
       try {
-        if (command === 'add') print(await store.create(createConnectionSchema.parse({ id, label: v.label ?? id, protocol: 'responses', base_url: v['base-url'], secret })));
+        if (command === 'add') print(await store.create(createConnectionSchema.parse({
+          id, label: v.label ?? id, protocol: v.protocol ?? 'passthrough', base_url: v['base-url'], secret,
+          ...(v['supports-fast'] ? { supports_fast: true } : {}),
+          ...(v['supports-ultrafast'] ? { supports_ultrafast: true } : {}),
+        })));
         else print(await store.rotate(id, rotateConnectionSchema.parse({ secret }).secret));
       } catch { throw new Error('Could not save provider; check ID, label, endpoint and credential storage'); }
       return 0;
@@ -112,9 +119,11 @@ async function main(args: string[]) {
       return 0;
     }
     if (group === 'agent' && command === 'init') {
-      const { positionals, values: v } = parseArgs({ args: rest, allowPositionals: true, options: { id: str, harness: str, model: str,
+      const { positionals, values: v } = parseArgs({ args: rest, allowPositionals: true, options: {
+        id: str, name: str, harness: str, model: str, 'speed-tier': str, 'service-tier': str,
         api: str, 'base-url': str, 'key-env': str, 'reasoning-effort': str, family: str,
-        connection: str, provider: str, vendor: str, temperature: str } });
+        connection: str, provider: str, vendor: str, temperature: str,
+      } });
       const out = position(positionals)!;
       const provider = v.provider ?? v.connection;
       if (v.provider && v.connection) throw new Error('Use only one of --provider and legacy --connection');
@@ -125,20 +134,32 @@ async function main(args: string[]) {
         const kind = harnessKind.parse(v.harness);
         const options = {
           ...(v['reasoning-effort'] !== undefined ? { reasoning_effort: v['reasoning-effort'] } : {}),
+          ...(v['service-tier'] !== undefined ? { service_tier: v['service-tier'] } : {}),
           ...(v.temperature !== undefined ? { temperature: v.temperature } : {}),
         };
-        console.log(await saveAgentManifest(out, { kind: agentKind, schema_version: 1, id: v.id, model: v.model,
-          provider, vendor: v.vendor, harness: { kind, version: harness(kind).version, options } }));
+        console.log(await saveAgentManifest(out, {
+          kind: agentKind, schema_version: 1, id: v.id,
+          ...(v.name !== undefined ? { name: v.name } : {}),
+          model: v.model,
+          ...(v['speed-tier'] !== undefined ? { speed_tier: v['speed-tier'] } : {}),
+          provider, vendor: v.vendor, harness: { kind, version: harness(kind).version, options },
+        }));
       } else {
         if (v.vendor !== undefined || v.temperature !== undefined) throw new Error('--vendor and --temperature require --provider (or legacy --connection)');
-        console.log(await saveAgent(out, { id: v.id, harness: v.harness, model: v.model, api: v.api, base_url: v['base-url'],
-          api_key_env: v['key-env'], model_family_id: v.family, ...(v['reasoning-effort'] !== undefined ? { reasoning_effort: v['reasoning-effort'] } : {}) }));
+        console.log(await saveAgent(out, {
+          id: v.id, ...(v.name !== undefined ? { name: v.name } : {}),
+          ...(v['speed-tier'] !== undefined ? { speed_tier: v['speed-tier'] } : {}),
+          harness: v.harness, model: v.model, api: v.api, base_url: v['base-url'],
+          api_key_env: v['key-env'], model_family_id: v.family,
+          ...(v['reasoning-effort'] !== undefined ? { reasoning_effort: v['reasoning-effort'] } : {}),
+          ...(v['service-tier'] !== undefined ? { service_tier: v['service-tier'] } : {}),
+        }));
       }
       return 0;
     }
     if (group === 'results' && (command === 'export' || command === 'merge' || command === 'rank')) {
       const { positionals, values: v } = parseArgs({ args: rest, allowPositionals: true,
-        options: { out: str, workspace: str, batch: str, run: str, family: str, vendor: str } });
+        options: { out: str, workspace: str, batch: str, run: str, family: str, vendor: str, scoring: str, 'group-by': str } });
       let data: unknown;
       if (command === 'export') {
         if (positionals.length || Boolean(v.batch) === Boolean(v.run)) throw new Error('Select exactly one of --batch or --run');
@@ -147,7 +168,20 @@ async function main(args: string[]) {
       } else if (command === 'merge') {
         if (!positionals.length) throw new Error('Provide one or more result bundles');
         data = mergeResults(await Promise.all(positionals.map(readJson)));
-      } else data = rankResults(mergeResults([await readJson(position(positionals)!)]), v.family, v.vendor);
+      } else {
+        if (v.scoring !== undefined && !(scoringModes as readonly string[]).includes(v.scoring)) {
+          throw new Error(`--scoring must be one of: ${scoringModes.join(', ')}`);
+        }
+        if (v['group-by'] !== undefined && !['model', 'revision'].includes(v['group-by'])) {
+          throw new Error('--group-by must be model or revision');
+        }
+        data = rankResults(mergeResults([await readJson(position(positionals)!)]), {
+          family: v.family,
+          vendor: v.vendor,
+          scoring: v.scoring as ScoringMode | undefined,
+          groupBy: v['group-by'] as 'model' | 'revision' | undefined,
+        });
+      }
       if (v.out) await writeFile(v.out, JSON.stringify(data, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
       else print(data);
       return 0;
@@ -159,9 +193,12 @@ async function main(args: string[]) {
         const { contest } = await loadContest(file);
         print({ contest_id: contest.contest_id, data_version: contest.data_version });
       } else {
-        const { agent, profile, vendor, connection, agentDigest, profileDigest, nativeDigest, effectiveDigest } = await loadAgent(file);
-        print({ agent_id: agent.agent_id, harness: agent.harness, model: profile.model, vendor, connection,
-          source_sha256: agentDigest, profile_sha256: profileDigest, native_sha256: nativeDigest, effective_sha256: effectiveDigest });
+        const { agent, agentName, speedTier, profile, vendor, connection, agentDigest, profileDigest, nativeDigest, effectiveDigest } = await loadAgent(file);
+        print({
+          agent_id: agent.agent_id, ...(agentName ? { name: agentName } : {}), harness: agent.harness, model: profile.model,
+          speed_tier: speedTier, vendor, connection,
+          source_sha256: agentDigest, profile_sha256: profileDigest, native_sha256: nativeDigest, effective_sha256: effectiveDigest,
+        });
       }
       return 0;
     }

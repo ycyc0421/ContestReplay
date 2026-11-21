@@ -2,9 +2,10 @@ import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
-import { agentKind, manifestProvider, resolveManifest } from './agent-manifest.js';
-import { Connections, endpoint } from './connections.js';
-import { builtinModel, codexModel, effectiveFor, efforts, harness, type HarnessEnv, type NativeOverride } from './harnesses.js';
+import { agentKind, agentNameSchema, manifestProvider, resolveManifest } from './agent-manifest.js';
+import { connectionProtocolSchema, Connections, endpoint } from './connections.js';
+import { builtinModel, codexModel, effectiveFor, efforts, harness, speedTierSchema, type HarnessEnv, type NativeOverride } from './harnesses.js';
+import { protocolPresetNames, protocolPresets, resolveProtocolPreset, scoringModes } from './protocol.js';
 import { canonical, documentFormat, parseDocumentText, serializeDocument } from './serialization.js';
 import { z } from 'zod';
 
@@ -30,23 +31,32 @@ export const contestSchema = z.strictObject({ schema_version: z.literal(2), ...c
     attachments: z.array(artifact.extend({ name: id.refine(n => n !== 'problems.pdf') })).max(32).default([]) }),
   problems: z.array(problem).min(1).max(100).refine(unique, 'Invalid problem set').optional(),
   judge: z.discriminatedUnion('kind', [localBackend, codeforcesBackend]),
-  rules: z.strictObject({ time_limit_ms: z.number().int().min(1000).max(8 * 60 * 60_000).default(900_000),
-    max_submissions: z.number().int().min(1).max(1000).default(100) }).default({ time_limit_ms: 900_000, max_submissions: 100 }),
+  rules: z.strictObject({
+    time_limit_ms: z.number().int().min(1000).max(8 * 60 * 60_000).default(900_000),
+    max_submissions: z.number().int().min(1).max(1000).default(100),
+    protocol_preset: z.enum(protocolPresetNames).optional(),
+    scoring_mode: z.enum(scoringModes).optional(),
+  }).default({ time_limit_ms: 900_000, max_submissions: 100 }),
 });
 export const judgeSchema = z.strictObject({ schema_version: z.literal(1),
   problems: z.array(problem.extend({ accepted_answers: z.array(z.string().min(1).max(4096).refine(s => s.trim() === s)).min(1) })).min(1).max(100),
 }).refine(j => unique(j.problems), 'Duplicate problem ID or unsafe total');
 const legacyAgent = z.strictObject({ schema_version: z.literal(1), agent_id: id,
   harness: z.strictObject({ kind: z.literal('builtin-responses'), version: z.literal('0.1.0') }), config: path });
-const apiFields = { api: z.literal('responses').default('responses'),
+const apiFields = {
+  name: agentNameSchema.optional(),
+  speed_tier: speedTierSchema.optional(),
+  api: connectionProtocolSchema.default('responses'),
   base_url: endpoint.default('https://api.openai.com/v1'),
   api_key_env: z.string().regex(/^[A-Z_][A-Z0-9_]*$/).default('OPENAI_API_KEY'),
   model_family_id: id.optional(),
 };
 const builtin = z.strictObject({ id, harness: z.literal('builtin-responses'), ...apiFields,
+  api: z.enum(['passthrough', 'responses']).default('responses'),
   model: builtinModel, temperature: z.number().min(0).max(2).default(0) });
 const codex = z.strictObject({ id, harness: z.literal('codex'), ...apiFields,
-  model: codexModel, reasoning_effort: z.enum(efforts).optional() });
+  model: codexModel, reasoning_effort: z.enum(efforts).optional(),
+  service_tier: z.preprocess(v => v === 'default' ? undefined : v, z.enum(['standard', 'fast', 'priority']).optional()) });
 export const agentSchema = z.discriminatedUnion('harness', [builtin, codex]);
 export type AgentProfile = z.infer<typeof agentSchema>;
 export const harnessVersion = (kind: AgentProfile['harness']) => harness(kind).version;
@@ -90,7 +100,8 @@ export async function resolveContest(raw: unknown, contestPath: string) {
     title: old.data.title, source: old.data.source, materials: { entrypoint: { kind: 'pdf', ...old.data.statement } },
     judge: { kind: 'local', answers: old.data.judge } }, contestPath) : validated(contestSchema, raw, contestPath);
   const base = dirname(contestPath);
-  const paper = await readArtifact(base, v.materials.entrypoint, 40_000_000);
+  const preset = protocolPresets[resolveProtocolPreset(v.rules)];
+  const paper = await readArtifact(base, v.materials.entrypoint, Math.max(40_000_000, preset.pdfMaxBytes));
   if (!paper.bytes.subarray(0, 5).equals(Buffer.from('%PDF-'))) throw new Error(`Missing PDF header: ${paper.path}`);
   v.materials.entrypoint.sha256 = paper.hash;
   const attachments = [];
@@ -146,7 +157,7 @@ export async function resolveAgentManifest(raw: unknown, agentPath: string, stor
   });
 }
 export function agentDigests(profile: AgentProfile, native?: NativeOverride, nativeText?: string, env?: HarnessEnv) {
-  const { model_family_id: _family, api_key_env: _key, id: _id, ...normalized } = profile;
+  const { model_family_id: _family, api_key_env: _key, id: _id, name: _name, speed_tier: _speedTier, ...normalized } = profile;
   const effective = effectiveFor(profile, native);
   return { profileDigest: sha256(canonical({ ...normalized, native: native?.model_verbosity ? native : undefined, env: env ?? {} })),
     nativeDigest: nativeText === undefined ? undefined : sha256(nativeText), effectiveDigest: sha256(canonical({ config: effective.config, env: env ?? {} })) };
@@ -177,7 +188,11 @@ export async function loadAgent(agentFile: string, store = new Connections()) {
     profile = validated(agentSchema, raw, agentPath);
   }
   const agent = { agent_id: profile.id, harness: { kind: profile.harness, version: harnessVersion(profile.harness) } };
-  return { agent, agentPath, agentDigest: sha256(bytes), ...agentDigests(profile, native, nativeText, env), profile, native, env, vendor, connection };
+  return {
+    agent, agentPath, agentDigest: sha256(bytes), ...agentDigests(profile, native, nativeText, env),
+    profile, native, env, vendor, connection,
+    agentName: profile.name, speedTier: profile.speed_tier ?? 'standard',
+  };
 }
 export async function loadInputs(contestFile: string, agentFile: string, store?: Connections) {
   return { ...await loadContest(contestFile), ...await loadAgent(agentFile, store) };

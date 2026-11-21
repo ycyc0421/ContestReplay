@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import { frames } from './wire.js';
 import { type AgentProfile } from './config.js';
 import { harness, type HarnessEnv } from './harnesses.js';
+import { protocolPresets, type SandboxResources } from './protocol.js';
 
 const docker = promisify(execFile);
 const image = 'cr-bench:0.1.0';
@@ -39,19 +40,23 @@ export async function removeContainer(id: string) {
 }
 
 export async function launch(id: string, imageId: string, pdfPath: string, signal: AbortSignal, onStderr?: (chunk: Buffer) => void,
-  codex?: { input: string; channels: string; env?: HarnessEnv; onStdout: (chunk: Buffer) => void }) {
-  if ([pdfPath, codex?.input, codex?.channels].some(path => path?.includes(','))) throw new Error('Docker PDF staging path cannot contain a comma');
+  codex?: { input: string; channels: string; sessions?: string; env?: HarnessEnv; resources?: SandboxResources; onStdout: (chunk: Buffer) => void }) {
+  if ([pdfPath, codex?.input, codex?.channels, codex?.sessions].some(path => path?.includes(','))) throw new Error('Docker PDF staging path cannot contain a comma');
   const name = `cr-${id}`;
+  const limits = codex ? (codex.resources ?? protocolPresets.short.sandbox) : resources;
   const args = [
     'create', '--rm', '--pull=never', '--name', name, '--label', `org.contestreplay.run=${id}`, '-i',
     '--network=none', '--read-only', '--user', '1000:1000', '--cap-drop=ALL',
-    '--security-opt=no-new-privileges', '--pids-limit', String(resources.pids),
-    '--memory', codex ? '2g' : resources.memory, '--cpus', resources.cpus, '--log-driver=none',
-    '--tmpfs', codex ? '/workspace:rw,nosuid,nodev,exec,size=256m,uid=1000,gid=1000,mode=0700' : `/workspace:rw,nosuid,nodev,noexec,size=${resources.workspace},uid=1000,gid=1000,mode=0700`,
-    '--tmpfs', `/tmp:rw,nosuid,nodev,noexec,size=${codex ? 64 : 8}m`, '--workdir', '/workspace', '--env', 'HOME=/workspace',
+    '--security-opt=no-new-privileges', '--pids-limit', String(limits.pids),
+    '--memory', limits.memory, '--cpus', limits.cpus, '--log-driver=none',
+    '--tmpfs', codex ? `/workspace:rw,nosuid,nodev,exec,size=${limits.workspace},uid=1000,gid=1000,mode=0700` : `/workspace:rw,nosuid,nodev,noexec,size=${resources.workspace},uid=1000,gid=1000,mode=0700`,
+    '--tmpfs', `/tmp:rw,nosuid,nodev,noexec,size=${codex ? 128 : 8}m`, '--workdir', '/workspace', '--env', 'HOME=/workspace',
     ...(codex ? ['--env', 'CODEX_HOME=/workspace/.codex',
-      ...Object.entries(harness('codex').env.parse(codex.env ?? {})).flatMap(([key, value]) => value ? ['--env', `${key}=${value}`] : []), '--mount', `type=bind,source=${codex.input},target=/inputs,readonly`,
-      '--mount', `type=bind,source=${codex.channels},target=/channels,readonly`] : ['--mount', `type=bind,source=${pdfPath},target=/inputs/problems.pdf,readonly`]),
+      ...Object.entries(harness('codex').env.parse(codex.env ?? {})).flatMap(([key, value]) => value ? ['--env', `${key}=${value}`] : []),
+      '--mount', `type=bind,source=${codex.input},target=/inputs,readonly`,
+      '--mount', `type=bind,source=${codex.channels},target=/channels,readonly`,
+      ...(codex.sessions ? ['--mount', `type=bind,source=${codex.sessions},target=/workspace/.sessions`] : [])]
+      : ['--mount', `type=bind,source=${pdfPath},target=/inputs/problems.pdf,readonly`]),
     '--entrypoint', 'node', imageId, codex ? '/app/bridge.js' : '/app/worker.js',
   ];
   let containerId: string;
@@ -88,24 +93,27 @@ export async function launch(id: string, imageId: string, pdfPath: string, signa
 }
 
 // Render untrusted PDFs inside a networkless image rather than in the host process.
-export async function renderPdf(id: string, image: string, input: string, pages: string, signal: AbortSignal) {
+export async function renderPdf(id: string, image: string, input: string, pages: string, signal: AbortSignal,
+  limits?: { maxPages?: number; maxBytes?: number }) {
   if ([input, pages].some(p => p.includes(','))) throw new Error('Docker mount paths cannot contain a comma');
+  const maxPages = limits?.maxPages ?? protocolPresets.short.pdfMaxPages;
+  const maxBytes = limits?.maxBytes ?? protocolPresets.short.pdfMaxBytes;
   const args = ['run', '--rm', '--pull=never', '--network=none', '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
-    '--user', `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`, '--memory', '512m', '--cpus', '1', '--pids-limit', '16',
+    '--user', `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`, '--memory', '1g', '--cpus', '1', '--pids-limit', '16',
     '--mount', `type=bind,source=${input},target=/paper.pdf,readonly`];
   const renderId = `render-${id}`;
   try {
     const run = (entry: string, rest: string[], more: string[] = []) => docker('docker', [...args, '--name', `cr-${renderId}`, ...more,
-      '--entrypoint', entry, image, ...rest], { timeout: 45_000, signal, maxBuffer: 32_768 });
+      '--entrypoint', entry, image, ...rest], { timeout: 120_000, signal, maxBuffer: 65_536 });
     const { stdout } = await run('pdfinfo', ['/paper.pdf']);
     const count = Number(stdout.match(/^Pages:\s*(\d+)\s*$/m)?.[1]);
-    if (!Number.isInteger(count) || count < 1 || count > 32) throw new Error('Codex transport requires 1–32 PDF pages');
+    if (!Number.isInteger(count) || count < 1 || count > maxPages) throw new Error(`Codex transport requires 1–${maxPages} PDF pages`);
     await run('pdftoppm', ['-png', '-scale-to', '1600', '/paper.pdf', '/pages/page'], ['--mount', `type=bind,source=${pages},target=/pages`]);
     const { readdir, stat } = await import('node:fs/promises');
     const files = await readdir(pages);
     if (files.length !== count || !files.every(f => /^page-\d+\.png$/.test(f))) throw new Error('PDF rendering produced an incomplete page set');
     const sizes = await Promise.all(files.map(f => stat(`${pages}/${f}`)));
-    if (sizes.reduce((sum, s) => sum + s.size, 0) > 18_000_000) throw new Error('Rendered PDF exceeds 18 MB');
+    if (sizes.reduce((sum, s) => sum + s.size, 0) > maxBytes) throw new Error(`Rendered PDF exceeds ${Math.round(maxBytes / 1_000_000)} MB`);
   } catch (error) {
     try { await removeContainer(renderId); } catch (cause) { throw new SandboxCleanupError(cause); }
     throw error;

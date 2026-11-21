@@ -7,24 +7,45 @@ import { join, resolve } from 'node:path';
 import { z } from 'zod';
 
 export const connectionId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
+export const connectionProtocols = ['passthrough', 'responses', 'chat-completions', 'anthropic-messages'] as const;
+export type ConnectionProtocol = (typeof connectionProtocols)[number];
+export const connectionProtocolSchema = z.enum(connectionProtocols);
 export const endpoint = z.url({ protocol: /^https?$/ }).max(4096).refine(value => {
   const u = new URL(value);
   return !u.username && !u.password && !u.search && !u.hash && (u.protocol === 'https:' || ['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname));
 }, 'Use HTTPS or loopback HTTP without credentials, a query or a fragment').transform(value => new URL(value).href.replace(/\/+$/, ''));
-const meta = z.strictObject({ id: connectionId, label: z.string().trim().min(1).max(120), protocol: z.literal('responses'), base_url: endpoint,
-  credential_ref: z.uuid(), approved_origin: z.string() });
+const meta = z.strictObject({
+  id: connectionId,
+  label: z.string().trim().min(1).max(120),
+  protocol: connectionProtocolSchema.default('passthrough'),
+  base_url: endpoint,
+  credential_ref: z.uuid(),
+  approved_origin: z.string(),
+  supports_fast: z.boolean().optional(),
+  supports_ultrafast: z.boolean().optional(),
+});
 const stored = meta.extend({ backend: z.enum(['secret-service', 'file']) });
-const base = meta.pick({ label: true, protocol: true, base_url: true });
+const base = meta.pick({ label: true, protocol: true, base_url: true, supports_fast: true, supports_ultrafast: true });
 const secret = z.string().trim().min(1).max(8192).regex(/^[\x21-\x7e]+$/);
 export const createConnectionSchema = base.extend({ id: connectionId.optional(), secret });
-export const patchConnectionSchema = base.partial();
+export const patchConnectionSchema = z.strictObject({
+  label: meta.shape.label.optional(),
+  protocol: connectionProtocolSchema.optional(),
+  base_url: endpoint.optional(),
+  supports_fast: z.boolean().optional(),
+  supports_ultrafast: z.boolean().optional(),
+});
 export const rotateConnectionSchema = z.strictObject({ secret });
 export type Connection = z.infer<typeof meta>;
 export class ConnectionError extends Error { constructor(message: string, readonly status = 400) { super(message); } }
 const missing = (e: unknown) => (e as NodeJS.ErrnoException).code === 'ENOENT';
 type StoredConnection = z.infer<typeof stored>;
-const pub = (value: StoredConnection): Connection => ({ id: value.id, label: value.label, protocol: value.protocol,
-  base_url: value.base_url, credential_ref: value.credential_ref, approved_origin: value.approved_origin });
+const pub = (value: StoredConnection): Connection => ({
+  id: value.id, label: value.label, protocol: value.protocol,
+  base_url: value.base_url, credential_ref: value.credential_ref, approved_origin: value.approved_origin,
+  ...(value.supports_fast !== undefined ? { supports_fast: value.supports_fast } : {}),
+  ...(value.supports_ultrafast !== undefined ? { supports_ultrafast: value.supports_ultrafast } : {}),
+});
 function checkPublicMetadata(value: string, { id, label, base_url }: Pick<Connection, 'id' | 'label' | 'base_url'>) {
   if ([id, label, base_url].some(field => field === value || (value.length >= 8 && field.includes(value)))) {
     throw new ConnectionError('A credential cannot be part of public provider metadata');
@@ -130,9 +151,10 @@ export class Connections {
     })))).filter(item => item !== undefined));
     return result;
   }
-  async key(id: string, expected: { base_url: string; api: string }) {
+  async key(id: string, expected: { base_url: string; api?: string }) {
     const value = await this.stored(id);
-    if (value.base_url !== expected.base_url || value.protocol !== expected.api) throw new ConnectionError('Connection endpoint changed; regenerate the plan', 409);
+    const protocolMatches = !expected.api || value.protocol === 'passthrough' || expected.api === 'passthrough' || value.protocol === expected.api;
+    if (value.base_url !== expected.base_url || !protocolMatches) throw new ConnectionError('Connection endpoint changed; regenerate the plan', 409);
     try {
       return await this.credential(value);
     } catch { throw new ConnectionError('API credential unavailable; rotate it in Studio or use cr provider rotate'); }
@@ -146,9 +168,9 @@ export class Connections {
     await atomic(join(this.secrets, ref), value);
     return 'file' as const;
   }
-  create(input: z.infer<typeof createConnectionSchema>) {
+  create(input: z.input<typeof createConnectionSchema>) {
     return this.locked(async () => {
-      const { secret, ...data } = input;
+      const { secret, ...data } = createConnectionSchema.parse(input);
       const id = data.id ?? 'conn-' + randomUUID();
       checkPublicMetadata(secret, { ...data, id });
       const ref = randomUUID();
@@ -162,11 +184,12 @@ export class Connections {
       return pub(value);
     });
   }
-  patch(id: string, patch: z.infer<typeof patchConnectionSchema>) {
+  patch(id: string, patch: z.input<typeof patchConnectionSchema>) {
     return this.locked(async () => {
+      const parsedPatch = patchConnectionSchema.parse(patch);
       const old = await this.stored(id);
-      if (patch.base_url && new URL(patch.base_url).origin !== old.approved_origin) throw new ConnectionError('Create a new provider to authorize a different origin', 409);
-      const value = { ...old, ...patch };
+      if (parsedPatch.base_url && new URL(parsedPatch.base_url).origin !== old.approved_origin) throw new ConnectionError('Create a new provider to authorize a different origin', 409);
+      const value = { ...old, ...parsedPatch };
       const current = await this.credential(old).catch(() => undefined);
       if (current) checkPublicMetadata(current, pub(value));
       await atomic(this.path(id), JSON.stringify(value));

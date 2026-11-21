@@ -66,7 +66,14 @@ test('actual Codex reads full PDF page images and submits over MCP in a no-netwo
     assert.ok(!JSON.stringify(await exportRun(out, result.runId)).includes('local-test-key'));
     const events = log.trim().split('\n').map(JSON.parse);
     assert.equal(events.find(event => event.type === 'model_response').request_id, 'Bearer [REDACTED]');
+    assert.ok(events.some(event => event.type === 'model_timing' && typeof event.ttft_ms === 'number' && typeof event.duration_ms === 'number'));
     assert.equal(events.at(-1).score, 3);
+    const runMeta = JSON.parse(await readFile(join(result.directory, 'run.json'), 'utf8'));
+    assert.equal(runMeta.protocol_preset, 'short');
+    assert.equal(runMeta.scoring_mode, 'last_ac');
+    assert.deepEqual(runMeta.problems, [{ id: '1', max_points: 3 }, { id: '2', max_points: 5 }]);
+    assert.deepEqual(runMeta.sandbox.resources, { memory: '4g', cpus: '2', pids: 256, workspace: '512m' });
+    assert.equal(runMeta.model.speed_tier, 'standard');
   } finally {
     server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));

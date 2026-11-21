@@ -4,7 +4,9 @@ import { z } from 'zod';
 import { agentKind } from './agent-manifest.js';
 import { loadAgent, loadContest } from './config.js';
 import type { Connections } from './connections.js';
+import { speedTierSchema } from './harnesses.js';
 import { assertCompatible } from './plan.js';
+import { resolveProtocolPreset, resolveScoringMode } from './protocol.js';
 import { documentFormat, parseDocumentText } from './serialization.js';
 
 const skipped = new Set(['node_modules', 'dist', 'coverage', 'runs']);
@@ -41,11 +43,17 @@ export async function agentCatalog(base: string, store: Connections) {
     const harness = record(raw.harness);
     const provider = text(raw.provider) ?? text(raw.connection) ?? ('value' in loaded ? loaded.value.connection : undefined);
     const id = text(raw.id) ?? text(raw.agent_id) ?? ('value' in loaded ? loaded.value.agent.agent_id : path.split('/').at(-1)!);
-    entries.push({ id, path: relative(base, path), model: text(raw.model) ?? ('value' in loaded ? loaded.value.profile.model : ''),
+    const name = ('value' in loaded ? loaded.value.agentName : undefined) ?? (text(raw.name)?.trim() || undefined);
+    const rawTier = speedTierSchema.safeParse(raw.speed_tier);
+    const speed_tier = 'value' in loaded ? loaded.value.speedTier : (rawTier.success ? rawTier.data : undefined);
+    entries.push({
+      id, ...(name ? { name } : {}), path: relative(base, path), model: text(raw.model) ?? ('value' in loaded ? loaded.value.profile.model : ''),
       vendor: text(raw.vendor) ?? ('value' in loaded ? loaded.value.vendor : undefined),
+      ...(speed_tier ? { speed_tier } : {}),
       harness: text(harness.kind) ?? text(raw.harness) ?? ('value' in loaded ? loaded.value.profile.harness : 'unknown'), provider,
       provider_available: provider ? providers.has(provider) : true,
-      valid: 'value' in loaded, issues: 'error' in loaded ? [issue(loaded.error)] : [] });
+      valid: 'value' in loaded, issues: 'error' in loaded ? [issue(loaded.error)] : [],
+    });
   }
   return entries.sort((a, b) => a.id.localeCompare(b.id) || a.path.localeCompare(b.path));
 }
@@ -63,6 +71,10 @@ export async function contestCatalog(base: string) {
       judge_kind: text(judge.kind) ?? 'unknown',
       problem_count: 'value' in loaded ? loaded.value.contest.problems.length : Array.isArray(raw.problems) ? raw.problems.length : 0,
       time_limit_ms: 'value' in loaded ? loaded.value.contest.rules.time_limit_ms : typeof rules.time_limit_ms === 'number' ? rules.time_limit_ms : 900_000,
+      ...('value' in loaded ? {
+        protocol_preset: resolveProtocolPreset(loaded.value.contest.rules),
+        scoring_mode: resolveScoringMode(loaded.value.contest.rules),
+      } : {}),
       valid: 'value' in loaded, issues: 'error' in loaded ? [issue(loaded.error)] : [] });
   }
   return entries.sort((a, b) => a.title.localeCompare(b.title) || a.path.localeCompare(b.path));

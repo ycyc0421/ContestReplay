@@ -1,6 +1,7 @@
-import { createServer, type IncomingMessage } from 'node:http';
+import { createServer, type IncomingHttpHeaders, type IncomingMessage } from 'node:http';
 import { createServer as socketServer } from 'node:net';
 import { chmod, mkdir, writeFile } from 'node:fs/promises';
+import { performance } from 'node:perf_hooks';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -15,6 +16,13 @@ import { z } from 'zod';
 
 type Codex = Extract<AgentProfile, { harness: 'codex' }>;
 type Endpoint = ReturnType<typeof socketServer> | ReturnType<typeof createServer>;
+const ALLOWED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD']);
+const STRIPPED_REQUEST_HEADERS = new Set([
+  'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer',
+  'transfer-encoding', 'upgrade', 'host', 'content-length', 'authorization', 'x-api-key', 'api-key',
+  'cookie', 'forwarded',
+]);
+
 async function listen(server: Endpoint, path: string) {
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -25,16 +33,65 @@ async function listen(server: Endpoint, path: string) {
 export async function codexConfig(dir: string, profile: Codex, native?: NativeOverride) {
   await writeFile(join(dir, 'config.toml'), effectiveFor(profile, native).content, { mode: 0o444 });
 }
-async function requestBody(req: IncomingMessage) {
+async function rawRequestBody(req: IncomingMessage) {
   const buffers: Buffer[] = []; let size = 0;
   for await (const chunk of req) {
     size += (chunk as Buffer).length;
     if (size > 48_000_000) throw new Error('Model request too large');
     buffers.push(chunk as Buffer);
   }
-  const parsed: unknown = JSON.parse(Buffer.concat(buffers).toString());
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Expected JSON object');
-  return parsed as Record<string, unknown>;
+  return Buffer.concat(buffers);
+}
+export function resolveRelayTarget(baseUrl: string, reqUrl: string) {
+  if (!reqUrl || !reqUrl.startsWith('/') || reqUrl.startsWith('//') || reqUrl.includes('\0') || reqUrl.includes('\\')) {
+    throw new Error('Invalid relay path');
+  }
+  let parsed: URL;
+  try { parsed = new URL(reqUrl, 'http://relay.local'); }
+  catch { throw new Error('Invalid relay path'); }
+  if (parsed.origin !== 'http://relay.local') throw new Error('Invalid relay path');
+  const rawPath = reqUrl.split(/[?#]/)[0] ?? '';
+  const hasUnsafeSegment = (pathname: string) => pathname.split('/').some(seg => {
+    if (seg === '.' || seg === '..') return true;
+    try {
+      const decoded = decodeURIComponent(seg);
+      return decoded === '.' || decoded === '..' || decoded.includes('/') || decoded.includes('\\') || decoded.includes('\0');
+    } catch { return true; }
+  });
+  if (hasUnsafeSegment(rawPath) || hasUnsafeSegment(parsed.pathname)) throw new Error('Path traversal is not allowed');
+  const subpath = parsed.pathname === '/v1' ? '' : parsed.pathname.startsWith('/v1/') ? parsed.pathname.slice(3) : parsed.pathname;
+  const base = new URL(baseUrl.replace(/\/+$/, ''));
+  const basePath = base.pathname.replace(/\/+$/, '');
+  const joinedPath = basePath + (subpath === '/' && basePath ? '' : subpath);
+  const target = new URL(`${base.origin}${joinedPath || '/'}${parsed.search}`);
+  if (target.origin !== base.origin) throw new Error('Relay target escaped pinned origin');
+  if (basePath && target.pathname !== basePath && !target.pathname.startsWith(`${basePath}/`)) {
+    throw new Error('Relay target escaped pinned base path');
+  }
+  return { target, subpath: subpath || '/' };
+}
+function forwardHeaders(incoming: IncomingHttpHeaders, key: string, api: string): Record<string, string> {
+  const connectionTokens = new Set(
+    String(incoming.connection ?? '').split(',').map(token => token.trim().toLowerCase()).filter(Boolean),
+  );
+  const headers: Record<string, string> = {};
+  for (const [rawName, rawValue] of Object.entries(incoming)) {
+    if (rawValue === undefined) continue;
+    const name = rawName.toLowerCase();
+    if (STRIPPED_REQUEST_HEADERS.has(name) || connectionTokens.has(name) || name.startsWith('x-forwarded-')) continue;
+    headers[name] = Array.isArray(rawValue) ? rawValue.join(', ') : rawValue;
+  }
+  headers.authorization = `Bearer ${key}`;
+  if (api === 'anthropic-messages') headers['x-api-key'] = key;
+  return headers;
+}
+function looksLikeResponsesPayload(body: Record<string, unknown>) {
+  return Object.hasOwn(body, 'input') && (
+    Object.hasOwn(body, 'previous_response_id') ||
+    Object.hasOwn(body, 'conversation') ||
+    Object.hasOwn(body, 'store') ||
+    Object.hasOwn(body, 'reasoning')
+  );
 }
 export function checkModelRequest(body: Record<string, unknown>, model: string) {
   if (body.model !== model || body.previous_response_id || body.conversation || body.background || body.prompt || body.include && !Array.isArray(body.include)) throw new Error('Unsupported model request');
@@ -53,8 +110,11 @@ export function checkModelRequest(body: Record<string, unknown>, model: string) 
   return { ...body, store: false };
 }
 export async function serveContestChannels(opts: { dir: string; profile: Codex; key: string; signal: AbortSignal;
-  native?: NativeOverride; contest: Pick<ReturnType<typeof match>, 'submit' | 'status' | 'close'>; event: EventSink; finish: () => void; fault: (reason: string) => void }) {
+  native?: NativeOverride; maxTurns?: number; requestTimeoutMs?: number;
+  contest: Pick<ReturnType<typeof match>, 'submit' | 'status' | 'close'>; event: EventSink; finish: () => void; fault: (reason: string) => void }) {
   const { dir, profile, key, signal, contest, event } = opts;
+  const maxTurns = opts.maxTurns ?? protocol.maxTurns;
+  const requestTimeoutMs = opts.requestTimeoutMs ?? protocol.requestTimeoutMs;
   await mkdir(dir, { mode: 0o755 });
   const stop = new AbortController();
   const current = AbortSignal.any([stop.signal, signal]);
@@ -66,66 +126,158 @@ export async function serveContestChannels(opts: { dir: string; profile: Codex; 
   const track = (socket: import('node:net').Socket) => { connections.add(socket); socket.once('close', () => connections.delete(socket)); };
   const relay = createServer((req, res) => {
     const reject = (status: number, message: string) => { if (res.headersSent) res.destroy(); else res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify({ error: { message } })); };
-    if (req.method !== 'POST' || req.url !== '/v1/responses') { reject(404, 'Unsupported model endpoint'); return; }
+    const method = (req.method ?? 'GET').toUpperCase();
+    if (!ALLOWED_METHODS.has(method)) { reject(405, 'Unsupported HTTP method'); return; }
+    let resolved: ReturnType<typeof resolveRelayTarget>;
+    try { resolved = resolveRelayTarget(profile.base_url, req.url ?? ''); }
+    catch (error) {
+      event({ type: 'model_request_rejected', reason: error instanceof Error ? error.message : 'Invalid relay path' });
+      reject(400, 'Disallowed relay path');
+      return;
+    }
     if (finished || current.aborted || inFlight) { reject(429, 'Model request already in flight or run closed'); return; }
-    if (calls >= protocol.maxTurns) { opts.fault('turn_limit'); reject(429, 'Run model request limit reached'); return; }
+    if (calls >= maxTurns) { opts.fault('turn_limit'); reject(429, 'Run model request limit reached'); return; }
     inFlight = true;
     void (async () => {
-      let body: ReturnType<typeof checkModelRequest>;
-      try { body = checkModelRequest(await requestBody(req), profile.model); }
-      catch (error) { event({ type: 'model_request_rejected', reason: error instanceof Error && !(error instanceof SyntaxError) ? error.message : 'Invalid JSON' }); opts.fault('invalid_model_request'); reject(400, 'Disallowed request'); return; }
-      // Codex may omit native verbosity for models absent from its catalog.
-      // Apply the explicitly configured value to the approved Responses request.
-      const verbosity = opts.native?.model_verbosity;
-      if (verbosity) {
-        const text = (body as Record<string, unknown>).text;
-        Object.assign(body, { text: { ...(text && typeof text === 'object' && !Array.isArray(text) ? text : {}), verbosity } });
+      const isResponsesPath = method === 'POST' && (resolved.subpath === '/responses' || resolved.subpath.endsWith('/responses'));
+      const headers = forwardHeaders(req.headers, key, profile.api);
+      const hasBody = method !== 'GET' && method !== 'HEAD';
+      let rawBody: Buffer = Buffer.alloc(0);
+      if (hasBody) {
+        try { rawBody = await rawRequestBody(req); }
+        catch (error) {
+          event({ type: 'model_request_rejected', reason: error instanceof Error ? error.message : 'Request too large' });
+          opts.fault('invalid_model_request'); reject(400, 'Disallowed request'); return;
+        }
+      }
+      let outgoingBody: Buffer | undefined = hasBody && rawBody.length > 0 ? rawBody : undefined;
+      let requestedModel: string = profile.model;
+      let reasoning: unknown = null;
+      const contentType = String(req.headers['content-type'] ?? '').toLowerCase();
+      let parsedJson: Record<string, unknown> | undefined;
+      if (hasBody && (isResponsesPath || (rawBody.length > 0 && contentType.includes('application/json')))) {
+        try {
+          const parsed: unknown = JSON.parse(rawBody.toString('utf8'));
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) parsedJson = parsed as Record<string, unknown>;
+          else if (isResponsesPath) throw new Error('Expected JSON object');
+        } catch (error) {
+          if (isResponsesPath) {
+            event({ type: 'model_request_rejected', reason: error instanceof Error && !(error instanceof SyntaxError) ? error.message : 'Invalid JSON' });
+            opts.fault('invalid_model_request'); reject(400, 'Disallowed request'); return;
+          }
+        }
+      }
+      if (parsedJson && (isResponsesPath || looksLikeResponsesPayload(parsedJson))) {
+        let checked: ReturnType<typeof checkModelRequest>;
+        try { checked = checkModelRequest(parsedJson, profile.model); }
+        catch (error) {
+          event({ type: 'model_request_rejected', reason: error instanceof Error ? error.message : 'Disallowed request' });
+          opts.fault('invalid_model_request'); reject(400, 'Disallowed request'); return;
+        }
+        // Codex may omit native verbosity for models absent from its catalog.
+        // Apply the explicitly configured value to the approved Responses request.
+        const verbosity = opts.native?.model_verbosity;
+        if (verbosity) {
+          const text = (checked as Record<string, unknown>).text;
+          Object.assign(checked, { text: { ...(text && typeof text === 'object' && !Array.isArray(text) ? text : {}), verbosity } });
+        }
+        if (profile.service_tier) {
+          Object.assign(checked, { service_tier: profile.service_tier });
+        }
+        reasoning = (checked as Record<string, unknown>).reasoning ?? null;
+        outgoingBody = Buffer.from(JSON.stringify(checked));
+        headers['content-type'] = 'application/json';
+      } else if (parsedJson) {
+        if (typeof parsedJson.model === 'string') requestedModel = parsedJson.model;
+        if (parsedJson.reasoning !== undefined) reasoning = parsedJson.reasoning;
       }
       const turn = ++calls;
-      event({ type: 'model_request', turn, model: profile.model, reasoning: (body as Record<string, unknown>).reasoning ?? null });
+      event({ type: 'model_request', turn, method, path: resolved.subpath, model: requestedModel, reasoning });
       const disconnected = new AbortController();
       res.once('close', () => { if (!res.writableFinished) disconnected.abort(); });
-      const requestSignal = AbortSignal.any([current, disconnected.signal, AbortSignal.timeout(protocol.requestTimeoutMs)]);
+      const requestSignal = AbortSignal.any([current, disconnected.signal, AbortSignal.timeout(requestTimeoutMs)]);
+      const startedAt = performance.now();
       let completed = false;
+      let ttftMs: number | undefined;
+      let upstreamStatus: number | undefined;
       try {
-        const upstream = await fetch(profile.base_url.replace(/\/+$/, '') + '/responses', {
-          method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' }, body: JSON.stringify(body), redirect: 'error', signal: requestSignal,
+        const upstream = await fetch(resolved.target, {
+          method, headers, ...(outgoingBody !== undefined ? { body: new Uint8Array(outgoingBody) } : {}),
+          redirect: 'error', signal: requestSignal,
         });
+        upstreamStatus = upstream.status;
+        const headersMs = Math.max(0, Math.round(performance.now() - startedAt));
         const type = upstream.headers.get('content-type') ?? 'application/json';
-        event({ type: 'model_response', turn, status: upstream.status, request_id: upstream.headers.get('x-request-id') });
-        if (!upstream.ok || !upstream.body) {
+        event({ type: 'model_response', turn, status: upstream.status, request_id: upstream.headers.get('x-request-id'), ttft_ms: headersMs, path: resolved.subpath });
+        if (!upstream.ok || (!upstream.body && method !== 'HEAD')) {
           void upstream.body?.cancel().catch(() => {});
+          event({ type: 'model_timing', turn, method, path: resolved.subpath, status: upstream.status, ttft_ms: headersMs, duration_ms: Math.max(0, Math.round(performance.now() - startedAt)) });
           opts.fault('model_request_failed'); reject(502, 'Upstream model request failed'); return;
         }
-        res.writeHead(200, { 'content-type': type });
-        // Preserve the streaming wire protocol; retain only identity and usage metadata.
+        res.writeHead(upstream.status, { 'content-type': type });
+        if (!upstream.body) {
+          res.end();
+          event({ type: 'model_timing', turn, method, path: resolved.subpath, status: upstream.status, ttft_ms: headersMs, duration_ms: Math.max(0, Math.round(performance.now() - startedAt)) });
+          return;
+        }
+        // Preserve the streaming wire protocol; retain only identity, usage, and timing metadata.
         const reader = Readable.fromWeb(upstream.body as Parameters<typeof Readable.fromWeb>[0]);
         const decoder = new TextDecoder(); let line = ''; let observed = false;
         const observe = (text: string) => {
+          const trimmed = text.trim();
+          if (!trimmed || trimmed === '[DONE]') return;
           try {
-            const record = JSON.parse(text) as Record<string, unknown>;
-            const value = (record.response ?? record) as Record<string, unknown>;
+            const record = JSON.parse(trimmed) as Record<string, unknown>;
+            const value = ((record.response ?? record.message ?? record) ?? {}) as Record<string, unknown>;
             if (!observed && typeof value.model === 'string' && typeof value.id === 'string') {
               observed = true;
               event({ type: 'model_identity', turn, model: value.model, response_id: value.id });
             }
-            if (typeof value.model === 'string' && value.model !== profile.model && /^gpt-.*-\d{4}-\d{2}-\d{2}$/.test(profile.model)) opts.fault('unexpected_model');
+            if (isResponsesPath && typeof value.model === 'string' && value.model !== profile.model && /^gpt-.*-\d{4}-\d{2}-\d{2}$/.test(profile.model)) {
+              opts.fault('unexpected_model');
+            }
             if (record.type === 'response.completed' || record.object === 'response') {
               completed = true;
               if (value.usage) event({ type: 'model_usage', turn, usage: value.usage });
+            } else if (record.object === 'chat.completion') {
+              completed = true;
+              if (record.usage) event({ type: 'model_usage', turn, usage: record.usage });
+            } else if (record.object === 'chat.completion.chunk') {
+              const choices = Array.isArray(record.choices) ? record.choices as Record<string, unknown>[] : [];
+              if (choices.some(c => c && typeof c.finish_reason === 'string' && c.finish_reason)) completed = true;
+              if (record.usage) event({ type: 'model_usage', turn, usage: record.usage });
+            } else if (record.type === 'message_start') {
+              if (value.usage) event({ type: 'model_usage', turn, usage: value.usage });
+            } else if (record.type === 'message_delta') {
+              if (record.usage) event({ type: 'model_usage', turn, usage: record.usage });
+            } else if (record.type === 'message_stop') {
+              completed = true;
             }
             if (['response.failed', 'error'].includes(String(record.type))) opts.fault('model_request_failed');
           } catch { /* non-data SSE line */ }
         };
         if (type.includes('text/event-stream')) reader.on('data', (chunk: Buffer) => {
+          if (ttftMs === undefined) ttftMs = Math.max(0, Math.round(performance.now() - startedAt));
           line += decoder.decode(chunk, { stream: true });
           const lines = line.split('\n'); line = lines.pop() ?? '';
           if (line.length > 1_000_000) line = '';
           for (const l of lines) if (l.startsWith('data: ')) observe(l.slice(6));
         });
-        else { reader.on('data', (chunk: Buffer) => { if (line.length <= 1_000_000) line += decoder.decode(chunk, { stream: true }); }); reader.once('end', () => observe(line)); }
+        else {
+          reader.on('data', (chunk: Buffer) => {
+            if (ttftMs === undefined) ttftMs = Math.max(0, Math.round(performance.now() - startedAt));
+            if (line.length <= 1_000_000) line += decoder.decode(chunk, { stream: true });
+          });
+          reader.once('end', () => observe(line));
+        }
         await pipeline(reader, res, { signal: requestSignal });
-      } catch { if (!current.aborted && !finished && !(completed && disconnected.signal.aborted)) opts.fault('model_request_failed'); reject(502, 'Upstream transport failed'); }
+        event({ type: 'model_timing', turn, method, path: resolved.subpath, status: upstream.status, ttft_ms: ttftMs ?? headersMs, duration_ms: Math.max(0, Math.round(performance.now() - startedAt)) });
+      } catch {
+        const durationMs = Math.max(0, Math.round(performance.now() - startedAt));
+        event({ type: 'model_timing', turn, method, path: resolved.subpath, status: upstreamStatus ?? null, ttft_ms: ttftMs ?? durationMs, duration_ms: durationMs });
+        if (!current.aborted && !finished && !(completed && disconnected.signal.aborted)) opts.fault('model_request_failed');
+        reject(502, 'Upstream transport failed');
+      }
     })().finally(() => { inFlight = false; }).catch(() => res.destroy());
   });
   relay.on('connection', track);
