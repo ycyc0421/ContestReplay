@@ -1,0 +1,38 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Length 543 >>
+stream
+BT /F1 20 Tf 70 740 Td (ContestReplay Demo Final) Tj ET
+BT /F1 14 Tf 70 700 Td (1. How many circles are in the box below?) Tj ET
+70 555 290 115 re S
+135 610 m 135 621 126 630 115 630 c 104 630 95 621 95 610 c 95 599 104 590 115 590 c 126 590 135 599 135 610 c S
+230 610 m 230 621 221 630 210 630 c 199 630 190 621 190 610 c 190 599 199 590 210 590 c 221 590 230 599 230 610 c S
+325 610 m 325 621 316 630 305 630 c 294 630 285 621 285 610 c 285 599 294 590 305 590 c 316 590 325 599 325 610 c S
+BT /F1 14 Tf 70 510 Td (2. What is 7 + 5?) Tj ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000000311 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+904
+%%EOF

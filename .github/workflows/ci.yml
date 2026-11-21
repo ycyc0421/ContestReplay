@@ -1,0 +1,17 @@
+name: Checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install --global pnpm@12.17.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: docker build -t cr-bench:0.1.0 . && pnpm test:docker
+      - run: docker build -f Dockerfile.codex -t cr-codex:0.170.0 . && pnpm test:codex

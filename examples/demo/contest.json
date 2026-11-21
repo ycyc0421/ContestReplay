@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "contest_id": "cr-demo-final",
+  "data_version": 1,
+  "title": "ContestReplay Demo Final",
+  "source": {
+    "name": "ContestReplay original sample (CC0-1.0)"
+  },
+  "statement": {
+    "path": "problems.pdf",
+    "sha256": "f56be27fb238d02f4c41e5eb0ec4315ab1457702ef884d38dab7ffbb69672c40",
+    "redistribution": "allowed"
+  },
+  "judge": {
+    "path": "judge.json",
+    "sha256": "091027b205a7397c6698fdf43434c2ef99dd127fa409be27415c03ffb6faf50d",
+    "redistribution": "allowed"
+  }
+}

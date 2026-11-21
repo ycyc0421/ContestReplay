@@ -1,0 +1,8 @@
+id = "demo-codex"
+harness = "codex"
+api = "responses"
+model = "gpt-5.3-codex"
+model_family_id = "gpt-5-codex"
+reasoning_effort = "medium"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"

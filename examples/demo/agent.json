@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "agent_id": "demo-responses",
+  "harness": {
+    "kind": "builtin-responses",
+    "version": "0.1.0"
+  },
+  "config": "responses.toml"
+}
