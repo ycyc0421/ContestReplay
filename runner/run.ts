@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { constants, createWriteStream, type WriteStream } from 'node:fs';
-import { chmod, lstat, mkdir, mkdtemp, open, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { once } from 'node:events';
 import { performance } from 'node:perf_hooks';
 import { finished } from 'node:stream/promises';
@@ -11,12 +11,12 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { ResponseInput } from 'openai/resources/responses/responses.js';
 import { z } from 'zod';
 import { createContest, createMcp, finishArgs, statusArgs, submitArgs, type EventSink } from './contest.js';
-import { protocol, protocolDigestForPreset, protocolForPreset, resolveProtocolPreset, resolveScoringMode, toolDefinitions } from './protocol.js';
+import { protocol, protocolDigestForPreset, protocolForPreset, resolveProtocolPreset, resolveScoringMode } from './protocol.js';
 import { agentRevision, type Inputs } from './config.js';
 import { launch, renderPdf, resources, SandboxCleanupError } from './docker.js';
 import { match } from './match.js';
 import { codeforces, type ProgramJudge } from './codeforces.js';
-import { codexConfig, serveContestChannels } from './codex.js';
+import { codexConfig, serveContestChannels, type SessionArchiveResult } from './codex.js';
 import type { Infer } from './model.js';
 import { send } from './wire.js';
 import { credentialJson, redactCredentialStream } from './credential-redaction.js';
@@ -36,37 +36,51 @@ function interrupt(signal: AbortSignal): Promise<never> {
 
 export const SESSION_ARCHIVE_MAX_BYTES = 32 * 1024 * 1024;
 const SESSION_ARCHIVE_MAX_FILES = 256;
+const SESSION_ARCHIVE_MAX_ENTRIES = 2048;
 const SESSION_ARCHIVE_MAX_DEPTH = 8;
 
-export async function archiveSessionDir(sourceDir: string, targetDir: string, key?: string, maxBytes = SESSION_ARCHIVE_MAX_BYTES): Promise<string[]> {
+export async function archiveSessionDir(
+  sourceDir: string,
+  targetDir: string,
+  key?: string,
+  maxBytes = SESSION_ARCHIVE_MAX_BYTES,
+  maxEntriesVisited = SESSION_ARCHIVE_MAX_ENTRIES,
+): Promise<string[]> {
   let rootInfo;
   try { rootInfo = await lstat(sourceDir); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
   if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) return [];
+  const rootReal = await realpath(sourceDir);
+  const rootPrefix = rootReal.endsWith(sep) ? rootReal : rootReal + sep;
 
   const archived: string[] = [];
   let remaining = maxBytes;
+  let entriesVisited = 0;
 
   const walk = async (currentDir: string, relPrefix: string, depth: number): Promise<void> => {
-    if (depth > SESSION_ARCHIVE_MAX_DEPTH || remaining <= 0 || archived.length >= SESSION_ARCHIVE_MAX_FILES) return;
+    if (depth > SESSION_ARCHIVE_MAX_DEPTH || remaining <= 0 || archived.length >= SESSION_ARCHIVE_MAX_FILES || entriesVisited >= maxEntriesVisited) return;
     const names = (await readdir(currentDir)).sort();
     for (const name of names) {
-      if (remaining <= 0 || archived.length >= SESSION_ARCHIVE_MAX_FILES) break;
+      if (remaining <= 0 || archived.length >= SESSION_ARCHIVE_MAX_FILES || ++entriesVisited > maxEntriesVisited) break;
       if (!name || name === '.' || name === '..' || name.includes('/') || name.includes('\\') || name.includes('\0')) continue;
       const srcPath = join(currentDir, name);
       let info;
       try { info = await lstat(srcPath); } catch { continue; }
       if (info.isSymbolicLink()) continue;
+      let resolvedPath: string;
+      try { resolvedPath = await realpath(srcPath); } catch { continue; }
+      if (!resolvedPath.startsWith(rootPrefix)) continue;
       const rel = relPrefix ? `${relPrefix}/${name}` : name;
       if (info.isDirectory()) {
         await walk(srcPath, rel, depth + 1);
       } else if (info.isFile()) {
+        if (info.nlink > 1) continue;
         let handle;
         try { handle = await open(srcPath, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW); }
         catch { continue; }
         try {
           const statInfo = await handle.stat();
-          if (!statInfo.isFile()) continue;
+          if (!statInfo.isFile() || statInfo.nlink > 1) continue;
           const destPath = join(targetDir, ...rel.split('/'));
           await mkdir(dirname(destPath), { recursive: true, mode: 0o700 });
           const out = createWriteStream(destPath, { mode: 0o600, flags: 'wx' });
@@ -194,8 +208,8 @@ export async function runBench(inputs: Inputs, opts: {
   void stoppedPromise.catch(() => {});
   const wait = <T>(p: Promise<T>) => Promise.race([p, stoppedPromise]);
   let stage: string | undefined;
-  let sessionStage: string | undefined;
-  let sessionFiles: string[] = [];
+  let sessionResult: SessionArchiveResult = { status: 'empty', files: [] };
+  const isCodex = inputs.profile.harness === 'codex';
   let sandbox: Awaited<ReturnType<typeof launch>> | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let client: Client | undefined;
@@ -228,9 +242,6 @@ export async function runBench(inputs: Inputs, opts: {
       await mkdir(attachments, { mode: 0o755 });
       for (const file of inputs.attachments) await writeFile(join(attachments, file.name), file.bytes, { mode: 0o444 });
       await codexConfig(input, inputs.profile, inputs.native);
-      sessionStage = join(stage, 'sessions');
-      await mkdir(sessionStage, { mode: 0o777 });
-      await chmod(sessionStage, 0o777);
       const channels = join(stage, 'channels');
       const judge = opts.programJudge ?? (inputs.contest.judge.kind === 'codeforces' ? codeforces(inputs.contest.judge) : undefined);
       // Create the session lazily at t=0, after the container is launched.
@@ -240,14 +251,19 @@ export async function runBench(inputs: Inputs, opts: {
       const terminal = new Promise<string>(resolve => { endRun = resolve; });
       closeChannels = await serveContestChannels({
         dir: channels, profile: inputs.profile, native: inputs.native, key: opts.key, signal: stopped,
-        maxTurns: preset.maxTurns, requestTimeoutMs: preset.requestTimeoutMs,
+        maxTurns: preset.maxTurns, requestTimeoutMs: preset.requestTimeoutMs, maxRequestBytes: preset.maxRequestBytes,
+        sessionArchive: {
+          dir: join(directory, 'session'),
+          maxBytes: SESSION_ARCHIVE_MAX_BYTES,
+          onResult: res => { sessionResult = res; },
+        },
         contest: { submit: args => session().submit(args), status: id => session().status(id), close: () => session().close() },
         event, finish: () => {
           endRun('finish');
         }, fault: endRun,
       });
       sandbox = await launch(runId, opts.image, pdfPath, opts.signal, stderr, {
-        input, channels, sessions: sessionStage, env: inputs.env, resources: preset.sandbox, onStdout: stdout,
+        input, channels, env: inputs.env, resources: preset.sandbox, onStdout: stdout,
       });
       elapsed = session().elapsed;
       started = true;
@@ -260,6 +276,17 @@ export async function runBench(inputs: Inputs, opts: {
       const end = await wait(Promise.race([terminal, sandbox.exited.then(code => code === 0 ? 'agent_ended' : 'sandbox_exited')]));
       reason = end;
       status = ['finish', 'agent_ended', 'turn_limit'].includes(end) ? 'completed' : 'void';
+      if (end === 'finish' || end === 'turn_limit') {
+        // Allow a strictly bounded grace window for bridge.js to finish flushing
+        // container session artifacts over /channels/session.sock before force removal.
+        await Promise.race([
+          sandbox.exited,
+          new Promise<void>(resolve => {
+            const grace = setTimeout(resolve, 1_500);
+            opts.signal.addEventListener('abort', () => { clearTimeout(grace); resolve(); }, { once: true });
+          }),
+        ]);
+      }
     } else {
     if (!opts.infer) throw new RunFailure('missing_model_adapter');
     if (inputs.contest.judge.kind !== 'local' || inputs.attachments.length) throw new RunFailure('unsupported_contest');
@@ -368,22 +395,28 @@ export async function runBench(inputs: Inputs, opts: {
     cleanup.abort();
     contestMatch?.close();
     if (timer) clearTimeout(timer);
-    try { await closeChannels?.(); }
-    catch { status = 'void'; reason = 'relay_cleanup_failed'; }
-    try { await client?.close(); await mcp?.close(); }
-    catch { status = 'void'; reason = 'mcp_cleanup_failed'; }
+    let sandboxCleanupFailed = reason === 'sandbox_cleanup_failed';
     try { await sandbox?.close(); }
-    catch { status = 'void'; reason = 'sandbox_cleanup_failed'; }
-    if (sessionStage) {
-      sessionFiles = await archiveSessionDir(sessionStage, join(directory, 'session'), opts.key).catch(() => []);
-      if (sessionFiles.length > 0) {
-        const tmp = `${runJsonPath}.${randomUUID()}.tmp`;
-        try {
-          await writeFile(tmp, credentialJson({ ...runMeta, session_files: sessionFiles }, opts.key, 2) + '\n', { mode: 0o600, flag: 'wx' });
-          await rename(tmp, runJsonPath);
-        } catch {
-          await rm(tmp, { force: true }).catch(() => {});
-        }
+    catch { status = 'void'; reason = 'sandbox_cleanup_failed'; sandboxCleanupFailed = true; }
+    try { await closeChannels?.(); }
+    catch { status = 'void'; if (!sandboxCleanupFailed) reason = 'relay_cleanup_failed'; }
+    try { await client?.close(); await mcp?.close(); }
+    catch { status = 'void'; if (!sandboxCleanupFailed) reason = 'mcp_cleanup_failed'; }
+    if (isCodex) {
+      if (sandboxCleanupFailed) {
+        sessionResult = { status: 'failed', files: [] };
+        await rm(join(directory, 'session'), { recursive: true, force: true }).catch(() => {});
+      }
+      const tmp = `${runJsonPath}.${randomUUID()}.tmp`;
+      try {
+        await writeFile(tmp, credentialJson({
+          ...runMeta,
+          session_archive_status: sessionResult.status,
+          ...(sessionResult.files.length > 0 ? { session_files: sessionResult.files } : {}),
+        }, opts.key, 2) + '\n', { mode: 0o600, flag: 'wx' });
+        await rename(tmp, runJsonPath);
+      } catch {
+        await rm(tmp, { force: true }).catch(() => {});
       }
     }
     try { if (stage) await rm(stage, { recursive: true, force: true }); }
@@ -402,7 +435,8 @@ export async function runBench(inputs: Inputs, opts: {
       type: 'run_ended', status, reason,
       score: status === 'completed' ? contestMatch?.score() ?? contest?.score() ?? 0 : null,
       max_score: inputs.contest.problems.reduce((sum, p) => sum + p.max_points, 0),
-      ...(sessionFiles.length > 0 ? { session_files: sessionFiles } : {}),
+      ...(isCodex ? { session_archive_status: sessionResult.status } : {}),
+      ...(sessionResult.files.length > 0 ? { session_files: sessionResult.files } : {}),
     });
     log.end();
     await logClosed;

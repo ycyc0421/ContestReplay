@@ -96,7 +96,7 @@ async function main(args: string[]) {
           ...(v['supports-ultrafast'] ? { supports_ultrafast: true } : {}),
         })));
         else print(await store.rotate(id, rotateConnectionSchema.parse({ secret }).secret));
-      } catch { throw new Error('Could not save provider; check ID, label, endpoint and credential storage'); }
+      } catch { throw new Error('Could not save provider; check ID, label, protocol, endpoint and credential storage'); }
       return 0;
     }
     if (group === 'contest' && command === 'init') {

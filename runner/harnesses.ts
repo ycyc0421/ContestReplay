@@ -61,12 +61,22 @@ export function parseNative(kind: HarnessKind, content: string): NativeOverride 
   if (!result.success) throw new Error('Only model_verbosity (low, medium, high) may be overridden; safety, provider, MCP and environment settings are runner-managed');
   return result.data;
 }
+export function codexConfigServiceTier(serviceTier?: string): 'fast' | undefined {
+  if (serviceTier === 'fast' || serviceTier === 'priority') return 'fast';
+  return undefined;
+}
+export function responsesServiceTier(serviceTier?: string): 'priority' | 'default' | undefined {
+  if (serviceTier === 'fast' || serviceTier === 'priority') return 'priority';
+  if (serviceTier === 'standard') return 'default';
+  return undefined;
+}
 export function codexEffective(model: string, reasoning?: string, native?: NativeOverride, serviceTier?: string) {
+  const configTier = codexConfigServiceTier(serviceTier);
   return {
     ...(native?.model_verbosity ? { model_verbosity: native.model_verbosity } : {}),
     model, model_provider: 'cr',
     ...(reasoning ? { model_reasoning_effort: reasoning } : {}),
-    ...(serviceTier && serviceTier !== 'default' ? { service_tier: serviceTier } : {}),
+    ...(configTier ? { service_tier: configTier } : {}),
     approval_policy: 'never', sandbox_mode: 'danger-full-access', web_search: 'disabled', analytics: { enabled: false },
     model_providers: { cr: { name: 'ContestReplay relay', base_url: 'http://127.0.0.1:8745/v1', wire_api: 'responses', request_max_retries: 0, stream_max_retries: 0 } },
     mcp_servers: { contest: { command: 'node', args: ['/app/bridge.js', 'mcp'], required: true } },

@@ -89,7 +89,11 @@ const metadata = resultSchema.omit({ score: true, max_score: true, submissions: 
 });
 
 const isAccepted = (verdict: string) => ['accepted', 'OK', 'AC'].includes(verdict);
-const isNonPenalized = (verdict: string) => ['CE', 'COMPILATION_ERROR', 'compilation_error', 'pending', 'already_accepted'].includes(verdict);
+const isNonPenalized = (verdict: string) => [
+  'CE', 'COMPILATION_ERROR', 'compilation_error',
+  'pending', 'already_accepted',
+  'invalid_submission', 'SKIPPED', 'REJECTED',
+].includes(verdict);
 
 export async function exportRun(root: string, id: string): Promise<Result> {
   const directory = join(root, z.uuid().parse(id));
@@ -101,21 +105,23 @@ export async function exportRun(root: string, id: string): Promise<Result> {
   const observed = new Set<string>();
   const responseDurations = new Map<number, number>();
   const timingDurations = new Map<number, number>();
+  // Deduplicate token usage per turn (e.g. Anthropic message_start + message_delta,
+  // or repeated model_response + model_usage for the same turn).
+  const turnTokens = new Map<number, { inp?: number; out?: number }>();
   let modelTurns = 0;
-  let totalInputTokens = 0;
-  let totalOutputTokens = 0;
-  let hasInputTokens = false;
-  let hasOutputTokens = false;
   let terminal: Record<string, unknown> | undefined;
   let seq = 0;
 
-  const recordUsage = (usage: unknown) => {
+  const recordUsage = (turnKey: number, usage: unknown) => {
     if (!usage || typeof usage !== 'object') return;
     const u = usage as Record<string, unknown>;
     const inp = typeof u.input_tokens === 'number' ? u.input_tokens : typeof u.prompt_tokens === 'number' ? u.prompt_tokens : undefined;
     const out = typeof u.output_tokens === 'number' ? u.output_tokens : typeof u.completion_tokens === 'number' ? u.completion_tokens : undefined;
-    if (inp !== undefined && Number.isFinite(inp) && inp >= 0) { totalInputTokens += Math.round(inp); hasInputTokens = true; }
-    if (out !== undefined && Number.isFinite(out) && out >= 0) { totalOutputTokens += Math.round(out); hasOutputTokens = true; }
+    const prev = turnTokens.get(turnKey) ?? {};
+    let updated = false;
+    if (inp !== undefined && Number.isFinite(inp) && inp >= 0) { prev.inp = Math.round(inp); updated = true; }
+    if (out !== undefined && Number.isFinite(out) && out >= 0) { prev.out = Math.round(out); updated = true; }
+    if (updated) turnTokens.set(turnKey, prev);
   };
 
   try {
@@ -153,17 +159,20 @@ export async function exportRun(root: string, id: string): Promise<Result> {
       if (event.type === 'model_request') modelTurns++;
       if (['model_response', 'model_identity'].includes(event.type) && typeof event.model === 'string') observed.add(event.model);
       if (event.type === 'model_response') {
+        const turnKey = typeof event.turn === 'number' ? event.turn : modelTurns || responseDurations.size + 1;
         if (typeof event.duration_ms === 'number' && Number.isFinite(event.duration_ms) && event.duration_ms >= 0) {
-          const turnKey = typeof event.turn === 'number' ? event.turn : modelTurns || responseDurations.size + 1;
           responseDurations.set(turnKey, event.duration_ms);
         }
-        if (event.usage) recordUsage(event.usage);
+        if (event.usage) recordUsage(turnKey, event.usage);
       }
       if (event.type === 'model_timing' && typeof event.duration_ms === 'number' && Number.isFinite(event.duration_ms) && event.duration_ms >= 0) {
         const turnKey = typeof event.turn === 'number' ? event.turn : timingDurations.size + 1;
         timingDurations.set(turnKey, event.duration_ms);
       }
-      if (event.type === 'model_usage') recordUsage(event.usage);
+      if (event.type === 'model_usage') {
+        const turnKey = typeof event.turn === 'number' ? event.turn : modelTurns || turnTokens.size + 1;
+        recordUsage(turnKey, event.usage);
+      }
       if (event.type === 'run_ended') terminal = event;
     }
   } finally { lines.close(); }
@@ -173,6 +182,15 @@ export async function exportRun(root: string, id: string): Promise<Result> {
   const seenTurns = new Set<number>();
   for (const [turnKey, ms] of timingDurations) { modelWaitMs += ms; seenTurns.add(turnKey); }
   for (const [turnKey, ms] of responseDurations) { if (!seenTurns.has(turnKey)) modelWaitMs += ms; }
+
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let hasInputTokens = false;
+  let hasOutputTokens = false;
+  for (const t of turnTokens.values()) {
+    if (t.inp !== undefined) { totalInputTokens += t.inp; hasInputTokens = true; }
+    if (t.out !== undefined) { totalOutputTokens += t.out; hasOutputTokens = true; }
+  }
 
   const telemetry: ResultTelemetry = {
     model_turns: modelTurns,
@@ -208,13 +226,108 @@ export async function exportBatch(root: string, batchId: string) {
   return resultBundle(results);
 }
 
+function coreFingerprint(result: Result) {
+  return JSON.stringify({
+    run_id: result.run_id,
+    contest_id: result.contest_id,
+    data_version: result.data_version,
+    contest_revision: result.contest_revision,
+    protocol_id: result.protocol_id,
+    protocol_version: result.protocol_version,
+    protocol_sha256: result.protocol_sha256,
+    agent_id: result.agent_id,
+    agent_revision: result.agent_revision,
+    harness: result.harness,
+    model: {
+      requested: result.model.requested,
+      observed: [...result.model.observed].sort(),
+      family: result.model.family ?? null,
+    },
+    score: result.score,
+    max_score: result.max_score,
+    submissions: result.submissions.map(s => ({
+      id: s.id,
+      problem_id: s.problem_id,
+      elapsed_ms: s.elapsed_ms,
+      verdict: s.verdict,
+    })),
+  });
+}
+
+function mergeOptionalField<T>(a: T | undefined, b: T | undefined, runId: string): T | undefined {
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`Conflicting run ${runId}`);
+  return a;
+}
+
+function mergeCompatibleRun(existing: Result, incoming: Result): Result {
+  if (JSON.stringify(existing) === JSON.stringify(incoming)) return existing;
+  if (coreFingerprint(existing) !== coreFingerprint(incoming)) throw new Error(`Conflicting run ${existing.run_id}`);
+  const runId = existing.run_id;
+  const submissions: ResultSubmission[] = existing.submissions.map((a, idx) => {
+    const b = incoming.submissions[idx]!;
+    const language = mergeOptionalField(a.language, b.language, runId);
+    const score = mergeOptionalField(a.score, b.score, runId);
+    const max_points = mergeOptionalField(a.max_points, b.max_points, runId);
+    const remote_submission_id = mergeOptionalField(a.remote_submission_id, b.remote_submission_id, runId);
+    return {
+      id: a.id,
+      problem_id: a.problem_id,
+      elapsed_ms: a.elapsed_ms,
+      verdict: a.verdict,
+      ...(language !== undefined ? { language } : {}),
+      ...(score !== undefined ? { score } : {}),
+      ...(max_points !== undefined ? { max_points } : {}),
+      ...(remote_submission_id !== undefined ? { remote_submission_id } : {}),
+    };
+  });
+  const contest_title = mergeOptionalField(existing.contest_title, incoming.contest_title, runId);
+  const protocol_preset = mergeOptionalField(existing.protocol_preset, incoming.protocol_preset, runId);
+  const scoring_mode = mergeOptionalField(existing.scoring_mode, incoming.scoring_mode, runId);
+  const agent_name = mergeOptionalField(existing.agent_name, incoming.agent_name, runId);
+  const telemetry = mergeOptionalField(existing.telemetry, incoming.telemetry, runId);
+  const vendor = mergeOptionalField(existing.model.vendor, incoming.model.vendor, runId);
+  const reasoning_effort = mergeOptionalField(existing.model.reasoning_effort, incoming.model.reasoning_effort, runId);
+  const speed_tier = mergeOptionalField(existing.model.speed_tier, incoming.model.speed_tier, runId);
+  const service_tier = mergeOptionalField(existing.model.service_tier, incoming.model.service_tier, runId);
+  return resultSchema.parse({
+    run_id: existing.run_id,
+    contest_id: existing.contest_id,
+    ...(contest_title !== undefined ? { contest_title } : {}),
+    data_version: existing.data_version,
+    contest_revision: existing.contest_revision,
+    protocol_id: existing.protocol_id,
+    protocol_version: existing.protocol_version,
+    protocol_sha256: existing.protocol_sha256,
+    ...(protocol_preset !== undefined ? { protocol_preset } : {}),
+    ...(scoring_mode !== undefined ? { scoring_mode } : {}),
+    agent_id: existing.agent_id,
+    ...(agent_name !== undefined ? { agent_name } : {}),
+    agent_revision: existing.agent_revision,
+    harness: existing.harness,
+    model: {
+      requested: existing.model.requested,
+      observed: existing.model.observed,
+      ...(existing.model.family !== undefined ? { family: existing.model.family } : {}),
+      ...(vendor !== undefined ? { vendor } : {}),
+      ...(reasoning_effort !== undefined ? { reasoning_effort } : {}),
+      ...(speed_tier !== undefined ? { speed_tier } : {}),
+      ...(service_tier !== undefined ? { service_tier } : {}),
+    },
+    score: existing.score,
+    max_score: existing.max_score,
+    ...(telemetry !== undefined ? { telemetry } : {}),
+    submissions,
+  });
+}
+
 export function mergeResults(bundles: unknown[]) {
   const results = new Map<string, Result>();
   for (const bundle of bundles) for (const result of resultsSchema.parse(bundle).results) {
     const normalized = result as Result;
     const current = results.get(normalized.run_id);
-    if (current && JSON.stringify(current) !== JSON.stringify(normalized)) throw new Error(`Conflicting run ${normalized.run_id}`);
-    results.set(normalized.run_id, normalized);
+    results.set(normalized.run_id, current ? mergeCompatibleRun(current, normalized) : normalized);
   }
   return resultBundle([...results.values()]);
 }
@@ -234,7 +347,9 @@ export type ScoredResult = {
   solved: number;
   penalty_minutes?: number;
   points?: number;
-  last_ac_ms: number;
+  tie_break_ms: number;
+  last_ac_ms?: number;
+  scoring_unavailable?: boolean;
   per_problem: Record<string, ProblemScoreBreakdown>;
 };
 
@@ -250,9 +365,11 @@ export function scoreResult(result: Result, mode: ScoringMode = result.scoring_m
   let penaltyMinutes = 0;
   let ioiPoints = 0;
   let cfPoints = 0;
+  let missingCfWeight = false;
   let lastAcMs = 0;
   let lastImproveMs = 0;
-  const hasExplicitSubScores = result.submissions.some(s => typeof s.score === 'number' || typeof s.max_points === 'number');
+  const canComputeIoiFromSubs = result.submissions.some(s => typeof s.score === 'number' || typeof s.max_points === 'number')
+    && result.submissions.every(s => !isAccepted(s.verdict) || typeof s.score === 'number' || typeof s.max_points === 'number');
 
   for (const [problemId, subs] of byProblem) {
     const ordered = subs.map((s, idx) => ({ s, idx })).sort((a, b) => a.s.elapsed_ms - b.s.elapsed_ms || a.idx - b.idx).map(x => x.s);
@@ -262,7 +379,7 @@ export function scoreResult(result: Result, mode: ScoringMode = result.scoring_m
     let bestSubElapsed = 0;
 
     for (const s of ordered) {
-      const subPts = typeof s.score === 'number' ? s.score : isAccepted(s.verdict) ? (s.max_points ?? 1) : 0;
+      const subPts = typeof s.score === 'number' ? s.score : isAccepted(s.verdict) ? (s.max_points ?? 0) : 0;
       if (subPts > bestSubScore) {
         bestSubScore = subPts;
         bestSubElapsed = s.elapsed_ms;
@@ -285,11 +402,18 @@ export function scoreResult(result: Result, mode: ScoringMode = result.scoring_m
       const icpcPen = minutes + 20 * wrongBeforeAc;
       penaltyMinutes += icpcPen;
 
-      const cfBase = firstAc.max_points ?? (typeof firstAc.score === 'number' && firstAc.score > 0 ? firstAc.score : 500);
-      const wrongDeduction = cfBase >= 500 ? 50 : cfBase * 0.1;
-      const rawCf = Math.max(0.3 * cfBase, cfBase * (1 - minutes / 250) - wrongDeduction * wrongBeforeAc);
-      const problemCf = cfBase >= 100 ? Math.round(rawCf) : Math.round(rawCf * 100) / 100;
-      cfPoints += problemCf;
+      const explicitCfBase = typeof firstAc.max_points === 'number'
+        ? firstAc.max_points
+        : (typeof firstAc.score === 'number' && firstAc.score > 0 ? firstAc.score : undefined);
+      let problemCf = 0;
+      if (explicitCfBase !== undefined) {
+        const wrongDeduction = explicitCfBase >= 500 ? 50 : explicitCfBase * 0.1;
+        const rawCf = Math.max(0.3 * explicitCfBase, explicitCfBase * (1 - minutes / 250) - wrongDeduction * wrongBeforeAc);
+        problemCf = explicitCfBase >= 100 ? Math.round(rawCf) : Math.round(rawCf * 100) / 100;
+        cfPoints += problemCf;
+      } else {
+        missingCfWeight = true;
+      }
 
       per_problem[problemId] = {
         solved: true,
@@ -307,23 +431,51 @@ export function scoreResult(result: Result, mode: ScoringMode = result.scoring_m
     }
   }
 
+  const resolvedLastAc = solved > 0 ? lastAcMs : undefined;
+
   if (mode === 'icpc') {
-    return { mode, primary: solved, secondary: penaltyMinutes, solved, penalty_minutes: penaltyMinutes, last_ac_ms: lastAcMs, per_problem };
+    return {
+      mode, primary: solved, secondary: penaltyMinutes, solved, penalty_minutes: penaltyMinutes,
+      tie_break_ms: lastAcMs, ...(resolvedLastAc !== undefined ? { last_ac_ms: resolvedLastAc } : {}), per_problem,
+    };
   }
   if (mode === 'ioi') {
-    const total = hasExplicitSubScores ? Math.round(ioiPoints * 1000) / 1000 : result.score;
-    const finish = hasExplicitSubScores ? lastImproveMs : lastAcMs;
-    return { mode, primary: total, secondary: finish, solved, points: total, last_ac_ms: finish, per_problem };
+    if (canComputeIoiFromSubs) {
+      const total = Math.round(ioiPoints * 1000) / 1000;
+      return {
+        mode, primary: total, secondary: lastImproveMs, solved, points: total,
+        tie_break_ms: lastImproveMs, ...(resolvedLastAc !== undefined ? { last_ac_ms: resolvedLastAc } : {}), per_problem,
+      };
+    }
+    return {
+      mode, primary: result.score, secondary: lastAcMs, solved, points: result.score,
+      tie_break_ms: lastAcMs, ...(resolvedLastAc !== undefined ? { last_ac_ms: resolvedLastAc } : {}),
+      ...(result.submissions.length > 0 && result.score > 0 ? { scoring_unavailable: true } : {}),
+      per_problem,
+    };
   }
   if (mode === 'cf') {
+    if (missingCfWeight) {
+      return {
+        mode, primary: result.score, secondary: lastAcMs, solved, points: result.score,
+        tie_break_ms: lastAcMs, ...(resolvedLastAc !== undefined ? { last_ac_ms: resolvedLastAc } : {}),
+        scoring_unavailable: true, per_problem,
+      };
+    }
     const total = Math.round(cfPoints * 100) / 100;
-    return { mode, primary: total, secondary: lastAcMs, solved, points: total, last_ac_ms: lastAcMs, per_problem };
+    return {
+      mode, primary: total, secondary: lastAcMs, solved, points: total,
+      tie_break_ms: lastAcMs, ...(resolvedLastAc !== undefined ? { last_ac_ms: resolvedLastAc } : {}), per_problem,
+    };
   }
-  return { mode: 'last_ac', primary: result.score, secondary: lastAcMs, solved, points: result.score, last_ac_ms: lastAcMs, per_problem };
+  return {
+    mode: 'last_ac', primary: result.score, secondary: lastAcMs, solved, points: result.score,
+    tie_break_ms: lastAcMs, ...(resolvedLastAc !== undefined ? { last_ac_ms: resolvedLastAc } : {}), per_problem,
+  };
 }
 
 export function compareScoredResults(a: ScoredResult, b: ScoredResult) {
-  return b.primary - a.primary || a.secondary - b.secondary || a.last_ac_ms - b.last_ac_ms;
+  return b.primary - a.primary || a.secondary - b.secondary || a.tie_break_ms - b.tie_break_ms;
 }
 
 export type RankOptions = {
@@ -365,33 +517,35 @@ export function rankResults(bundle: unknown, familyOrOpts?: string | RankOptions
     const sorted: RankedEntry[] = rows
       .map(result => {
         const scoring = scoreResult(result, mode);
-        return { result, finish_ms: scoring.last_ac_ms, scoring };
+        return { result, finish_ms: scoring.tie_break_ms, scoring };
       })
       .sort((a, b) => compareScoredResults(a.scoring, b.scoring) || a.result.run_id.localeCompare(b.result.run_id));
 
     if (groupBy === 'model') {
-      // Policy C: deduplicate distinct (agent_id, agent_revision, reasoning_effort, speed_tier) variants,
-      // then aggregate by canonical (vendor, requested_model) with the highest-ranked primary representative.
-      const seenVariants = new Set<string>();
-      const modelGroups = new Map<string, RankedEntry[]>();
+      // Policy C: group first by canonical (vendor, requested_model), then deduplicate
+      // distinct (agent_id, agent_revision, reasoning_effort, speed_tier) variants within each group.
+      const modelGroups = new Map<string, { seenVariants: Set<string>; variants: RankedEntry[] }>();
       for (const row of sorted) {
+        const modelKey = JSON.stringify([(row.result.model.vendor ?? '').toLowerCase(), row.result.model.requested]);
+        let bucket = modelGroups.get(modelKey);
+        if (!bucket) {
+          bucket = { seenVariants: new Set(), variants: [] };
+          modelGroups.set(modelKey, bucket);
+        }
         const variantKey = JSON.stringify([
           row.result.agent_id,
           row.result.agent_revision,
           row.result.model.reasoning_effort ?? '',
           row.result.model.speed_tier ?? 'standard',
         ]);
-        if (seenVariants.has(variantKey)) continue;
-        seenVariants.add(variantKey);
-        const modelKey = JSON.stringify([(row.result.model.vendor ?? '').toLowerCase(), row.result.model.requested]);
-        const list = modelGroups.get(modelKey) ?? [];
-        list.push(row);
-        modelGroups.set(modelKey, list);
+        if (bucket.seenVariants.has(variantKey)) continue;
+        bucket.seenVariants.add(variantKey);
+        bucket.variants.push(row);
       }
       let rank = 0;
       let index = 0;
       let prev: RankedEntry | undefined;
-      return [...modelGroups.values()].map(variants => {
+      return [...modelGroups.values()].map(({ variants }) => {
         const primary = variants[0]!;
         index++;
         if (!prev || compareScoredResults(prev.scoring, primary.scoring) !== 0) rank = index;
@@ -405,7 +559,7 @@ export function rankResults(bundle: unknown, familyOrOpts?: string | RankOptions
     let index = 0;
     let prev: RankedEntry | undefined;
     return sorted.flatMap(row => {
-      const key = JSON.stringify([row.result.agent_id, row.result.agent_revision]);
+      const key = JSON.stringify([row.result.agent_id, row.result.agent_revision, row.result.model.speed_tier ?? 'standard']);
       if (seen.has(key)) return [];
       seen.add(key);
       index++;

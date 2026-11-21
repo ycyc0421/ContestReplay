@@ -41,10 +41,20 @@ export async function resolveManifest(raw: unknown, store: Connections, readExte
     return result.data;
   };
   const env = validate(kind === 'codex' ? harness('codex').env : harness('builtin-responses').env, manifest.harness.env ?? {}, ['harness', 'env']);
+  if (connection.protocol !== 'responses' && connection.protocol !== 'passthrough') {
+    fail([manifest.provider ? 'provider' : 'connection'], `Harness ${kind} requires a responses or passthrough provider`);
+  }
+  if (manifest.speed_tier === 'fast' && connection.supports_fast === false) {
+    fail(['speed_tier'], 'Selected provider does not support fast speed_tier');
+  }
+  if (manifest.speed_tier === 'ultrafast' && connection.supports_ultrafast === false) {
+    fail(['speed_tier'], 'Selected provider does not support ultrafast speed_tier');
+  }
   const common = {
     id: manifest.id,
     ...(manifest.name ? { name: manifest.name } : {}),
     ...(manifest.speed_tier ? { speed_tier: manifest.speed_tier } : {}),
+    api: connection.protocol,
     base_url: connection.base_url,
     api_key_env: 'OPENAI_API_KEY',
   };
@@ -54,24 +64,17 @@ export async function resolveManifest(raw: unknown, store: Connections, readExte
     const serviceTier = selected.service_tier;
     return {
       ...common,
-      api: connection.protocol,
       harness: kind,
       model: validate(codexModel, manifest.model, ['model']),
       reasoning_effort: effort === 'default' ? undefined : effort,
       ...(serviceTier && serviceTier !== 'default' ? { service_tier: serviceTier } : {}),
     } as const;
-  })() : (() => {
-    if (connection.protocol !== 'responses' && connection.protocol !== 'passthrough') {
-      fail([manifest.provider ? 'provider' : 'connection'], 'Built-in Responses requires a responses or passthrough provider');
-    }
-    return {
-      ...common,
-      api: connection.protocol,
-      harness: kind,
-      model: validate(builtinModel, manifest.model, ['model']),
-      temperature: validate(harness('builtin-responses').options, options, ['harness', 'options']).temperature,
-    } as const;
-  })();
+  })() : {
+    ...common,
+    harness: kind,
+    model: validate(builtinModel, manifest.model, ['model']),
+    temperature: validate(harness('builtin-responses').options, options, ['harness', 'options']).temperature,
+  } as const;
   let nativeText: string | undefined;
   let native;
   if (native_config) {

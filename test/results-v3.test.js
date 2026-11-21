@@ -2,13 +2,14 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { cp, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { cp, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
   protocol, protocolDigest, protocolDigestForPreset, protocolForPreset, protocolPresets,
   resolveProtocolPreset, resolveScoringMode,
 } from '../dist/protocol.js';
+import { codexConfigServiceTier, codexEffective, responsesServiceTier } from '../dist/harnesses.js';
 import { agentRevision, loadAgent, loadContest } from '../dist/config.js';
 import { Connections } from '../dist/connections.js';
 import { agentCatalog } from '../dist/catalog.js';
@@ -161,6 +162,61 @@ test('Agent name does not affect agent_revision or invalidate plans, while servi
   assert.equal(cliLoaded.agentName, 'CLI Fast Runner');
   assert.equal(cliLoaded.speedTier, 'ultrafast');
   assert.equal(cliLoaded.profile.service_tier, 'fast');
+
+  // service_tier mapping for config.toml vs OpenAI /v1/responses
+  assert.equal(codexConfigServiceTier('fast'), 'fast');
+  assert.equal(codexConfigServiceTier('priority'), 'fast');
+  assert.equal(codexConfigServiceTier('standard'), undefined);
+  assert.equal(codexConfigServiceTier('default'), undefined);
+  assert.equal(codexEffective('gpt-5.3-codex', 'high', undefined, 'standard').service_tier, undefined);
+  assert.equal(codexEffective('gpt-5.3-codex', 'high', undefined, 'priority').service_tier, 'fast');
+  assert.equal(responsesServiceTier('fast'), 'priority');
+  assert.equal(responsesServiceTier('priority'), 'priority');
+  assert.equal(responsesServiceTier('standard'), 'default');
+  assert.equal(responsesServiceTier('default'), undefined);
+
+  // Plan locks credential_source: switching provider with SAME endpoint or changing api_key_env invalidates plan
+  await store.create({ id: 'openai-alt', label: 'OpenAI Alt', protocol: 'passthrough', base_url: 'https://api.openai.com/v1', secret: 'fixture-key-2', supports_fast: true });
+  await writeFile(agentFile, JSON.stringify(baseDoc));
+  const lockedPlan = await makePlan({
+    schema_version: 2,
+    cells: [{ agent: agentFile, contest: resolve('examples/demo/contest.json') }],
+  }, dir, getImage, store);
+  assert.equal(lockedPlan.jobs[0].credential_source, 'provider:openai');
+  await writeFile(agentFile, JSON.stringify({ ...baseDoc, provider: 'openai-alt' }));
+  await assert.rejects(verifyPlan(lockedPlan, false, store), /regenerate the plan/);
+
+  // Tampered protocol_preset on PlanJob is rejected against loaded contest rules
+  await writeFile(agentFile, JSON.stringify(baseDoc));
+  const tamperedPlan = { ...lockedPlan, jobs: [{ ...lockedPlan.jobs[0], protocol_preset: 'icpc-5h' }] };
+  await assert.rejects(verifyPlan(tamperedPlan, false, store), /protocol preset/i);
+
+  // Provider capability & protocol compatibility enforcement
+  await store.create({ id: 'no-fast', label: 'Standard Only', protocol: 'passthrough', base_url: 'https://api.openai.com/v1', secret: 'fixture-key-3', supports_fast: false, supports_ultrafast: false });
+  await store.create({ id: 'anthropic-only', label: 'Anthropic Only', protocol: 'anthropic-messages', base_url: 'https://api.anthropic.com/v1', secret: 'fixture-key-4' });
+  const badFastFile = join(dir, 'bad-fast.json');
+  await writeFile(badFastFile, JSON.stringify({ ...baseDoc, provider: 'no-fast', speed_tier: 'fast' }));
+  await assert.rejects(loadAgent(badFastFile, store), /does not support fast/);
+  const badProtoFile = join(dir, 'bad-proto.json');
+  await writeFile(badProtoFile, JSON.stringify({ ...baseDoc, provider: 'anthropic-only', speed_tier: 'standard' }));
+  await assert.rejects(loadAgent(badProtoFile, store), /requires a responses or passthrough provider/);
+
+  // Legacy JSON+TOML wrapper: changing display `name` inside responses.toml does NOT invalidate existing plan,
+  // while changing `api_key_env` DOES invalidate it!
+  const legacyDir = join(dir, 'legacy-wrapper');
+  await mkdir(legacyDir, { recursive: true });
+  await cp(resolve('examples/demo/agent.json'), join(legacyDir, 'agent.json'));
+  await cp(resolve('examples/demo/responses.toml'), join(legacyDir, 'responses.toml'));
+  const legacyPlan = await makePlan({
+    schema_version: 2,
+    cells: [{ agent: join(legacyDir, 'agent.json'), contest: resolve('examples/demo/contest.json') }],
+  }, dir, getImage, store);
+  assert.equal(legacyPlan.jobs[0].credential_source, 'env:OPENAI_API_KEY');
+  const origToml = await readFile(join(legacyDir, 'responses.toml'), 'utf8');
+  await writeFile(join(legacyDir, 'responses.toml'), `name = "Renamed Legacy"\n${origToml}`);
+  await verifyPlan(legacyPlan, false, store);
+  await writeFile(join(legacyDir, 'responses.toml'), `api_key_env = "OTHER_API_KEY"\n${origToml}`);
+  await assert.rejects(verifyPlan(legacyPlan, false, store), /regenerate the plan/);
 });
 
 test('results.json v3 export collects telemetry/submissions, reads v1/v2/v3, scores icpc/ioi/cf/last_ac, and groups via Policy C', async t => {
@@ -365,9 +421,103 @@ test('results.json v3 export collects telemetry/submissions, reads v1/v2/v3, sco
   const merged = mergeResults([v1, v2, bundleV3]);
   assert.equal(merged.schema_version, 3);
   assert.equal(merged.results.length, 6);
+
+  // Review regression checks:
+  // 1. Non-penalized verdicts (invalid_submission, SKIPPED, REJECTED, CE) do not add ICPC penalty
+  const nonPen = scoreResult({
+    ...exported,
+    submissions: [
+      { id: 's1', problem_id: 'A', elapsed_ms: 60_000, verdict: 'invalid_submission' },
+      { id: 's2', problem_id: 'A', elapsed_ms: 120_000, verdict: 'SKIPPED' },
+      { id: 's3', problem_id: 'A', elapsed_ms: 180_000, verdict: 'REJECTED' },
+      { id: 's4', problem_id: 'A', elapsed_ms: 240_000, verdict: 'CE' },
+      { id: 's5', problem_id: 'A', elapsed_ms: 600_000, verdict: 'OK', max_points: 500, score: 500 },
+    ],
+  }, 'icpc');
+  assert.equal(nonPen.solved, 1);
+  assert.equal(nonPen.penalty_minutes, 10);
+
+  // 2. CF scoring without explicit weights does NOT fabricate 500 pts
+  const cfLegacy = scoreResult(v2.results[0], 'cf');
+  assert.equal(cfLegacy.scoring_unavailable, true);
+  assert.equal(cfLegacy.points, 500);
+  const cfLegacy100 = scoreResult({ ...v2.results[0], score: 100 }, 'cf');
+  assert.equal(cfLegacy100.scoring_unavailable, true);
+  assert.equal(cfLegacy100.points, 100);
+
+  // 3. IOI partial-only scoring separates tie_break_ms from last_ac_ms
+  assert.equal(ioi.tie_break_ms, 240_000);
+  assert.equal(ioi.last_ac_ms, undefined);
+
+  // 4. Policy C groups by (vendor, requested_model) FIRST so identical (agent_id, agent_revision) across vendors are NOT dropped
+  const sharedAgentRev = '9'.repeat(64);
+  const vendorA = { ...variantFast, run_id: randomUUID(), agent_id: 'shared', agent_revision: sharedAgentRev, model: { ...variantFast.model, vendor: 'openai' } };
+  const vendorB = { ...variantFast, run_id: randomUUID(), agent_id: 'shared', agent_revision: sharedAgentRev, model: { ...variantFast.model, vendor: 'openrouter' } };
+  const groupedVendors = rankResultsGrouped(resultBundle([vendorA, vendorB]), { scoring: 'icpc' })[0];
+  assert.equal(groupedVendors.length, 2);
+
+  // 5. groupBy: 'revision' keeps standard vs fast speed_tier distinct
+  const fastRun = { ...variantFast, run_id: randomUUID(), agent_id: 'same-agent', agent_revision: sharedAgentRev, model: { ...variantFast.model, speed_tier: 'fast' } };
+  const stdRun = { ...variantFast, run_id: randomUUID(), agent_id: 'same-agent', agent_revision: sharedAgentRev, model: { ...variantFast.model, speed_tier: 'standard' } };
+  assert.equal(rankResults(resultBundle([fastRun, stdRun]), { scoring: 'icpc', groupBy: 'revision' })[0].length, 2);
+
+  // 6. Per-turn token deduplication (Anthropic message_start + message_delta on same turn)
+  const dedupRunId = randomUUID();
+  const dedupDir = join(root, dedupRunId);
+  await mkdir(dedupDir);
+  await writeFile(join(dedupDir, 'run.json'), JSON.stringify({
+    run_id: dedupRunId, contest_id: 'cf-round', data_version: 1, contest_revision: hash, input_sha256: { contest: hash },
+    protocol_id: 'codex-pdf-pages-mcp', protocol_version: 2, protocol_sha256: hash,
+    agent_id: 'dedup', agent_revision: hash, harness: { kind: 'codex', version: '0.170.0' },
+    model: { model: 'claude-sonnet-4-5', vendor: 'anthropic' },
+  }));
+  const dedupEvents = [
+    { type: 'model_request', turn: 1, elapsed_ms: 10 },
+    { type: 'model_usage', turn: 1, elapsed_ms: 20, usage: { input_tokens: 100, output_tokens: 1 } },
+    { type: 'model_usage', turn: 1, elapsed_ms: 30, usage: { output_tokens: 25 } },
+    { type: 'model_timing', turn: 1, elapsed_ms: 30, ttft_ms: 5, duration_ms: 20 },
+    { type: 'run_ended', status: 'completed', reason: 'finish', score: 0, max_score: 100, elapsed_ms: 40 },
+  ];
+  await writeFile(join(dedupDir, 'events.jsonl'), dedupEvents.map((e, i) => JSON.stringify({ schema_version: 1, seq: i + 1, ...e })).join('\n') + '\n');
+  const dedupExported = await exportRun(root, dedupRunId);
+  assert.equal(dedupExported.telemetry.total_input_tokens, 100);
+  assert.equal(dedupExported.telemetry.total_output_tokens, 25);
+
+  // 7. Re-exported v3 merges cleanly with prior v2 of the same run_id; core conflict still rejects
+  const sharedRunId = randomUUID();
+  const v2Same = {
+    schema_version: 2,
+    results: [{
+      run_id: sharedRunId, contest_id: 'cf-round', data_version: 1, contest_revision: hash,
+      protocol_id: 'codex-pdf-pages-mcp', protocol_version: 2, protocol_sha256: hash,
+      agent_id: 'a1', agent_revision: '6'.repeat(64), harness: { kind: 'codex', version: '0.170.0' },
+      model: { requested: 'gpt-5.3-codex', observed: ['gpt-5.3-codex'], vendor: 'openai' },
+      score: 500, max_score: 1500,
+      submissions: [{ id: 's1', problem_id: 'A', elapsed_ms: 100_000, verdict: 'OK' }],
+    }],
+  };
+  const v3Same = {
+    schema_version: 3,
+    results: [{
+      ...v2Same.results[0],
+      agent_name: 'GPT-5.3 Display',
+      scoring_mode: 'icpc',
+      protocol_preset: 'cf-2h',
+      model: { ...v2Same.results[0].model, speed_tier: 'fast' },
+      telemetry: { model_turns: 3, model_wait_ms: 1200 },
+      submissions: [{ id: 's1', problem_id: 'A', elapsed_ms: 100_000, verdict: 'OK', language: 'cpp20', max_points: 500, score: 500 }],
+    }],
+  };
+  const mergedSame = mergeResults([v2Same, v3Same]);
+  assert.equal(mergedSame.results.length, 1);
+  assert.equal(mergedSame.results[0].agent_name, 'GPT-5.3 Display');
+  assert.equal(mergedSame.results[0].telemetry.model_turns, 3);
+  assert.equal(mergedSame.results[0].submissions[0].language, 'cpp20');
+  const v3Conflict = { schema_version: 3, results: [{ ...v3Same.results[0], score: 999 }] };
+  assert.throws(() => mergeResults([v2Same, v3Conflict]), /Conflicting run/);
 });
 
-test('archiveSessionDir copies nested session files with 0600 mode, redacts credentials, skips symlinks, and caps total size', async t => {
+test('archiveSessionDir copies nested session files with 0600 mode, redacts credentials, skips symlinks and hardlinks, and caps total size', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'cr-session-archive-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const stage = join(dir, 'stage');
@@ -382,6 +532,7 @@ test('archiveSessionDir copies nested session files with 0600 mode, redacts cred
   await writeFile(join(stage, '2026', '04', 'rollout.jsonl'), `${pad}${secretKey}\n{"ok":true}\n`);
   await symlink(outside, join(stage, 'escape.txt'));
   await symlink(dir, join(stage, 'escape-dir'));
+  await link(outside, join(stage, 'hardlink-escape.txt'));
 
   const files = await archiveSessionDir(stage, target, secretKey);
   assert.deepEqual(files, ['2026/04/rollout.jsonl']);
@@ -393,6 +544,7 @@ test('archiveSessionDir copies nested session files with 0600 mode, redacts cred
   assert.ok(content.includes('{"ok":true}'));
   await assert.rejects(stat(join(target, 'escape.txt')), { code: 'ENOENT' });
   await assert.rejects(stat(join(target, 'escape-dir')), { code: 'ENOENT' });
+  await assert.rejects(stat(join(target, 'hardlink-escape.txt')), { code: 'ENOENT' });
 
   // Byte cap enforcement
   const cappedTarget = join(dir, 'capped');

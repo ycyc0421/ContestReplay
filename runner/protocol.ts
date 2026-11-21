@@ -79,6 +79,10 @@ export function resolveScoringMode(rules?: { scoring_mode?: ScoringMode }): Scor
   return rules?.scoring_mode ?? 'last_ac';
 }
 
+export function relayMaxRequestBytes(preset: Pick<ProtocolPreset, 'pdfMaxBytes'>) {
+  return Math.max(48_000_000, Math.ceil(preset.pdfMaxBytes * 1.5) + 16_000_000);
+}
+
 export function protocolForPreset(name: ProtocolPresetName = 'short') {
   const preset = protocolPresets[name];
   return Object.freeze({
@@ -88,6 +92,7 @@ export function protocolForPreset(name: ProtocolPresetName = 'short') {
     maxTurns: preset.maxTurns,
     pdfMaxPages: preset.pdfMaxPages,
     pdfMaxBytes: preset.pdfMaxBytes,
+    maxRequestBytes: relayMaxRequestBytes(preset),
     diagnosticMaxBytes: preset.diagnosticMaxBytes,
     settlementMs: preset.settlementMs,
     sandbox: preset.sandbox,

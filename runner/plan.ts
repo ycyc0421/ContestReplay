@@ -24,7 +24,8 @@ export const planSchema = z.strictObject({ schema_version: z.literal(2), protoco
   jobs: z.array(z.strictObject({
     image: imageRef, harness: z.enum(['builtin-responses', 'codex']), model_family_id: z.string().optional(),
     agent_path: absPath, agent_id: z.string().min(1), agent_name: z.string().min(1).max(120).optional(),
-    speed_tier: speedTierSchema.optional(), agent_revision: digest,
+    speed_tier: speedTierSchema.optional(), credential_source: z.string().min(1).max(256).optional(),
+    agent_revision: digest,
     agent_sha256: digest, profile_sha256: digest, native_sha256: digest.optional(), effective_sha256: digest.optional(),
     contest_path: absPath, contest_id: z.string().min(1), data_version: z.number().int().positive(), contest_sha256: digest,
     protocol_preset: z.enum(protocolPresetNames).optional(),
@@ -48,11 +49,12 @@ export async function makePlan(raw: unknown, base: string, getImage = inspectIma
   };
   const agents: {
     input: AgentInput;
-    entry: Omit<Pick<PlanJob, 'agent_path' | 'agent_id' | 'agent_name' | 'speed_tier' | 'agent_revision' | 'agent_sha256' | 'profile_sha256' | 'native_sha256' | 'effective_sha256' | 'image' | 'harness' | 'model_family_id'>, 'agent_revision'>;
+    entry: Omit<Pick<PlanJob, 'agent_path' | 'agent_id' | 'agent_name' | 'speed_tier' | 'credential_source' | 'agent_revision' | 'agent_sha256' | 'profile_sha256' | 'native_sha256' | 'effective_sha256' | 'image' | 'harness' | 'model_family_id'>, 'agent_revision'>;
     baseRevision: string;
   }[] = [];
   for (const file of paths(axes.agents)) {
     const input = await loadAgent(file, store);
+    assertHarnessProtocolCompatible(input.profile);
     const { harness, model_family_id } = input.profile;
     let image: string | undefined = images.get(harness);
     if (!image) { image = await getImage(imageFor(harness)); images.set(harness, image); }
@@ -63,6 +65,7 @@ export async function makePlan(raw: unknown, base: string, getImage = inspectIma
         agent_path: file, agent_id: input.agent.agent_id,
         ...(input.agentName ? { agent_name: input.agentName } : {}),
         speed_tier: input.speedTier,
+        credential_source: credentialSourceFor(input),
         image, harness, ...(model_family_id ? { model_family_id } : {}),
         agent_sha256: input.agentDigest, profile_sha256: input.profileDigest, effective_sha256: input.effectiveDigest,
         ...(input.nativeDigest ? { native_sha256: input.nativeDigest } : {}),
@@ -110,14 +113,28 @@ export function assertCompatible(harness: Inputs['profile']['harness'], contest:
     throw new Error(`Incompatible cell ${agentId} × ${contest.contest_id}: built-in Responses supports PDF and local answers only`);
   }
 }
-function verifyAgent(job: PlanJob, input: AgentInput, contest?: ContestInput['contest']) {
-  const preset = job.protocol_preset ?? (contest ? resolveProtocolPreset(contest.rules) : 'short');
+function credentialSourceFor(input: Pick<AgentInput, 'connection' | 'profile'>) {
+  return input.connection ? `provider:${input.connection}` : `env:${input.profile.api_key_env}`;
+}
+function assertHarnessProtocolCompatible(profile: Inputs['profile']) {
+  if (profile.api !== 'responses' && profile.api !== 'passthrough') {
+    throw new Error(`Harness ${profile.harness} requires a responses or passthrough provider (got ${profile.api})`);
+  }
+}
+function verifyAgent(job: PlanJob, input: AgentInput, contest: ContestInput['contest']) {
+  assertHarnessProtocolCompatible(input.profile);
+  const expectedPreset = resolveProtocolPreset(contest.rules);
+  if (job.protocol_preset !== undefined && job.protocol_preset !== expectedPreset) {
+    throw new Error('Plan protocol preset does not match contest rules; regenerate the plan');
+  }
   // Display metadata such as `name` may change without invalidating an existing plan;
-  // verify execution-affecting identity and digests.
+  // verify execution-affecting identity, credential source, speed_tier, and digests.
   if (input.agent.agent_id !== job.agent_id ||
       input.profile.harness !== job.harness || input.profile.model_family_id !== job.model_family_id ||
+      (job.speed_tier ?? 'standard') !== (input.speedTier ?? 'standard') ||
+      (job.credential_source !== undefined && job.credential_source !== credentialSourceFor(input)) ||
       input.profileDigest !== job.profile_sha256 || input.nativeDigest !== job.native_sha256 || input.effectiveDigest !== job.effective_sha256 ||
-      agentRevision(input, job.image, protocolDigestForPreset(preset)) !== job.agent_revision) {
+      agentRevision(input, job.image, protocolDigestForPreset(expectedPreset)) !== job.agent_revision) {
     throw new Error('Agent inputs changed; regenerate the plan');
   }
 }
@@ -128,8 +145,8 @@ function verifyContest(job: PlanJob, input: ContestInput) {
 export async function verifyJob(plan: Plan, job: PlanJob, store?: Connections) {
   if (plan.protocol_sha256 !== protocolDigest) throw new Error('Evaluation protocol changed; regenerate the plan');
   const inputs = await loadInputs(job.contest_path, job.agent_path, store);
-  verifyAgent(job, inputs, inputs.contest);
   verifyContest(job, inputs);
+  verifyAgent(job, inputs, inputs.contest);
   assertCompatible(job.harness, inputs.contest, job.agent_id);
   return inputs;
 }
@@ -146,8 +163,8 @@ export async function verifyPlan(plan: Plan, runtime = false, store?: Connection
       contests.set(job.contest_path, contest);
     }
     if (runtime) await modelKey(agent, store);
-    verifyAgent(job, agent, contest.contest);
     verifyContest(job, contest);
+    verifyAgent(job, agent, contest.contest);
     assertCompatible(job.harness, contest.contest, job.agent_id);
     if (runtime && contest.contest.judge.kind === 'codeforces') await checkCodeforces();
   }
@@ -161,6 +178,8 @@ export async function executeJob(plan: Plan, job: PlanJob, opts: { out: string; 
   const key = await modelKey(inputs, opts.store);
   opts.signal.throwIfAborted();
   const preset = protocolForPreset(resolveProtocolPreset(inputs.contest.rules));
-  const infer = inputs.profile.harness === 'builtin-responses' ? createInference(key, inputs.profile, { requestTimeoutMs: preset.requestTimeoutMs }) : undefined;
+  const infer = inputs.profile.harness === 'builtin-responses'
+    ? createInference(key, inputs.profile, { requestTimeoutMs: preset.requestTimeoutMs, maxOutputTokens: preset.maxOutputTokens })
+    : undefined;
   return runBench(inputs, { ...opts, image: job.image, infer, key });
 }

@@ -4,7 +4,7 @@ import { open } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { agentKind, agentNameSchema, manifestProvider, resolveManifest } from './agent-manifest.js';
 import { connectionProtocolSchema, Connections, endpoint } from './connections.js';
-import { builtinModel, codexModel, effectiveFor, efforts, harness, speedTierSchema, type HarnessEnv, type NativeOverride } from './harnesses.js';
+import { builtinModel, codexModel, effectiveFor, efforts, harness, responsesServiceTier, speedTierSchema, type HarnessEnv, type NativeOverride } from './harnesses.js';
 import { protocolPresetNames, protocolPresets, resolveProtocolPreset, scoringModes } from './protocol.js';
 import { canonical, documentFormat, parseDocumentText, serializeDocument } from './serialization.js';
 import { z } from 'zod';
@@ -157,10 +157,23 @@ export async function resolveAgentManifest(raw: unknown, agentPath: string, stor
   });
 }
 export function agentDigests(profile: AgentProfile, native?: NativeOverride, nativeText?: string, env?: HarnessEnv) {
-  const { model_family_id: _family, api_key_env: _key, id: _id, name: _name, speed_tier: _speedTier, ...normalized } = profile;
+  const { model_family_id: _family, api_key_env: _key, id: _id, name: _name, speed_tier: speedTier, ...normalized } = profile;
   const effective = effectiveFor(profile, native);
-  return { profileDigest: sha256(canonical({ ...normalized, native: native?.model_verbosity ? native : undefined, env: env ?? {} })),
-    nativeDigest: nativeText === undefined ? undefined : sha256(nativeText), effectiveDigest: sha256(canonical({ config: effective.config, env: env ?? {} })) };
+  const relayServiceTier = profile.harness === 'codex' ? responsesServiceTier(profile.service_tier) : undefined;
+  return {
+    profileDigest: sha256(canonical({
+      ...normalized,
+      ...(speedTier && speedTier !== 'standard' ? { speed_tier: speedTier } : {}),
+      native: native?.model_verbosity ? native : undefined,
+      env: env ?? {},
+    })),
+    nativeDigest: nativeText === undefined ? undefined : sha256(nativeText),
+    effectiveDigest: sha256(canonical({
+      config: effective.config,
+      ...(relayServiceTier ? { relay_service_tier: relayServiceTier } : {}),
+      env: env ?? {},
+    })),
+  };
 }
 export async function loadAgent(agentFile: string, store = new Connections()) {
   const agentPath = resolve(agentFile);
@@ -182,8 +195,10 @@ export async function loadAgent(agentFile: string, store = new Connections()) {
     if (raw && typeof raw === 'object' && ('schema_version' in raw || 'agent_id' in raw)) {
       const legacy = validated(legacyAgent, raw, agentPath);
       const contents = await file(resolve(dirname(agentPath), legacy.config), 64_000);
-      nativeText = contents.toString('utf8');
-      raw = { ...Object(parseDocumentText(nativeText, 'toml')), id: legacy.agent_id, harness: legacy.harness.kind };
+      const parsedLegacy = Object(parseDocumentText(contents.toString('utf8'), 'toml')) as Record<string, unknown>;
+      const { name: _displayName, ...nativeCore } = parsedLegacy;
+      nativeText = canonical(nativeCore);
+      raw = { ...parsedLegacy, id: legacy.agent_id, harness: legacy.harness.kind };
     }
     profile = validated(agentSchema, raw, agentPath);
   }

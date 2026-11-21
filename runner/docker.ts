@@ -40,8 +40,8 @@ export async function removeContainer(id: string) {
 }
 
 export async function launch(id: string, imageId: string, pdfPath: string, signal: AbortSignal, onStderr?: (chunk: Buffer) => void,
-  codex?: { input: string; channels: string; sessions?: string; env?: HarnessEnv; resources?: SandboxResources; onStdout: (chunk: Buffer) => void }) {
-  if ([pdfPath, codex?.input, codex?.channels, codex?.sessions].some(path => path?.includes(','))) throw new Error('Docker PDF staging path cannot contain a comma');
+  codex?: { input: string; channels: string; env?: HarnessEnv; resources?: SandboxResources; onStdout: (chunk: Buffer) => void }) {
+  if ([pdfPath, codex?.input, codex?.channels].some(path => path?.includes(','))) throw new Error('Docker PDF staging path cannot contain a comma');
   const name = `cr-${id}`;
   const limits = codex ? (codex.resources ?? protocolPresets.short.sandbox) : resources;
   const args = [
@@ -54,8 +54,7 @@ export async function launch(id: string, imageId: string, pdfPath: string, signa
     ...(codex ? ['--env', 'CODEX_HOME=/workspace/.codex',
       ...Object.entries(harness('codex').env.parse(codex.env ?? {})).flatMap(([key, value]) => value ? ['--env', `${key}=${value}`] : []),
       '--mount', `type=bind,source=${codex.input},target=/inputs,readonly`,
-      '--mount', `type=bind,source=${codex.channels},target=/channels,readonly`,
-      ...(codex.sessions ? ['--mount', `type=bind,source=${codex.sessions},target=/workspace/.sessions`] : [])]
+      '--mount', `type=bind,source=${codex.channels},target=/channels,readonly`]
       : ['--mount', `type=bind,source=${pdfPath},target=/inputs/problems.pdf,readonly`]),
     '--entrypoint', 'node', imageId, codex ? '/app/bridge.js' : '/app/worker.js',
   ];

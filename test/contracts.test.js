@@ -9,10 +9,12 @@ import { match } from '../dist/match.js';
 import { cfForm, cfReceipt } from '../dist/cf-web.js';
 import { exactPracticeCandidates } from '../dist/codeforces.js';
 import { exportRun, mergeResults, rankResults } from '../dist/results.js';
-import { createServer } from 'node:http';
-import { request as httpRequest } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
+import { connect as netConnect } from 'node:net';
+import { readFile, stat } from 'node:fs/promises';
 import { assertCompatible } from '../dist/plan.js';
-import { checkModelRequest, resolveRelayTarget, serveContestChannels } from '../dist/codex.js';
+import { checkChatOrMessagesRequest, checkModelRequest, resolveRelayTarget, serveContestChannels } from '../dist/codex.js';
+import { protocolForPreset } from '../dist/protocol.js';
 
 test('program judge stays pending without blocking and settles against the received timestamp', async () => {
   const inputs = await loadInputs('examples/demo/contest.json', 'examples/demo/codex.toml');
@@ -56,22 +58,48 @@ test('relay rejects a different model and remote tools/files', () => {
   assert.equal(checkModelRequest({ model: 'expected', store: true }, 'expected').store, false);
 });
 
-test('relay resolves subpaths safely, blocks traversal, and transparently proxies non-Responses endpoints with timing', async t => {
+test('relay enforces strict route/method/header/model allowlists, maps service_tier, handles SSE/disconnect races, and streams sessions via IPC', async t => {
+  // Route normalization & anti-bypass checks
   assert.equal(resolveRelayTarget('https://api.openai.com/v1', '/v1/responses').target.href, 'https://api.openai.com/v1/responses');
+  assert.equal(resolveRelayTarget('https://api.openai.com/v1', '/v1/responses/').subpath, '/responses');
+  assert.equal(resolveRelayTarget('https://api.openai.com/v1', '/v1/Responses').subpath, '/responses');
+  assert.equal(resolveRelayTarget('https://api.openai.com/v1', '/v1/%72esponses').subpath, '/responses');
+  assert.equal(resolveRelayTarget('https://api.openai.com/v1', '/v1/responses/compact').subpath, '/responses/compact');
   assert.equal(resolveRelayTarget('https://api.openai.com/v1', '/v1/chat/completions?stream=true').target.href, 'https://api.openai.com/v1/chat/completions?stream=true');
   assert.equal(resolveRelayTarget('https://api.anthropic.com/v1', '/v1/messages').target.href, 'https://api.anthropic.com/v1/messages');
-  assert.equal(resolveRelayTarget('https://proxy.example/custom', '/models').target.href, 'https://proxy.example/custom/models');
-  assert.throws(() => resolveRelayTarget('https://api.openai.com/v1', '/v1/../secret'), /traversal/);
-  assert.throws(() => resolveRelayTarget('https://api.openai.com/v1', '/v1/%2e%2e/secret'), /traversal/);
+  // Protocol-specific route binding
+  assert.equal(resolveRelayTarget('https://api.openai.com/v1', '/v1/responses', 'responses').subpath, '/responses');
+  assert.throws(() => resolveRelayTarget('https://api.openai.com/v1', '/v1/chat/completions', 'responses'), /not allowed for provider protocol/);
+  assert.throws(() => resolveRelayTarget('https://api.anthropic.com/v1', '/v1/responses', 'anthropic-messages'), /not allowed for provider protocol/);
+  // Non-inference & traversal routes blocked
+  assert.throws(() => resolveRelayTarget('https://api.openai.com/v1', '/v1/files'), /Unsupported model endpoint/);
+  assert.throws(() => resolveRelayTarget('https://api.openai.com/v1', '/v1/batches'), /Unsupported model endpoint/);
+  assert.throws(() => resolveRelayTarget('https://api.openai.com/v1', '/v1/models'), /Unsupported model endpoint/);
+  assert.throws(() => resolveRelayTarget('https://api.openai.com/v1', '/v1/../responses'), /traversal/);
+  assert.throws(() => resolveRelayTarget('https://api.openai.com/v1', '/v1/%2e%2e/responses'), /traversal/);
+  assert.throws(() => resolveRelayTarget('https://api.openai.com/v1', '/v1/responses;foo=1'), /Invalid relay path/);
   assert.throws(() => resolveRelayTarget('https://api.openai.com/v1', '//evil.example/v1/responses'), /Invalid relay path/);
   assert.throws(() => resolveRelayTarget('https://api.openai.com/v1', 'https://evil.example/v1/responses'), /Invalid relay path/);
 
+  // Chat / Messages model & remote tool/file checks
+  assert.throws(() => checkChatOrMessagesRequest({ model: 'other', messages: [] }, 'expected', '/chat/completions'));
+  assert.throws(() => checkChatOrMessagesRequest({ model: 'expected', web_search_options: {}, messages: [] }, 'expected', '/chat/completions'));
+  assert.throws(() => checkChatOrMessagesRequest({ model: 'expected', tools: [{ type: 'web_search' }], messages: [] }, 'expected', '/chat/completions'));
+  assert.throws(() => checkChatOrMessagesRequest({ model: 'expected', messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://evil.test/x.png' } }] }] }, 'expected', '/chat/completions'));
+  assert.throws(() => checkChatOrMessagesRequest({ model: 'expected', mcp_servers: [], messages: [] }, 'expected', '/messages'));
+  assert.throws(() => checkChatOrMessagesRequest({ model: 'expected', tools: [{ type: 'web_search_20250305', name: 'ws' }], messages: [] }, 'expected', '/messages'));
+  assert.throws(() => checkChatOrMessagesRequest({ model: 'expected', messages: [{ role: 'user', content: [{ type: 'document', source: { type: 'url', url: 'https://evil.test/a.pdf' } }] }] }, 'expected', '/messages'));
+  assert.equal(checkChatOrMessagesRequest({ model: 'expected', store: true, messages: [] }, 'expected', '/chat/completions').store, false);
+
   const seen = [];
+  let holdResponsesAfterCompleted = false;
+  let holdResponsesBeforeCompleted = false;
+  let releaseHeld = () => {};
   const upstream = createServer(async (req, res) => {
     const chunks = [];
     for await (const c of req) chunks.push(c);
     const bodyText = Buffer.concat(chunks).toString('utf8');
-    seen.push({ method: req.method, url: req.url, headers: req.headers, body: bodyText ? JSON.parse(bodyText) : null });
+    seen.push({ method: req.method, url: req.url, headers: req.headers, bodyLength: bodyText.length, body: bodyText.length < 100_000 ? JSON.parse(bodyText) : { oversized: true } });
     if (req.url === '/v1/chat/completions') {
       res.writeHead(200, { 'content-type': 'application/json', 'x-request-id': 'req-chat-1' });
       res.end(JSON.stringify({ id: 'chatcmpl-1', object: 'chat.completion', model: 'gpt-5.3-codex',
@@ -79,93 +107,175 @@ test('relay resolves subpaths safely, blocks traversal, and transparently proxie
         usage: { prompt_tokens: 12, completion_tokens: 4 } }));
       return;
     }
+    if (req.url === '/v1/messages') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      // No space after `data:` and no trailing newline on final event
+      res.write(`event: message_start\ndata:${JSON.stringify({ type: 'message_start', message: { id: 'msg-1', model: 'gpt-5.3-codex', usage: { input_tokens: 50, output_tokens: 1 } } })}\n\n`);
+      res.write(`event: message_delta\ndata:${JSON.stringify({ type: 'message_delta', usage: { output_tokens: 15 } })}\n\n`);
+      res.end(`event: message_stop\ndata:${JSON.stringify({ type: 'message_stop' })}`);
+      return;
+    }
     if (req.url === '/v1/responses') {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'x-request-id': 'req-resp-1' });
       const payload = { id: 'resp-1', object: 'response', model: 'gpt-5.3-codex', status: 'completed', output: [],
         usage: { input_tokens: 20, output_tokens: 5 } };
-      res.end(`event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: payload })}\n\n`);
+      if (holdResponsesBeforeCompleted) {
+        res.write(`event: response.created\ndata:${JSON.stringify({ type: 'response.created', response: { ...payload, status: 'in_progress' } })}\n\n`);
+        await new Promise(resolve => { releaseHeld = resolve; });
+        res.end();
+        return;
+      }
+      res.write(`event: response.completed\ndata:${JSON.stringify({ type: 'response.completed', response: payload })}\n\n`);
+      if (holdResponsesAfterCompleted) {
+        await new Promise(resolve => { releaseHeld = resolve; });
+      }
+      res.end();
       return;
     }
-    if (req.url === '/v1/redirect') {
-      res.writeHead(302, { location: 'https://evil.example/' }).end();
-      return;
-    }
-    res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ data: [] }));
+    res.writeHead(404).end();
   });
   await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
   const dir = await mkdtemp(join(tmpdir(), 'cr-relay-'));
+  const sessionDir = join(dir, 'session');
+  let sessionArchiveResult;
   const events = [];
   const faults = [];
+  const cf2hPreset = protocolForPreset('cf-2h');
   const close = await serveContestChannels({
     dir: join(dir, 'channels'),
     profile: { id: 'p', harness: 'codex', api: 'passthrough', model: 'gpt-5.3-codex', service_tier: 'fast',
       base_url: `http://127.0.0.1:${upstream.address().port}/v1`, api_key_env: 'OPENAI_API_KEY' },
     key: 'relay-secret-token',
     signal: new AbortController().signal,
-    maxTurns: 4,
+    maxTurns: 10,
     requestTimeoutMs: 10_000,
+    maxRequestBytes: cf2hPreset.maxRequestBytes,
+    sessionArchive: { dir: sessionDir, maxBytes: 1024, onResult: r => { sessionArchiveResult = r; } },
     contest: { submit: () => ({ verdict: 'ok' }), status: () => ({}), close: () => {} },
     event: e => events.push(e),
     finish: () => {},
     fault: r => faults.push(r),
   });
   t.after(async () => {
+    releaseHeld();
     await close();
     upstream.closeAllConnections();
     await new Promise(resolve => upstream.close(resolve));
     await rm(dir, { recursive: true, force: true });
   });
   const callSock = (method, path, body, extraHeaders = {}) => new Promise((resolve, reject) => {
+    const raw = typeof body === 'string' ? body : body !== undefined ? JSON.stringify(body) : undefined;
     const req = httpRequest({ socketPath: join(dir, 'channels', 'model.sock'), method, path, headers: {
-      ...(body !== undefined ? { 'content-type': 'application/json' } : {}), ...extraHeaders,
+      ...(raw !== undefined ? { 'content-type': 'application/json' } : {}), ...extraHeaders,
     } }, res => {
       const chunks = [];
       res.on('data', c => chunks.push(c));
       res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, text: Buffer.concat(chunks).toString('utf8') }));
     });
     req.on('error', reject);
-    if (body !== undefined) req.write(JSON.stringify(body));
+    if (raw !== undefined) req.write(raw);
     req.end();
   });
 
-  // 1. Transparent passthrough to /v1/chat/completions strips client auth & injects Bearer token
+  // 1. Blocked methods, blocked non-inference routes, and model/tool bypasses produce ZERO upstream calls
+  assert.equal((await callSock('DELETE', '/v1/responses')).status, 405);
+  assert.equal((await callSock('GET', '/v1/models')).status, 405);
+  assert.equal((await callSock('POST', '/v1/files', { model: 'gpt-5.3-codex' })).status, 404);
+  assert.equal((await callSock('POST', '/v1/batches', { model: 'gpt-5.3-codex' })).status, 404);
+  assert.equal((await callSock('POST', '/v1/../responses', { model: 'gpt-5.3-codex', input: 'hi' })).status, 400);
+  assert.equal((await callSock('POST', '/v1/responses/', { model: 'other-model', input: 'hi' })).status, 400);
+  assert.equal((await callSock('POST', '/v1/%72esponses', { model: 'gpt-5.3-codex', input: 'hi', tools: [{ type: 'web_search' }] })).status, 400);
+  assert.equal((await callSock('POST', '/v1/chat/completions', { model: 'other-model', messages: [] })).status, 400);
+  assert.equal((await callSock('POST', '/v1/messages', { model: 'gpt-5.3-codex', mcp_servers: [], messages: [] })).status, 400);
+  assert.equal(seen.length, 0, 'Rejected requests must never hit upstream');
+
+  // 2. Chat Completions forwards with allowlisted headers only (strips tenant/custom/auth/accept-encoding)
   const chat = await callSock('POST', '/v1/chat/completions',
-    { model: 'gpt-5.3-codex', messages: [{ role: 'user', content: 'hello' }], custom_vendor_field: true },
-    { authorization: 'Bearer spoofed-token', 'x-forwarded-for': '1.2.3.4', 'x-custom-beta': 'v2' });
+    { model: 'gpt-5.3-codex', messages: [{ role: 'user', content: 'hello' }] },
+    { authorization: 'Bearer spoofed', 'x-goog-api-key': 'spoof', 'openai-organization': 'org-x', 'openai-project': 'proj-x',
+      'accept-encoding': 'gzip', 'x-forwarded-for': '1.2.3.4', 'x-custom-header': 'drop-me', accept: 'application/json' });
   assert.equal(chat.status, 200);
   assert.equal(seen[0].url, '/v1/chat/completions');
   assert.equal(seen[0].headers.authorization, 'Bearer relay-secret-token');
+  assert.equal(seen[0].headers['x-goog-api-key'], undefined);
+  assert.equal(seen[0].headers['openai-organization'], undefined);
+  assert.equal(seen[0].headers['openai-project'], undefined);
+  assert.equal(seen[0].headers['accept-encoding'], 'identity');
   assert.equal(seen[0].headers['x-forwarded-for'], undefined);
-  assert.equal(seen[0].headers['x-custom-beta'], 'v2');
-  assert.equal(seen[0].body.custom_vendor_field, true);
+  assert.equal(seen[0].headers['x-custom-header'], undefined);
+  assert.equal(seen[0].headers.accept, 'application/json');
 
-  // 2. Responses path enforces security invariants and injects service_tier + store:false
+  // 3. /v1/messages under passthrough injects x-api-key, forwards anthropic-version, parses `data:` without space & trailing line
+  const msg = await callSock('POST', '/v1/messages',
+    { model: 'gpt-5.3-codex', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    { 'anthropic-version': '2023-06-01' });
+  assert.equal(msg.status, 200);
+  assert.equal(seen[1].headers['x-api-key'], 'relay-secret-token');
+  assert.equal(seen[1].headers['anthropic-version'], '2023-06-01');
+  assert.ok(events.some(e => e.type === 'model_identity' && e.response_id === 'msg-1'));
+
+  // 4. /v1/responses maps service_tier 'fast' -> 'priority' and enforces store:false
   const resp = await callSock('POST', '/v1/responses', { model: 'gpt-5.3-codex', input: 'hi', store: true });
   assert.equal(resp.status, 200);
-  assert.equal(seen[1].body.store, false);
-  assert.equal(seen[1].body.service_tier, 'fast');
+  assert.equal(seen[2].body.store, false);
+  assert.equal(seen[2].body.service_tier, 'priority');
 
-  // 3. Path traversal rejected before hitting upstream
-  const trav = await callSock('GET', '/v1/../admin');
-  assert.equal(trav.status, 400);
-  assert.equal(seen.length, 2);
+  // 5. Large >48 MiB payload accepted under cf-2h preset (112 MiB cap)
+  const bigInput = 'a'.repeat(50 * 1024 * 1024);
+  const bigResp = await callSock('POST', '/v1/responses', JSON.stringify({ model: 'gpt-5.3-codex', input: bigInput }));
+  assert.equal(bigResp.status, 200);
+  assert.ok(seen[3].bodyLength > 50 * 1024 * 1024);
 
-  // 4. Disallowed remote tool on /v1/responses rejected
-  const badResp = await callSock('POST', '/v1/responses', { model: 'gpt-5.3-codex', input: 'hi', tools: [{ type: 'web_search' }] });
-  assert.equal(badResp.status, 400);
-  assert.ok(faults.includes('invalid_model_request'));
+  // 6. Disconnect AFTER response.completed does NOT fault; disconnect BEFORE response.completed DOES fault
+  faults.length = 0;
+  holdResponsesAfterCompleted = true;
+  await new Promise((resolve, reject) => {
+    const req = httpRequest({ socketPath: join(dir, 'channels', 'model.sock'), method: 'POST', path: '/v1/responses',
+      headers: { 'content-type': 'application/json' } }, res => {
+      res.once('data', () => { req.destroy(); resolve(); });
+    });
+    req.on('error', () => resolve());
+    req.end(JSON.stringify({ model: 'gpt-5.3-codex', input: 'after-complete' }));
+  });
+  await new Promise(r => setTimeout(r, 40));
+  releaseHeld();
+  holdResponsesAfterCompleted = false;
+  await new Promise(r => setTimeout(r, 40));
+  assert.ok(!faults.includes('model_request_failed'), 'Disconnect after response.completed must not void the run');
 
-  // 5. Upstream redirect blocked (redirect: 'error')
-  const redir = await callSock('GET', '/v1/redirect');
-  assert.equal(redir.status, 502);
+  holdResponsesBeforeCompleted = true;
+  await new Promise(resolve => {
+    const req = httpRequest({ socketPath: join(dir, 'channels', 'model.sock'), method: 'POST', path: '/v1/responses',
+      headers: { 'content-type': 'application/json' } }, res => {
+      res.once('data', () => { req.destroy(); resolve(); });
+    });
+    req.on('error', () => resolve());
+    req.end(JSON.stringify({ model: 'gpt-5.3-codex', input: 'before-complete' }));
+  });
+  await new Promise(r => setTimeout(r, 40));
+  releaseHeld();
+  holdResponsesBeforeCompleted = false;
+  await new Promise(r => setTimeout(r, 40));
+  assert.ok(faults.includes('model_request_failed'), 'Premature disconnect before response.completed must fault');
 
-  // 6. Telemetry recorded on forwarded turns
-  const timings = events.filter(e => e.type === 'model_timing');
-  assert.ok(timings.length >= 2);
-  assert.equal(typeof timings[0].ttft_ms, 'number');
-  assert.equal(typeof timings[0].duration_ms, 'number');
-  assert.ok(events.some(e => e.type === 'model_usage' && e.usage.prompt_tokens === 12));
-  assert.ok(events.some(e => e.type === 'model_usage' && e.usage.input_tokens === 20));
+  // 7. IPC /channels/session.sock archives & redacts session files cleanly without writable host mounts
+  await new Promise((resolve, reject) => {
+    const sock = netConnect(join(dir, 'channels', 'session.sock'), () => {
+      sock.write(JSON.stringify({ path: '2026/04/rollout.jsonl', data_base64: Buffer.from('token=relay-secret-token\n{"ok":true}\n').toString('base64') }) + '\n');
+      sock.end(JSON.stringify({ done: true }) + '\n');
+    });
+    sock.resume();
+    sock.on('error', reject);
+    sock.on('close', resolve);
+  });
+  await close();
+  assert.equal(sessionArchiveResult.status, 'archived');
+  assert.deepEqual(sessionArchiveResult.files, ['2026/04/rollout.jsonl']);
+  const archivedPath = join(sessionDir, '2026', '04', 'rollout.jsonl');
+  assert.equal((await stat(archivedPath)).mode & 0o777, 0o600);
+  const archivedText = await readFile(archivedPath, 'utf8');
+  assert.ok(!archivedText.includes('relay-secret-token'));
+  assert.ok(archivedText.includes('[REDACTED]'));
 });
 
 test('result export omits raw answers/logs, merges by run and ranks Agent revisions', async t => {

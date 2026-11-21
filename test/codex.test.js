@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createServer } from 'node:http';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadInputs, modelKey } from '../dist/config.js';
@@ -74,6 +74,13 @@ test('actual Codex reads full PDF page images and submits over MCP in a no-netwo
     assert.deepEqual(runMeta.problems, [{ id: '1', max_points: 3 }, { id: '2', max_points: 5 }]);
     assert.deepEqual(runMeta.sandbox.resources, { memory: '4g', cpus: '2', pids: 256, workspace: '512m' });
     assert.equal(runMeta.model.speed_tier, 'standard');
+    assert.equal(runMeta.session_archive_status, 'archived');
+    assert.ok(Array.isArray(runMeta.session_files) && runMeta.session_files.length >= 1, JSON.stringify(runMeta));
+    const archivedSessionPath = join(result.directory, 'session', ...runMeta.session_files[0].split('/'));
+    assert.equal((await stat(archivedSessionPath)).mode & 0o777, 0o600);
+    const archivedSessionText = await readFile(archivedSessionPath, 'utf8');
+    assert.ok(archivedSessionText.length > 0);
+    assert.ok(!archivedSessionText.includes('local-test-key'));
   } finally {
     server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));
