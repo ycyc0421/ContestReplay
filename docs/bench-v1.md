@@ -1,6 +1,8 @@
-# ContestReplay Bench CLI v1 草案
+# ContestReplay Bench CLI v1 草案（历史参考）
 
-目标仓库：`ycyc0421/ContestReplay`。这份早期草案仅供历史参考；以 [README](../README.md) 为准。本文记录 TypeScript CLI 的实现与后续设计；可运行命令见 [README](../README.md#运行-bench)。以下主要记录早期 CLI 设计；后续 Web 以 [统一 Web 与结果文件](bench-web.md) 为准，不参与比赛执行。
+> **文档状态**：早期架构草案，保留作背景参考。当前实际命令、Agent Manifest v2、本机 Studio 与测试说明以 [README](../README.md) 和 [Studio 配置契约](studio-contract-gaps.md) 为准；后续演进见 [路线思考](roadmap.md)，静态公开榜单提案见 [统一 Web 与结果文件](bench-web.md)。
+
+目标仓库：`ycyc0421/ContestReplay`。可运行入口见 [README 快速开始](../README.md#快速开始)。
 
 ## 技术栈
 
