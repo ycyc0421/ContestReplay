@@ -31,11 +31,11 @@ export async function streamSessions(
     });
   } catch { return; }
 
-  const writeLine = (line: string) => new Promise<void>((resolveWrite, rejectWrite) => {
+  const writeLine = (line: string, writeDeadline = deadline) => new Promise<void>((resolveWrite, rejectWrite) => {
     if (!sock || sock.destroyed) return rejectWrite(new Error('closed'));
-    if (Date.now() > deadline) return rejectWrite(new Error('timeout'));
+    if (Date.now() > writeDeadline) return rejectWrite(new Error('timeout'));
     if (sock.write(line)) { resolveWrite(); return; }
-    const timer = setTimeout(() => rejectWrite(new Error('timeout')), Math.max(50, deadline - Date.now()));
+    const timer = setTimeout(() => rejectWrite(new Error('timeout')), Math.max(50, writeDeadline - Date.now()));
     const onDrain = () => { clearTimeout(timer); sock?.off('error', onErr); sock?.off('close', onClose); resolveWrite(); };
     const onErr = (err: Error) => { clearTimeout(timer); sock?.off('drain', onDrain); sock?.off('close', onClose); rejectWrite(err); };
     const onClose = () => { clearTimeout(timer); sock?.off('drain', onDrain); sock?.off('error', onErr); rejectWrite(new Error('closed')); };
@@ -49,8 +49,7 @@ export async function streamSessions(
   let bytesSent = 0;
   let truncated = false;
 
-  const walk = async (dir: string, relPrefix: string, depth: number): Promise<void> => {
-    if (depth > MAX_SESSION_DEPTH) { truncated = true; return; }
+  const walk = async (dir: string, relPrefix: string): Promise<void> => {
     let names: string[];
     try { names = (await readdir(dir)).sort(); } catch { return; }
     for (const name of names) {
@@ -62,9 +61,14 @@ export async function streamSessions(
       try { info = await lstat(full); } catch { continue; }
       if (info.isSymbolicLink()) continue;
       const rel = relPrefix ? `${relPrefix}/${name}` : name;
+      const segCount = rel.split('/').length;
       if (info.isDirectory()) {
-        await walk(full, rel, depth + 1);
+        // Receiver permits file paths with at most MAX_SESSION_DEPTH (8) segments;
+        // any file inside a directory already at depth 8 would have >= 9 segments.
+        if (segCount >= MAX_SESSION_DEPTH) { truncated = true; continue; }
+        await walk(full, rel);
       } else if (info.isFile() && info.nlink <= 1) {
+        if (segCount > MAX_SESSION_DEPTH) { truncated = true; continue; }
         if (filesSent >= maxFiles) { truncated = true; break; }
         let handle;
         try { handle = await open(full, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW); } catch { continue; }
@@ -97,10 +101,13 @@ export async function streamSessions(
   };
 
   try {
-    await walk(sessionsRoot, '', 0);
-    await writeLine(JSON.stringify(truncated ? { done: true, truncated: true } : { done: true }) + '\n');
+    await walk(sessionsRoot, '');
+    // Always reserve a short dedicated flush budget for the terminal done/truncated frame
+    // even when the walk itself timed out, so the receiver cleanly records 'truncated' instead of 'failed'.
+    const finishDeadline = Math.max(deadline, Date.now() + 250);
+    await writeLine(JSON.stringify(truncated ? { done: true, truncated: true } : { done: true }) + '\n', finishDeadline);
     await new Promise<void>(resolveClose => {
-      const timer = setTimeout(() => { sock?.destroy(); resolveClose(); }, Math.max(50, deadline - Date.now()));
+      const timer = setTimeout(() => { sock?.destroy(); resolveClose(); }, Math.max(250, finishDeadline - Date.now()));
       sock?.once('close', () => { clearTimeout(timer); resolveClose(); });
       sock?.resume();
       sock?.end();

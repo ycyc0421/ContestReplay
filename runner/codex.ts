@@ -201,6 +201,8 @@ export function checkResponsesCompactRequest(body: Record<string, unknown>, mode
   const sanitized = { ...body };
   delete sanitized.store;
   delete sanitized.service_tier;
+  delete sanitized.reasoning;
+  delete sanitized.reasoning_effort;
   return sanitized;
 }
 export function checkChatOrMessagesRequest(body: Record<string, unknown>, model: string, route: '/chat/completions' | '/messages') {
@@ -526,15 +528,11 @@ export async function serveContestChannels(opts: { dir: string; profile: Antigra
             checked.text = { ...(text && typeof text === 'object' && !Array.isArray(text) ? text : {}), verbosity };
           }
         } else if (resolved.subpath === '/responses/compact') {
-          if (mappedServiceTier) {
-            throw new Error('Route /responses/compact cannot enforce configured service_tier');
+          if (profile.reasoning_effort) {
+            throw new Error('Route /responses/compact cannot enforce configured reasoning_effort');
           }
           checked = checkResponsesCompactRequest(parsedJson, profile.model);
-          if (profile.reasoning_effort && checked.reasoning !== undefined) {
-            const existing = checked.reasoning && typeof checked.reasoning === 'object' && !Array.isArray(checked.reasoning)
-              ? checked.reasoning as Record<string, unknown> : {};
-            checked.reasoning = { ...existing, effort: profile.reasoning_effort };
-          }
+          if (mappedServiceTier) checked.service_tier = mappedServiceTier;
         } else if (resolved.subpath === '/chat/completions') {
           checked = checkChatOrMessagesRequest(parsedJson, profile.model, '/chat/completions');
           delete checked.service_tier;

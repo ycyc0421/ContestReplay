@@ -286,6 +286,56 @@ test('relay enforces strict route/method/header/model allowlists, maps service_t
   assert.equal('service_tier' in seen[5].body, false);
   await plainClose();
 
+  // 4c. Separate tests for /v1/responses/compact:
+  //     (i) service_tier ONLY -> ALLOWED (host injects mapped 'priority', omits 'store')
+  //     (ii) reasoning_effort ONLY -> REJECTED (0 upstream calls, since ResponseCompactParams has no reasoning.effort)
+  const tierOnlyClose = await serveContestChannels({
+    dir: join(dir, 'channels-tier-only'),
+    profile: { id: 'p-tier', harness: 'codex', api: 'responses', model: 'gpt-5.3-codex', service_tier: 'fast',
+      base_url: `http://127.0.0.1:${upstream.address().port}/v1`, api_key_env: 'OPENAI_API_KEY' },
+    key: 'relay-secret-token', signal: new AbortController().signal, maxTurns: 4, requestTimeoutMs: 10_000,
+    contest: { submit: () => ({ verdict: 'ok' }), status: () => ({}), close: () => {} },
+    event: () => {}, finish: () => {}, fault: () => {},
+  });
+  t.after(async () => { await tierOnlyClose(); });
+  const callTierOnly = (path, body) => new Promise((resolve, reject) => {
+    const req = httpRequest({ socketPath: join(dir, 'channels-tier-only', 'model.sock'), method: 'POST', path, headers: { 'content-type': 'application/json' } }, res => {
+      const chunks = []; res.on('data', c => chunks.push(c)); res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('error', reject);
+    req.end(JSON.stringify(body));
+  });
+  const seenBeforeCompact = seen.length;
+  const tierCompact = await callTierOnly('/v1/responses/compact', { model: 'gpt-5.3-codex', input: 'hi', store: true, service_tier: 'flex' });
+  assert.equal(tierCompact.status, 200);
+  assert.equal(seen.length, seenBeforeCompact + 1);
+  assert.equal(seen[seenBeforeCompact].url, '/v1/responses/compact');
+  assert.equal(seen[seenBeforeCompact].body.service_tier, 'priority');
+  assert.equal('store' in seen[seenBeforeCompact].body, false);
+  await tierOnlyClose();
+
+  const effortOnlyClose = await serveContestChannels({
+    dir: join(dir, 'channels-effort-only'),
+    profile: { id: 'p-effort', harness: 'codex', api: 'responses', model: 'gpt-5.3-codex', reasoning_effort: 'high',
+      base_url: `http://127.0.0.1:${upstream.address().port}/v1`, api_key_env: 'OPENAI_API_KEY' },
+    key: 'relay-secret-token', signal: new AbortController().signal, maxTurns: 4, requestTimeoutMs: 10_000,
+    contest: { submit: () => ({ verdict: 'ok' }), status: () => ({}), close: () => {} },
+    event: () => {}, finish: () => {}, fault: () => {},
+  });
+  t.after(async () => { await effortOnlyClose(); });
+  const callEffortOnly = (path, body) => new Promise((resolve, reject) => {
+    const req = httpRequest({ socketPath: join(dir, 'channels-effort-only', 'model.sock'), method: 'POST', path, headers: { 'content-type': 'application/json' } }, res => {
+      const chunks = []; res.on('data', c => chunks.push(c)); res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('error', reject);
+    req.end(JSON.stringify(body));
+  });
+  const seenBeforeEffortCompact = seen.length;
+  const effortCompact = await callEffortOnly('/v1/responses/compact', { model: 'gpt-5.3-codex', input: 'hi' });
+  assert.equal(effortCompact.status, 400);
+  assert.equal(seen.length, seenBeforeEffortCompact, 'Compact request with unexpressible reasoning_effort must make 0 upstream calls');
+  await effortOnlyClose();
+
   // 6. Disconnect AFTER response.completed does NOT fault; disconnect BEFORE response.completed DOES fault
   faults.length = 0;
   holdResponsesAfterCompleted = true;
@@ -519,6 +569,44 @@ test('turn_limit immediately closes submissions, host strips unconfigured servic
   await ch6();
   assert.equal(bridgeTruncRes.status, 'truncated');
   assert.equal(bridgeTruncRes.files.length, 256);
+
+  // 7. Deep 9-segment path (8 nested dirs + file) via real bridge.ts streamSessions() -> receiver records 'truncated' (NOT 'failed')
+  const deepSrc = join(root, 'deep-sessions');
+  await mkdir(join(deepSrc, 'd1', 'd2', 'd3', 'd4', 'd5', 'd6', 'd7', 'd8'), { recursive: true });
+  await writeFile(join(deepSrc, 'ok.jsonl'), '{"ok":true}\n');
+  await writeFile(join(deepSrc, 'd1', 'd2', 'd3', 'd4', 'd5', 'd6', 'd7', 'd8', 'too-deep.jsonl'), '{"deep":true}\n');
+  let deepRes;
+  const ch7 = await serveContestChannels({
+    dir: join(root, 'c7'),
+    profile: { id: 'p', harness: 'codex', api: 'responses', model: 'gpt-5.3-codex',
+      base_url: `http://127.0.0.1:${upstream.address().port}/v1`, api_key_env: 'OPENAI_API_KEY' },
+    key: 'secret-key', signal: new AbortController().signal,
+    sessionArchive: { dir: join(root, 's7'), onResult: r => { deepRes = r; } },
+    contest: { submit: () => ({ verdict: 'ok' }), status: () => ({}), close: () => {} },
+    event: () => {}, finish: () => {}, fault: () => {},
+  });
+  await streamSessions(deepSrc, join(root, 'c7', 'session.sock'), 5_000);
+  await ch7();
+  assert.equal(deepRes.status, 'truncated');
+  assert.deepEqual(deepRes.files, ['ok.jsonl']);
+
+  // 8. Timeout during streamSessions() still flushes { done: true, truncated: true } via dedicated grace window -> receiver records 'truncated' (NOT 'failed')
+  const timeoutSrc = join(root, 'timeout-sessions');
+  await mkdir(timeoutSrc, { recursive: true });
+  await writeFile(join(timeoutSrc, 'a.jsonl'), 'x'.repeat(1024));
+  let timeoutRes;
+  const ch8 = await serveContestChannels({
+    dir: join(root, 'c8'),
+    profile: { id: 'p', harness: 'codex', api: 'responses', model: 'gpt-5.3-codex',
+      base_url: `http://127.0.0.1:${upstream.address().port}/v1`, api_key_env: 'OPENAI_API_KEY' },
+    key: 'secret-key', signal: new AbortController().signal,
+    sessionArchive: { dir: join(root, 's8'), onResult: r => { timeoutRes = r; } },
+    contest: { submit: () => ({ verdict: 'ok' }), status: () => ({}), close: () => {} },
+    event: () => {}, finish: () => {}, fault: () => {},
+  });
+  await streamSessions(timeoutSrc, join(root, 'c8', 'session.sock'), -1);
+  await ch8();
+  assert.equal(timeoutRes.status, 'truncated');
 });
 
 test('result export omits raw answers/logs, merges by run and ranks Agent revisions', async t => {
