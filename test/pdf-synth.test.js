@@ -323,18 +323,31 @@ test('mergePdfs validates inputs, passes TOCTOU-safe snapshots to pdfunite/qpdf,
     /Install poppler-utils \(pdfunite\) or qpdf/,
   );
 
-  // Real host merge via pdfunite + overwrite: true + single-file copy
+  // Real host merge via pdfunite/qpdf when installed on PATH (otherwise verify overwrite: true via injected execImpl)
+  const { spawnSync } = await import('node:child_process');
+  const hasHostMergeTool = ['pdfunite', 'qpdf'].some(bin => spawnSync(bin, ['--version'], { stdio: 'ignore' }).error == null);
   const realMerged = join(dir, 'real-merged.pdf');
-  const merged = await mergePdfs([pdf1, pdf2], realMerged);
-  assert.equal(merged.input_count, 2);
-  assert.ok(['pdfunite', 'qpdf'].includes(merged.tool));
+  if (hasHostMergeTool) {
+    const merged = await mergePdfs([pdf1, pdf2], realMerged);
+    assert.equal(merged.input_count, 2);
+    assert.ok(['pdfunite', 'qpdf'].includes(merged.tool));
 
-  const inspectedMerged = await inspectPdf(realMerged);
-  assert.equal(inspectedMerged.page_count, 2);
-  assert.deepEqual(inspectedMerged.problem_ids, ['A', 'B']);
+    const inspectedMerged = await inspectPdf(realMerged);
+    assert.equal(inspectedMerged.page_count, 2);
+    assert.deepEqual(inspectedMerged.problem_ids, ['A', 'B']);
 
-  const overwritten = await mergePdfs([pdf1, pdf2], realMerged, { overwrite: true });
-  assert.equal(overwritten.output_path, realMerged);
+    const overwritten = await mergePdfs([pdf1, pdf2], realMerged, { overwrite: true });
+    assert.equal(overwritten.output_path, realMerged);
+  } else {
+    const mockMerge = async (_cmd, args) => {
+      await copyFile(args[0], args[args.length - 1]);
+      return { stdout: '', stderr: '' };
+    };
+    const merged = await mergePdfs([pdf1, pdf2], realMerged, { execImpl: mockMerge });
+    assert.equal(merged.input_count, 2);
+    const overwritten = await mergePdfs([pdf1, pdf2], realMerged, { overwrite: true, execImpl: mockMerge });
+    assert.equal(overwritten.output_path, realMerged);
+  }
 
   const singleOut = join(dir, 'single-copy.pdf');
   const copied = await mergePdfs([pdf1], singleOut);
