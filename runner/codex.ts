@@ -86,6 +86,7 @@ export async function serveContestChannels(opts: { dir: string; profile: Codex; 
       const disconnected = new AbortController();
       res.once('close', () => { if (!res.writableFinished) disconnected.abort(); });
       const requestSignal = AbortSignal.any([current, disconnected.signal, AbortSignal.timeout(protocol.requestTimeoutMs)]);
+      let completed = false;
       try {
         const upstream = await fetch(profile.base_url.replace(/\/+$/, '') + '/responses', {
           method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' }, body: JSON.stringify(body), redirect: 'error', signal: requestSignal,
@@ -109,7 +110,10 @@ export async function serveContestChannels(opts: { dir: string; profile: Codex; 
               event({ type: 'model_identity', turn, model: value.model, response_id: value.id });
             }
             if (typeof value.model === 'string' && value.model !== profile.model && /^gpt-.*-\d{4}-\d{2}-\d{2}$/.test(profile.model)) opts.fault('unexpected_model');
-            if (value.usage && (record.type === 'response.completed' || record.object === 'response')) event({ type: 'model_usage', turn, usage: value.usage });
+            if (record.type === 'response.completed' || record.object === 'response') {
+              completed = true;
+              if (value.usage) event({ type: 'model_usage', turn, usage: value.usage });
+            }
             if (['response.failed', 'error'].includes(String(record.type))) opts.fault('model_request_failed');
           } catch { /* non-data SSE line */ }
         };
@@ -121,7 +125,7 @@ export async function serveContestChannels(opts: { dir: string; profile: Codex; 
         });
         else { reader.on('data', (chunk: Buffer) => { if (line.length <= 1_000_000) line += decoder.decode(chunk, { stream: true }); }); reader.once('end', () => observe(line)); }
         await pipeline(reader, res, { signal: requestSignal });
-      } catch { if (!current.aborted) opts.fault('model_request_failed'); reject(502, 'Upstream transport failed'); }
+      } catch { if (!current.aborted && !finished && !(completed && disconnected.signal.aborted)) opts.fault('model_request_failed'); reject(502, 'Upstream transport failed'); }
     })().finally(() => { inFlight = false; }).catch(() => res.destroy());
   });
   relay.on('connection', track);
