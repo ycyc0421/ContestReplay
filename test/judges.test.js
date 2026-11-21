@@ -1209,6 +1209,23 @@ test('Final review regression suite: QOJ maintenance page & bare score, CF Gym a
   });
   assert.equal(gymUnattributedFinishedBox.status, 'unknown');
 
+  // Attributed sidebox WITHOUT a .contest-state-phase node mentioning "Final standings will be available after the contest." MUST return 'unknown'
+  const gymProseNoPhaseBox = await previewCodeforcesContest(104567, {
+    gym: true,
+    cookie: 'JSESSIONID=gym-auth',
+    fetchImpl: async input => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/contest.standings') return jsonResponse({ status: 'FAILED' }, 403);
+      return htmlResponse(`
+        <html><body>
+          <div class="sidebox"><a href="/gym/104567">Current Gym</a><div>Final standings will be available after the contest.</div></div>
+          <a href="/gym/104567/problem/A">Alpha</a>
+        </body></html>
+      `);
+    },
+  });
+  assert.equal(gymProseNoPhaseBox.status, 'unknown');
+
   // Minute-precision /gym/<id>/my correlation (HH:MM floored to start of current UTC minute)
   const nowDate = new Date();
   const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];

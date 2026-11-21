@@ -487,24 +487,32 @@ async function previewGymPageHtml(
   let status: ContestPreview['status'] = 'unknown';
   if (currentGymBoxes.length > 0) {
     const boxNodes = currentGymBoxes.flatMap(walkHtml);
-    const stateText = boxNodes
-      .filter(n => n.value !== undefined)
-      .map(n => n.value!)
-      .join(' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-    const hasCountdown =
-      boxNodes.some(n => (htmlAttr(n, 'class') ?? '').toLowerCase().includes('countdown')) ||
-      /\b\d{1,2}:\d{2}:\d{2}\b/.test(stateText);
-    const hasActiveMarker =
-      hasCountdown || /\b(contest is running|before the contest|pending system test|system testing|coding)\b/i.test(stateText);
-    const hasFinishedMarker = /\b(final standings|contest is over|finished)\b/i.test(stateText);
+    const phaseValues = boxNodes
+      .filter(n => {
+        const cls = (htmlAttr(n, 'class') ?? '').toLowerCase();
+        return cls.includes('contest-state-phase');
+      })
+      .map(n => htmlText(n).replace(/\s+/g, ' ').trim().toLowerCase())
+      .filter(Boolean);
+    const hasCountdown = boxNodes.some(n => (htmlAttr(n, 'class') ?? '').toLowerCase().includes('countdown'));
 
-    if (hasActiveMarker && hasFinishedMarker) {
+    const FINISHED_PHASES = new Set(['finished', 'contest is over', 'final standings']);
+    const ACTIVE_PHASES = new Set([
+      'coding',
+      'contest is running',
+      'before the contest',
+      'pending system test',
+      'system testing',
+    ]);
+
+    const hasFinishedPhase = phaseValues.some(p => FINISHED_PHASES.has(p));
+    const hasActivePhase = hasCountdown || phaseValues.some(p => ACTIVE_PHASES.has(p));
+
+    if (hasActivePhase && hasFinishedPhase) {
       status = 'unknown';
-    } else if (hasActiveMarker) {
+    } else if (hasActivePhase) {
       status = 'active';
-    } else if (hasFinishedMarker) {
+    } else if (hasFinishedPhase) {
       status = 'finished';
     }
   }
