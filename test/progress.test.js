@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
-import { sha256 } from '../dist/config.js';
+import { resolveContest, sha256 } from '../dist/config.js';
 import {
   buildGhostRace,
   buildRunReplay,
@@ -43,9 +43,9 @@ async function createRunFixture(root, opts) {
     ...(opts.problems ? { problems: opts.problems } : {}),
     ...(opts.localInputs ? { local_inputs: opts.localInputs } : {}),
     input_sha256: opts.inputSha256 ?? { contest: hash },
-    protocol_id: opts.protocolId ?? 'codex-pdf-pages-mcp',
-    protocol_version: opts.protocolVersion ?? 2,
-    protocol_sha256: opts.protocolSha256 ?? 'b'.repeat(64),
+    protocol_id: opts.protocolId === null ? undefined : (opts.protocolId ?? 'codex-pdf-pages-mcp'),
+    protocol_version: opts.protocolVersion === null ? undefined : (opts.protocolVersion ?? 2),
+    protocol_sha256: opts.protocolSha256 === null ? undefined : (opts.protocolSha256 ?? 'b'.repeat(64)),
     agent_revision: hash,
     harness: { kind: 'codex', version: '0.170.0' },
     model: { model: 'gpt-5.3-codex', base_url: 'https://private.internal.example/v1' },
@@ -187,7 +187,54 @@ test('readRunProgress verifies local_inputs digests, ignores tampered files, blo
   assert.deepEqual(unseededProg.problems.map(p => p.id), ['A']);
   assert.equal(unseededProg.submissions_used, 2);
 
-  // 3. Tampered local contest.json / judge.json (digest mismatch) is NOT trusted
+  // 1b. Production resolveContest() digest verification on a real Codeforces v2 contest manifest
+  const cfDir = join(root, 'cf-manifest');
+  await mkdir(cfDir, { recursive: true });
+  const cfManifestPath = join(cfDir, 'contest.json');
+  const cfManifestRaw = {
+    schema_version: 2,
+    contest_id: 'cf-1234',
+    data_version: 1,
+    title: 'Codeforces Round 1234',
+    source: { name: 'Codeforces' },
+    materials: { entrypoint: { kind: 'pdf', path: resolve('examples/demo/problems.pdf') } },
+    problems: [
+      { id: 'A', max_points: 500 },
+      { id: 'B', max_points: 1000 },
+    ],
+    judge: {
+      kind: 'codeforces',
+      contest_id: 1234,
+      handle: 'cr_bot',
+      languages: { cpp17: 54 },
+    },
+  };
+  await writeFile(cfManifestPath, JSON.stringify(cfManifestRaw, null, 2));
+  const resolvedCf = await resolveContest(cfManifestRaw, cfManifestPath);
+  const { runId: cfRun } = await createRunFixture(root, {
+    contestId: 'cf-1234',
+    localInputs: { contest: cfManifestPath },
+    inputSha256: { contest: resolvedCf.contestDigest },
+    events: [
+      { elapsed_ms: 0, type: 'run_started', started_at: '2026-04-01T00:00:00.000Z' },
+      { elapsed_ms: 10_000, type: 'submission_received', submission_id: 's1', problem_id: 'A', language: 'cpp17', source: 'int main(){}' },
+      { elapsed_ms: 12_000, type: 'submission_judged', submission_id: 's1', verdict: 'OK' },
+      { elapsed_ms: 15_000, type: 'run_ended', status: 'completed', reason: 'finish', score: 500, max_score: 1500 },
+    ],
+  });
+  const cfProg = await readRunProgress(root, cfRun);
+  assert.equal(cfProg.problem_breakdown_unavailable, undefined);
+  assert.equal(cfProg.problem_count, 2);
+  assert.equal(cfProg.score, 500);
+  assert.equal(cfProg.max_score, 1500);
+
+  // Tampering with cfManifestPath breaks resolved.contestDigest -> sets problem_breakdown_unavailable: true
+  await writeFile(cfManifestPath, JSON.stringify({ ...cfManifestRaw, problems: [{ id: 'A', max_points: 9999 }] }));
+  const cfTampered = await readRunProgress(root, cfRun);
+  assert.equal(cfTampered.problem_breakdown_unavailable, true);
+  assert.equal(cfTampered.problems[0].max_points, 1);
+
+  // 3. Tampered local contest.json / judge.json (digest mismatch) is NOT trusted and marks breakdown unavailable
   const tamperedContest = join(root, 'tampered-contest.json');
   await writeFile(tamperedContest, JSON.stringify({ problems: [{ id: 'FAKE', max_points: 9999 }] }));
   const { runId: tamperedRun } = await createRunFixture(root, {
@@ -199,10 +246,11 @@ test('readRunProgress verifies local_inputs digests, ignores tampered files, blo
     ],
   });
   const tamperedProg = await readRunProgress(root, tamperedRun);
+  assert.equal(tamperedProg.problem_breakdown_unavailable, true);
   assert.equal(tamperedProg.problem_count, 0);
   assert.equal(tamperedProg.max_score, 10);
 
-  // 4. Symlinked run directory and symlinked session directory are rejected
+  // 4. Symlinked run directory, swapped directory, and symlinked session directory are rejected
   const externalDir = await mkdtemp(join(tmpdir(), 'cr-outside-'));
   t.after(() => rm(externalDir, { recursive: true, force: true }));
   await writeFile(join(externalDir, 'run.json'), '{}');
@@ -212,6 +260,15 @@ test('readRunProgress verifies local_inputs digests, ignores tampered files, blo
   await assert.rejects(readRunProgress(root, symRunId), /symlink/i);
   await assert.rejects(readRunLogSlice(root, symRunId, 'stdout'), /symlink/i);
 
+  // Directory replacement: real run dir removed and replaced by symlink is rejected
+  const { runId: replacedRunId, dir: replacedDir } = await createRunFixture(root, {
+    problems: [{ id: 'A', max_points: 1 }],
+    events: [{ elapsed_ms: 0, type: 'run_started' }],
+  });
+  await rm(replacedDir, { recursive: true, force: true });
+  await symlink(externalDir, replacedDir);
+  await assert.rejects(readRunProgress(root, replacedRunId), /symlink/i);
+
   const { runId: symSessionRun, dir: symSessionDir } = await createRunFixture(root, {
     problems: [{ id: 'A', max_points: 1 }],
     events: [{ elapsed_ms: 0, type: 'run_started', started_at: '2026-04-01T00:00:00.000Z' }],
@@ -219,7 +276,7 @@ test('readRunProgress verifies local_inputs digests, ignores tampered files, blo
   await symlink(externalDir, join(symSessionDir, 'session'));
   await assert.rejects(buildRunReplay(root, symSessionRun, { includeSession: true }), /symlink/i);
 
-  // 5. Corrupted mid-file JSON line & sequence gap throw explicitly (unlike trailing live partial line)
+  // 5. Corrupted mid-file JSON, bad schema_version, sequence gap, and post-run_ended events all throw explicitly
   const { runId: badJsonRun } = await createRunFixture(root, {
     problems: [{ id: 'A', max_points: 1 }],
     rawEventsContent: [
@@ -230,6 +287,22 @@ test('readRunProgress verifies local_inputs digests, ignores tampered files, blo
     ].join('\n'),
   });
   await assert.rejects(readRunProgress(root, badJsonRun), /Corrupted run event log/);
+
+  const { runId: badSchemaRun } = await createRunFixture(root, {
+    problems: [{ id: 'A', max_points: 1 }],
+    rawEventsContent: JSON.stringify({ schema_version: 99, seq: 1, elapsed_ms: 0, type: 'run_started' }) + '\n',
+  });
+  await assert.rejects(readRunProgress(root, badSchemaRun), /schema_version/);
+
+  const { runId: afterEndRun } = await createRunFixture(root, {
+    problems: [{ id: 'A', max_points: 1 }],
+    events: [
+      { elapsed_ms: 0, type: 'run_started' },
+      { elapsed_ms: 1000, type: 'run_ended', status: 'completed' },
+      { elapsed_ms: 2000, type: 'submission_received', submission_id: 's1', problem_id: 'A' },
+    ],
+  });
+  await assert.rejects(readRunProgress(root, afterEndRun), /after run_ended/);
 
   const { runId: seqGapRun } = await createRunFixture(root, {
     problems: [{ id: 'A', max_points: 1 }],
@@ -465,13 +538,26 @@ test('buildGhostRace enforces strict compatibility, isolates void runs, marks ru
   // Standalone evaluateGhostRaceAt matches method
   assert.deepEqual(evaluateGhostRaceAt(JSON.parse(JSON.stringify(race)), 310_000, 'last_ac'), at310s);
 
-  // Compatibility rejections: data_version, contest_revision, protocol_sha256, time_limit_ms, problem weight
+  // Exact CF and IOI final score assertions
+  const cfFinal = race.evaluateAt(2_000_000, 'cf');
+  // alpha: A(500*(1 - 0.5*5/60) = 479.17) + B(1000*(1 - 0.5*15/60) - 50 = 825) = 1304.17
+  assert.equal(cfFinal.standings[0].agent_id, 'alpha');
+  assert.equal(cfFinal.standings[0].score, 1304.17);
+  const ioiFinal = race.evaluateAt(2_000_000, 'ioi');
+  assert.equal(ioiFinal.standings[0].agent_id, 'alpha');
+  assert.equal(ioiFinal.standings[0].score, 2100);
+  assert.equal(ioiFinal.standings[1].agent_id, 'partial-only');
+  assert.equal(ioiFinal.standings[1].score, 500);
+
+  // Compatibility rejections: data_version, contest_revision, protocol_sha256, missing metadata, time_limit_ms, problem set/weight
   const incompatCases = [
     { label: 'data_version', opts: { contestId: 'cf-ghost-1', dataVersion: 2, timeLimitMs, problems }, pattern: /Data version mismatch/ },
     { label: 'contest_revision', opts: { contestId: 'cf-ghost-1', contestRevision: 'c'.repeat(64), timeLimitMs, problems }, pattern: /Contest revision mismatch/ },
     { label: 'protocol_sha256', opts: { contestId: 'cf-ghost-1', protocolSha256: 'd'.repeat(64), timeLimitMs, problems }, pattern: /Protocol mismatch/ },
+    { label: 'missing_protocol', opts: { contestId: 'cf-ghost-1', protocolSha256: null, timeLimitMs, problems }, pattern: /missing required compatibility metadata/ },
     { label: 'time_limit_ms', opts: { contestId: 'cf-ghost-1', timeLimitMs: 1_800_000, problems }, pattern: /Time limit mismatch/ },
-    { label: 'problem_weight', opts: { contestId: 'cf-ghost-1', timeLimitMs, problems: [{ id: 'A', max_points: 999 }] }, pattern: /Problem weight mismatch/ },
+    { label: 'problem_set_diff', opts: { contestId: 'cf-ghost-1', timeLimitMs, problems: [{ id: 'A', max_points: 500 }, { id: 'B', max_points: 1000 }] }, pattern: /Problem set or weight mismatch/ },
+    { label: 'problem_weight', opts: { contestId: 'cf-ghost-1', timeLimitMs, problems: [{ id: 'A', max_points: 999 }, { id: 'B', max_points: 1000 }, { id: 'C', max_points: 1500 }] }, pattern: /Problem set or weight mismatch/ },
   ];
   for (const tc of incompatCases) {
     const { runId: badId } = await createRunFixture(root, {
@@ -480,4 +566,100 @@ test('buildGhostRace enforces strict compatibility, isolates void runs, marks ru
     });
     await assert.rejects(buildGhostRace(root, [alphaId, badId]), tc.pattern, `Failed to reject ${tc.label}`);
   }
+});
+
+test('last_ac aligns with runner/results.ts (score then last_ac_ms without solved_count tiebreak) and IOI handles contradictory verdicts', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'cr-last-ac-ioi-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const problems = [
+    { id: 'P1', max_points: 500 },
+    { id: 'P2', max_points: 250 },
+    { id: 'P3', max_points: 250 },
+  ];
+  const timeLimitMs = 60_000;
+
+  // Agent FastOne: 1 solve (P1 = 500) at 10ms -> score 500, last_ac 10ms
+  const { runId: fastOneId } = await createRunFixture(root, {
+    contestId: 'tie-test',
+    agentId: 'fast-one',
+    timeLimitMs,
+    problems,
+    events: [
+      { elapsed_ms: 0, type: 'run_started' },
+      { elapsed_ms: 10, type: 'submission_received', submission_id: 's1', problem_id: 'P1' },
+      { elapsed_ms: 10, type: 'submission_judged', submission_id: 's1', verdict: 'accepted', points_awarded: 500 },
+      { elapsed_ms: 15, type: 'run_ended', status: 'completed', reason: 'finish', score: 500, max_score: 1000 },
+    ],
+  });
+
+  // Agent SlowTwo: 2 solves (P2 = 250 @ 20ms, P3 = 250 @ 40ms) -> score 500, last_ac 40ms
+  const { runId: slowTwoId } = await createRunFixture(root, {
+    contestId: 'tie-test',
+    agentId: 'slow-two',
+    timeLimitMs,
+    problems,
+    events: [
+      { elapsed_ms: 0, type: 'run_started' },
+      { elapsed_ms: 20, type: 'submission_received', submission_id: 's1', problem_id: 'P2' },
+      { elapsed_ms: 20, type: 'submission_judged', submission_id: 's1', verdict: 'accepted', points_awarded: 250 },
+      { elapsed_ms: 40, type: 'submission_received', submission_id: 's2', problem_id: 'P3' },
+      { elapsed_ms: 40, type: 'submission_judged', submission_id: 's2', verdict: 'accepted', points_awarded: 250 },
+      { elapsed_ms: 45, type: 'run_ended', status: 'completed', reason: 'finish', score: 500, max_score: 1000 },
+    ],
+  });
+
+  // Agent TieOne: 1 solve (P1 = 500) at 40ms -> exact tie with SlowTwo on score=500 & last_ac=40ms!
+  const { runId: tieOneId } = await createRunFixture(root, {
+    contestId: 'tie-test',
+    agentId: 'tie-one',
+    timeLimitMs,
+    problems,
+    events: [
+      { elapsed_ms: 0, type: 'run_started' },
+      { elapsed_ms: 40, type: 'submission_received', submission_id: 's1', problem_id: 'P1' },
+      { elapsed_ms: 40, type: 'submission_judged', submission_id: 's1', verdict: 'accepted', points_awarded: 500 },
+      { elapsed_ms: 45, type: 'run_ended', status: 'completed', reason: 'finish', score: 500, max_score: 1000 },
+    ],
+  });
+
+  const race = await buildGhostRace(root, [fastOneId, slowTwoId, tieOneId], { scoringMode: 'last_ac' });
+  const final = race.evaluateAt(60_000, 'last_ac');
+  // 10ms 1-solve beats 40ms 2-solves; 40ms 1-solve and 40ms 2-solves share rank 2!
+  assert.equal(final.standings[0].agent_id, 'fast-one');
+  assert.equal(final.standings[0].rank, 1);
+  assert.equal(final.standings[0].score, 500);
+  assert.equal(final.standings[0].last_ac_ms, 10);
+  const tied = final.standings.slice(1).map(s => ({ id: s.agent_id, rank: s.rank, score: s.score, last_ac_ms: s.last_ac_ms }))
+    .sort((a, b) => a.id.localeCompare(b.id));
+  assert.deepEqual(tied, [
+    { id: 'slow-two', rank: 2, score: 500, last_ac_ms: 40 },
+    { id: 'tie-one', rank: 2, score: 500, last_ac_ms: 40 },
+  ]);
+
+  // IOI contradictory inputs:
+  // P1: verdict='AC' but score=60 < 500 -> partial (NOT solved!)
+  // P2: verdict='WRONG_ANSWER' with score=250 == 250 -> NOT solved!
+  // P3: verdict='partial' with score=250 == 250 -> solved!
+  const { runId: ioiContraId } = await createRunFixture(root, {
+    contestId: 'ioi-contra',
+    scoringMode: 'ioi',
+    timeLimitMs,
+    problems,
+    events: [
+      { elapsed_ms: 0, type: 'run_started' },
+      { elapsed_ms: 10, type: 'submission_received', submission_id: 's1', problem_id: 'P1' },
+      { elapsed_ms: 10, type: 'submission_judged', submission_id: 's1', verdict: 'AC', score: 60 },
+      { elapsed_ms: 20, type: 'submission_received', submission_id: 's2', problem_id: 'P2' },
+      { elapsed_ms: 20, type: 'submission_judged', submission_id: 's2', verdict: 'WRONG_ANSWER', score: 250 },
+      { elapsed_ms: 30, type: 'submission_received', submission_id: 's3', problem_id: 'P3' },
+      { elapsed_ms: 30, type: 'submission_judged', submission_id: 's3', verdict: 'partial', score: 250 },
+      { elapsed_ms: 35, type: 'run_ended', status: 'completed', reason: 'finish', score: 560, max_score: 1000 },
+    ],
+  });
+  const ioiProg = await readRunProgress(root, ioiContraId);
+  assert.equal(ioiProg.solved_count, 1);
+  assert.equal(ioiProg.problems[0].status, 'partial');
+  assert.equal(ioiProg.problems[1].status, 'partial');
+  assert.equal(ioiProg.problems[2].status, 'accepted');
 });

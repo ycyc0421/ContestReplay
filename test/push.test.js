@@ -190,9 +190,13 @@ test('PushTargets enforces write-only credential storage, origin pinning, URL/SS
   assert.equal(patched.timeout_ms, 5000);
   assert.equal(patched.max_retries, 2);
 
-  // Loose credential permissions mark credential_available: false until rotated
+  // Loose credential permissions mark credential_available: false AND fail-close patch() until rotated!
   await chmod(oldCredFile, 0o644);
   assert.equal((await store.get('prod-hook')).credential_available, false);
+  await assert.rejects(
+    store.patch('prod-hook', { label: 'Should Fail Closed' }),
+    error => error instanceof PushTargetError && error.status === 500,
+  );
 
   // Atomic rotation from bearer -> hmac-sha256 allocates a NEW credential_ref and cleans up the old one
   assert.doesNotThrow(() => rotatePushTargetSchema.parse({ secret: rotatedSecret, auth_mode: 'hmac-sha256' }));
@@ -359,13 +363,13 @@ test('PushDispatcher enforces public payload whitelist, redacts short/symbol sec
 
   const dispatcher = new PushDispatcher(store, { sleep: fastSleep, now: () => fakeNow, concurrency: 4 });
 
-  // 1. Outbound payload whitelist canary test: private fields must NEVER leave the host!
+  // 1. Outbound payload whitelist canary test: private fields, free-form reason, and invalid problem_ids must NEVER leave the host!
   const canaryPayload = {
     run_id: '11111111-1111-4111-8111-111111111111',
     contest_id: 'demo-contest',
     score: 300,
     max_score: 500,
-    reason: 'failed at /home/alice/private/judge.json with Bearer CANARY_BEARER_XYZ',
+    reason: 'password=CANARY_ONLY_FREEFORM',
     source: 'CANARY_SOURCE_CODE',
     answer: 'CANARY_LOCAL_ANSWER',
     stdout: 'CANARY_STDOUT_LOG',
@@ -382,12 +386,23 @@ test('PushDispatcher enforces public payload whitelist, redacts short/symbol sec
         source: 'CANARY_SUB_SOURCE',
         answer: 'CANARY_SUB_ANSWER',
       },
+      {
+        submission_id: 's2',
+        problem_id: 'CANARY_INVALID_PID_EXFIL',
+        elapsed_ms: 2000,
+        verdict: 'invalid_submission',
+      },
     ],
   };
 
-  const sanitizedDirect = sanitizePushPayload('run.completed', canaryPayload);
+  const sanitizedDirect = sanitizePushPayload('run.completed', canaryPayload, { validProblemIds: ['A'] });
+  assert.equal(sanitizedDirect.reason, 'other');
+  assert.equal(sanitizedDirect.submissions[0].problem_id, 'A');
+  assert.equal(sanitizedDirect.submissions[1].problem_id, '[invalid]');
   const sanitizedStr = JSON.stringify(sanitizedDirect);
   for (const canary of [
+    'CANARY_ONLY_FREEFORM',
+    'CANARY_INVALID_PID_EXFIL',
     'CANARY_SOURCE_CODE',
     'CANARY_LOCAL_ANSWER',
     'CANARY_STDOUT_LOG',
@@ -396,13 +411,15 @@ test('PushDispatcher enforces public payload whitelist, redacts short/symbol sec
     'CANARY_UNDECLARED_NESTED',
     'CANARY_SUB_SOURCE',
     'CANARY_SUB_ANSWER',
-    'CANARY_BEARER_XYZ',
     '/home/alice',
   ]) {
     assert.ok(!sanitizedStr.includes(canary), `Whitelist leaked canary: ${canary}`);
   }
 
-  const runResults = await dispatcher.deliver('run.completed', canaryPayload);
+  // Canonical snake_case reason codes pass through untouched
+  assert.equal(sanitizePushPayload('run.completed', { run_id: canaryPayload.run_id, reason: 'time_limit' }).reason, 'time_limit');
+
+  const runResults = await dispatcher.deliver('run.completed', canaryPayload, { validProblemIds: ['A'] });
   assert.equal(runResults.length, 2);
   for (const r of runResults) {
     assert.doesNotThrow(() => pushDeliverySchema.parse(r));
@@ -498,6 +515,50 @@ test('PushDispatcher enforces public payload whitelist, redacts short/symbol sec
   const afterRace = await dispatcher.deliver('run.completed', canaryPayload, { targetIds: [raceTarget.id] });
   store.resolveForDelivery = origResolve;
   assert.deepEqual(afterRace, []);
+
+  // 5b. Target disabled during retry backoff stops retrying without sending a second HTTP request
+  const disableRetryTarget = await store.create({
+    id: 't-disable-retry',
+    label: 'Disable Mid Retry',
+    url: `${baseUrl}/flaky-503`,
+    events: ['run.completed'],
+    auth_mode: 'none',
+    max_retries: 3,
+  });
+  let midRetryFetches = 0;
+  const midRetryRes = await dispatcher.deliver('run.completed', canaryPayload, {
+    targetIds: [disableRetryTarget.id],
+    fetchImpl: async () => {
+      midRetryFetches++;
+      return new Response('unavailable', { status: 503 });
+    },
+    sleep: async () => {
+      await store.patch(disableRetryTarget.id, { enabled: false });
+    },
+  });
+  assert.equal(midRetryFetches, 1, 'Disabled target must not receive retry attempts after backoff');
+  assert.equal(midRetryRes[0].status, 'failed');
+  assert.equal(midRetryRes[0].error, 'target_disabled');
+
+  // 5c. DNS resolution resolving to link-local / IMDS IP is blocked before calling fetch
+  const dnsTarget = await store.create({
+    id: 't-dns-imds',
+    label: 'DNS Rebind IMDS',
+    url: 'https://rebind.example.test/hook',
+    events: ['run.completed'],
+    auth_mode: 'none',
+    max_retries: 2,
+  });
+  let dnsFetchCalls = 0;
+  const dnsBlocked = await dispatcher.deliver('run.completed', canaryPayload, {
+    targetIds: [dnsTarget.id],
+    lookupImpl: async () => [{ address: '169.254.169.254' }],
+    fetchImpl: async () => { dnsFetchCalls++; return new Response('ok', { status: 200 }); },
+  });
+  assert.equal(dnsFetchCalls, 0);
+  assert.equal(dnsBlocked[0].status, 'failed');
+  assert.equal(dnsBlocked[0].error, 'blocked_destination');
+  assert.equal(dnsBlocked[0].attempts, 1);
 
   // 6. Short secret & symbol Bearer redaction + safe fixed error codes on transport failure
   assert.equal(sanitizeDeliveryError('failed with key abc12', 'abc12'), 'failed with key [REDACTED]');

@@ -79,10 +79,12 @@ test('parsePdfPageCountFallback handles out-of-order PDF dictionary keys and ext
   ].join('\n'), 'latin1');
   assert.equal(parsePdfPageCountFallback(reorderedPdf), 3);
 
-  // FlateDecode bomb + /Subtype /Image stream skipped safely
+  // Multiple consecutive FlateDecode bombs + /Subtype /Image stream skipped safely;
+  // extraction MUST stop immediately on the FIRST oversized stream and NOT process subsequent streams.
   const bombPayload = deflateSync(Buffer.alloc(200_000, 0x41));
   const imagePayload = deflateSync(Buffer.from('BT (SHOULD_BE_SKIPPED_IMAGE) Tj ET', 'latin1'));
   const textPayload = deflateSync(Buffer.from('BT (Problem A: Safe Text) Tj ET', 'latin1'));
+  const afterBombPayload = deflateSync(Buffer.from('BT (Problem Z: After Bomb Should Stop) Tj ET', 'latin1'));
 
   const parts = [
     Buffer.from('%PDF-1.4\n1 0 obj\n<< /Subtype /Image /Filter /FlateDecode /Length ' + imagePayload.length + ' >>\nstream\n', 'latin1'),
@@ -91,6 +93,10 @@ test('parsePdfPageCountFallback handles out-of-order PDF dictionary keys and ext
     textPayload,
     Buffer.from('\nendstream\nendobj\n3 0 obj\n<< /Filter /FlateDecode /Length ' + bombPayload.length + ' >>\nstream\n', 'latin1'),
     bombPayload,
+    Buffer.from('\nendstream\nendobj\n4 0 obj\n<< /Filter /FlateDecode /Length ' + bombPayload.length + ' >>\nstream\n', 'latin1'),
+    bombPayload,
+    Buffer.from('\nendstream\nendobj\n5 0 obj\n<< /Filter /FlateDecode /Length ' + afterBombPayload.length + ' >>\nstream\n', 'latin1'),
+    afterBombPayload,
     Buffer.from('\nendstream\nendobj\n%%EOF\n', 'latin1'),
   ];
   const bombPdf = Buffer.concat(parts);
@@ -99,6 +105,7 @@ test('parsePdfPageCountFallback handles out-of-order PDF dictionary keys and ext
   assert.equal(detailed.truncated, true);
   assert.ok(!detailed.text.includes('SHOULD_BE_SKIPPED_IMAGE'), 'Image stream must be skipped before inflating');
   assert.ok(detailed.text.includes('Problem A: Safe Text'));
+  assert.ok(!detailed.text.includes('After Bomb Should Stop'), 'Must halt immediately on first oversized FlateDecode stream');
 });
 
 test('synthesizeTextContestPdf generates exact xref byte offsets, enforces Unicode/overwrite safety, and inspects identically across poppler and fallback', async t => {
@@ -164,19 +171,27 @@ test('synthesizeTextContestPdf generates exact xref byte offsets, enforces Unico
     /already exists/,
   );
 
-  // Non-ASCII characters are rejected by default unless allowAsciiFallback: true is explicitly passed
+  // Non-ASCII characters (including '×') and literal tabs in sample I/O are rejected by default (no silent rewriting)
   const unicodePdf = join(dir, 'unicode.pdf');
   await assert.rejects(
     synthesizeTextContestPdf([{ id: 'A', title: '桥梁修复', body: '中文题面' }], unicodePdf),
     /allowAsciiFallback/,
   );
+  await assert.rejects(
+    synthesizeTextContestPdf([{ id: 'A', title: 'Grid', body: 'An N × M grid.' }], join(dir, 'mul.pdf')),
+    /allowAsciiFallback/,
+  );
+  await assert.rejects(
+    synthesizeTextContestPdf([{ id: 'A', title: 'TSV', body: 'Parse TSV.', samples: [{ input: '1\t2', output: '3' }] }], join(dir, 'tab.pdf')),
+    /allowAsciiFallback/,
+  );
   const fallbackUnicode = await synthesizeTextContestPdf(
-    [{ id: 'A', title: '桥梁修复', body: '中文题面' }],
+    [{ id: 'A', title: '桥梁修复', body: '中文题面', samples: [{ input: '1\t2', output: '3' }] }],
     unicodePdf,
     { allowAsciiFallback: true },
   );
   assert.equal(fallbackUnicode.warnings.length, 1);
-  assert.match(fallbackUnicode.warnings[0], /Replaced 8 non-ASCII/);
+  assert.match(fallbackUnicode.warnings[0], /Replaced 9 non-ASCII/);
 
   // Pure-JS fallback inspection
   const fallbackInfo = await inspectPdf(outPdf, { useExternalTools: false });

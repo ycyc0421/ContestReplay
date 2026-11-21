@@ -1,7 +1,9 @@
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { lookup as dnsLookup } from 'node:dns/promises';
 import { constants } from 'node:fs';
 import { link, lstat, mkdir, open, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { isIP } from 'node:net';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { z } from 'zod';
@@ -21,11 +23,8 @@ function isLoopbackHost(hostname: string): boolean {
   return lower === '127.0.0.1' || lower === 'localhost' || lower === '[::1]';
 }
 
-function isBlockedHost(hostname: string): boolean {
-  const lower = hostname.toLowerCase().replace(/\.+$/, '');
-  if (BLOCKED_METADATA_HOSTS.has(lower)) return true;
-
-  const bare = lower.startsWith('[') && lower.endsWith(']') ? lower.slice(1, -1) : lower;
+export function isBlockedIpAddress(address: string): boolean {
+  const bare = address.toLowerCase().replace(/^\[|\]$/g, '').split('%')[0] ?? '';
 
   // Unspecified IPv4 / IPv6 addresses
   if (bare === '0.0.0.0' || bare === '::' || bare === '::0' || /^0(?::0){1,7}$/.test(bare)) return true;
@@ -37,10 +36,16 @@ function isBlockedHost(hostname: string): boolean {
   // IPv6 link-local (fe80::/10 -> fe80..febf)
   if (/^fe[89ab][0-9a-f]:/.test(bare)) return true;
 
-  // IPv4-mapped IPv6 forms (both dotted-quad and URL-normalized hex, e.g. ::ffff:a9fe:a9fe or ::ffff:0:0)
+  // IPv4-mapped IPv6 forms (both dotted-quad and URL-normalized hex)
   if (/^::ffff:(?:169\.254\.\d{1,3}\.\d{1,3}|a9fe:[0-9a-f]{1,4}|0\.0\.0\.0|0:0)$/i.test(bare)) return true;
 
   return false;
+}
+
+function isBlockedHost(hostname: string): boolean {
+  const lower = hostname.toLowerCase().replace(/\.+$/, '');
+  if (BLOCKED_METADATA_HOSTS.has(lower)) return true;
+  return isBlockedIpAddress(lower);
 }
 
 export const pushUrlSchema = z.url({ protocol: /^https?$/ }).max(4096).refine(value => {
@@ -169,20 +174,19 @@ export type PushDelivery = z.infer<typeof pushDeliverySchema>;
 // stdout, stderr, local_inputs, session transcripts, host paths) are removed.
 const nonNegInt = z.number().int().nonnegative();
 const nonNegNum = z.number().nonnegative();
-const safeReason = z.string().max(128).transform(value =>
-  value
-    .replace(/\bBearer\s+[\x21-\x7e]+/gi, 'Bearer [REDACTED]')
-    .replace(/(?:^|[\s([{'",=:]|file:\/\/)((?:\/(?:home|Users|tmp|var|etc|root|opt|srv|private|mnt|media|run))(?:\/[^\s)\]}'"`,;]+)+)/g,
-      (full, p: string) => full.replace(p, '[path]'))
-    .replace(/(?:^|[\s([{'",=:]|file:\/\/\/?)([A-Za-z]:\\[^\s)\]}'"`,;]+)/g,
-      (full, p: string) => full.replace(p, '[path]'))
-    .trim(),
-);
+const SAFE_REASON_CODE = /^[a-z][a-z0-9_]{0,63}$/;
+const SAFE_PROBLEM_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+// Never transmit arbitrary free-form error text in `reason`; allow only canonical snake_case codes.
+const safeReason = z.string().transform(value => {
+  const trimmed = value.trim();
+  return SAFE_REASON_CODE.test(trimmed) ? trimmed : 'other';
+});
 
 const publicSubmissionSchema = z.object({
   id: z.string().max(128).optional(),
   submission_id: z.string().max(128).optional(),
-  problem_id: z.string().min(1).max(128),
+  problem_id: z.string().max(256),
   elapsed_ms: nonNegInt,
   verdict: z.string().min(1).max(64),
   language: z.string().max(64).optional(),
@@ -190,7 +194,7 @@ const publicSubmissionSchema = z.object({
 });
 
 const publicProblemProgressSchema = z.object({
-  id: z.string().min(1).max(128),
+  id: z.string().regex(SAFE_PROBLEM_ID),
   max_points: nonNegNum,
   attempts: nonNegInt,
   status: z.enum(['unattempted', 'pending', 'accepted', 'partial', 'wrong']),
@@ -287,11 +291,30 @@ export const batchCompletedPayloadSchema = z.object({
   timestamp: z.iso.datetime().optional(),
 });
 
-export function sanitizePushPayload(eventType: PushDeliveryEvent, payload: unknown): Record<string, unknown> {
+export function sanitizePushPayload(
+  eventType: PushDeliveryEvent,
+  payload: unknown,
+  opts: { validProblemIds?: ReadonlySet<string> | readonly string[] } = {},
+): Record<string, unknown> {
   if (eventType === 'ping') return pingPayloadSchema.parse(payload);
-  if (eventType === 'run.completed') return runCompletedPayloadSchema.parse(payload);
   if (eventType === 'run.progress') return runProgressPayloadSchema.parse(payload);
-  return batchCompletedPayloadSchema.parse(payload);
+  if (eventType === 'batch.completed') return batchCompletedPayloadSchema.parse(payload);
+
+  const parsed = runCompletedPayloadSchema.parse(payload);
+  if (parsed.submissions) {
+    const validSet = opts.validProblemIds
+      ? (opts.validProblemIds instanceof Set ? opts.validProblemIds : new Set(opts.validProblemIds))
+      : undefined;
+    parsed.submissions = parsed.submissions.map(sub => {
+      const isInvalid = sub.verdict.trim().toLowerCase() === 'invalid_submission';
+      const allowedId = !isInvalid && SAFE_PROBLEM_ID.test(sub.problem_id) && (!validSet || validSet.has(sub.problem_id));
+      return {
+        ...sub,
+        problem_id: allowedId ? sub.problem_id : '[invalid]',
+      };
+    });
+  }
+  return parsed;
 }
 
 export class PushTargetError extends Error {
@@ -590,8 +613,17 @@ export class PushTargets {
         updated_at: new Date().toISOString(),
       });
       if (old.auth_mode !== 'none') {
-        const currentSecret = await this.readSecret(old).catch(() => undefined);
-        if (currentSecret) checkPublicMetadata(currentSecret, updated);
+        // Fail closed when the stored credential cannot be verified against updated public metadata.
+        let currentSecret: string | undefined;
+        try {
+          currentSecret = await this.readSecret(old);
+        } catch {
+          throw new PushTargetError('Push target credential unavailable; rotate it before modifying metadata', 500);
+        }
+        if (!currentSecret) {
+          throw new PushTargetError('Push target credential unavailable; rotate it before modifying metadata', 500);
+        }
+        checkPublicMetadata(currentSecret, updated);
       }
       await atomicWrite(this.path(id), JSON.stringify(updated));
       return this.describe(updated);
@@ -608,8 +640,6 @@ export class PushTargets {
       }
       checkPublicMetadata(parsed.secret, old);
 
-      // Write the new secret under a fresh credential_ref BEFORE swapping metadata atomically.
-      // This guarantees an in-flight delivery can never read an HMAC key under old Bearer metadata.
       const nextRef = randomUUID();
       const nextBackend = await this.putSecret(nextRef, parsed.secret, old.backend);
       const updated: StoredPushTarget = storedTargetSchema.parse({
@@ -726,9 +756,17 @@ function classifyTransportError(error: unknown, callerAborted: boolean): string 
   return 'network_error';
 }
 
+export type LookupAddressFn = (hostname: string) => Promise<Array<{ address: string }>>;
+
+const defaultLookupAddresses: LookupAddressFn = async hostname => {
+  const entries = await dnsLookup(hostname, { all: true });
+  return entries.map(entry => ({ address: entry.address }));
+};
+
 export interface PushDispatcherOptions {
   deliveriesFile?: string;
   fetchImpl?: typeof fetch;
+  lookupImpl?: LookupAddressFn;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   now?: () => number;
   concurrency?: number;
@@ -736,7 +774,9 @@ export interface PushDispatcherOptions {
 
 export interface DeliverOptions {
   targetIds?: string[];
+  validProblemIds?: readonly string[];
   fetchImpl?: typeof fetch;
+  lookupImpl?: LookupAddressFn;
   signal?: AbortSignal;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
@@ -744,6 +784,7 @@ export interface DeliverOptions {
 export class PushDispatcher {
   readonly deliveriesFile: string;
   private readonly defaultFetch: typeof fetch;
+  private readonly defaultLookup?: LookupAddressFn;
   private readonly defaultSleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly now: () => number;
   private readonly concurrency: number;
@@ -751,9 +792,25 @@ export class PushDispatcher {
   constructor(private readonly targets: PushTargets, opts: PushDispatcherOptions = {}) {
     this.deliveriesFile = resolve(opts.deliveriesFile ?? join(targets.root, 'deliveries.jsonl'));
     this.defaultFetch = opts.fetchImpl ?? globalThis.fetch;
+    this.defaultLookup = opts.lookupImpl;
     this.defaultSleep = opts.sleep ?? defaultSleep;
     this.now = opts.now ?? (() => Date.now());
     this.concurrency = Math.max(1, Math.min(16, Math.floor(opts.concurrency ?? 4)));
+  }
+
+  private async verifyDestinationDns(urlStr: string, fetchFn: typeof fetch, lookupImpl?: LookupAddressFn): Promise<boolean> {
+    const u = new URL(urlStr);
+    const bare = u.hostname.replace(/^\[|\]$/g, '');
+    if (isBlockedHost(u.hostname)) return false;
+    if (isLoopbackHost(u.hostname) || isIP(bare) !== 0) return true;
+
+    // When using a mocked fetchImpl without an explicit lookupImpl, skip real network DNS.
+    const resolver = lookupImpl ?? this.defaultLookup ?? (fetchFn === globalThis.fetch ? defaultLookupAddresses : undefined);
+    if (!resolver) return true;
+
+    const resolved = await resolver(bare);
+    if (!resolved.length) return false;
+    return resolved.every(item => !isBlockedIpAddress(item.address));
   }
 
   private async appendDelivery(record: PushDelivery, secret?: string) {
@@ -793,12 +850,13 @@ export class PushDispatcher {
     const startMs = this.now();
     const timestampIso = new Date(startMs).toISOString();
 
+    const loadTarget = async () => this.targets.resolveForDelivery(targetId);
+
     let resolved: { target: PushTarget; secret?: string };
     try {
-      resolved = await this.targets.resolveForDelivery(targetId);
+      resolved = await loadTarget();
     } catch (error) {
       if (eventType !== 'ping' && error instanceof PushTargetError && error.status === 404) {
-        // Target was concurrently removed after listing; skip cleanly.
         return undefined;
       }
       const errorCode = error instanceof PushTargetError && /credential/i.test(error.message)
@@ -818,8 +876,7 @@ export class PushDispatcher {
       return record;
     }
 
-    const { target, secret } = resolved;
-    // Re-check enabled & event subscription atomically loaded under lock (for non-ping deliveries).
+    let { target, secret } = resolved;
     if (eventType !== 'ping' && (!target.enabled || !target.events.includes(eventType))) {
       return undefined;
     }
@@ -836,8 +893,38 @@ export class PushDispatcher {
         lastError = 'delivery_aborted';
         break;
       }
+
+      // Before every retry attempt, re-verify target enabled/events/credentials under lock.
+      if (attempt > 1) {
+        try {
+          const refreshed = await loadTarget();
+          target = refreshed.target;
+          secret = refreshed.secret;
+        } catch {
+          lastError = 'target_unavailable';
+          break;
+        }
+        if (eventType !== 'ping' && (!target.enabled || !target.events.includes(eventType))) {
+          lastError = 'target_disabled';
+          break;
+        }
+      }
+
+      // Check DNS resolution against link-local / IMDS / unspecified IP ranges before sending.
+      let dnsAllowed: boolean;
+      try {
+        dnsAllowed = await this.verifyDestinationDns(target.url, fetchFn, opts.lookupImpl);
+      } catch {
+        dnsAllowed = false;
+      }
+      if (!dnsAllowed) {
+        attempts = attempt;
+        lastStatus = undefined;
+        lastError = 'blocked_destination';
+        break;
+      }
+
       attempts = attempt;
-      // Refresh timestamp and HMAC signature on every retry attempt while keeping X-CR-Delivery-Id idempotent.
       const attemptTimestamp = String(Math.floor(this.now() / 1000));
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -913,7 +1000,7 @@ export class PushDispatcher {
     opts: DeliverOptions = {},
   ): Promise<PushDelivery[]> {
     const validEvent = pushEventTypeSchema.parse(eventType);
-    const sanitizedPayload = sanitizePushPayload(validEvent, payload);
+    const sanitizedPayload = sanitizePushPayload(validEvent, payload, { validProblemIds: opts.validProblemIds });
     if (opts.signal?.aborted) return [];
 
     let selectedIds: string[];
@@ -1000,7 +1087,7 @@ export class PushDispatcher {
       }
       const text = buf.subarray(0, read).toString('utf8');
       const lines = text.split('\n');
-      if (startPos > 0) lines.shift(); // Drop potentially truncated leading line.
+      if (startPos > 0) lines.shift();
       for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed) continue;

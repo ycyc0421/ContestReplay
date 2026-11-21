@@ -325,7 +325,9 @@ export function extractPdfTextFallbackDetailed(
       } catch (error) {
         const code = (error as NodeJS.ErrnoException)?.code;
         if (code === 'ERR_BUFFER_TOO_LARGE' || /output length/i.test(String((error as Error)?.message ?? ''))) {
+          // Stop immediately on the first decompression-bomb stream to bound CPU/memory work.
           truncated = true;
+          break;
         }
         contentText = undefined;
       }
@@ -638,33 +640,42 @@ export async function mergePdfs(
   }
 }
 
-function encodePdfAscii(text: string, allowAsciiFallback: boolean): { text: string; replacedCount: number } {
-  const normalized = text
-    .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
-    .replace(/\t/g, '    ')
-    .replace(/[\u2018\u2019]/g, "'")
-    .replace(/[\u201C\u201D]/g, '"')
-    .replace(/\u2013/g, '-')
-    .replace(/\u2014/g, '--')
-    .replace(/\u2026/g, '...')
-    .replace(/\u00A0/g, ' ')
-    .replace(/\u2264/g, '<=')
-    .replace(/\u2265/g, '>=')
-    .replace(/\u00D7/g, 'x');
+const LOSSY_ASCII_MAP: Record<string, string> = {
+  '\t': '    ',
+  '\u2018': "'",
+  '\u2019': "'",
+  '\u201C': '"',
+  '\u201D': '"',
+  '\u2013': '-',
+  '\u2014': '--',
+  '\u2026': '...',
+  '\u00A0': ' ',
+  '\u2264': '<=',
+  '\u2265': '>=',
+  '\u00D7': 'x',
+};
+
+function encodePdfAscii(
+  text: string,
+  allowAsciiFallback: boolean,
+  opts: { allowTabExpansion?: boolean } = {},
+): { text: string; replacedCount: number } {
+  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   let out = '';
   let replacedCount = 0;
   for (const ch of normalized) {
     const code = ch.charCodeAt(0);
     if (ch === '\n' || (code >= 0x20 && code <= 0x7e)) {
       out += ch;
+    } else if (ch === '\t' && opts.allowTabExpansion) {
+      out += '    ';
     } else if (allowAsciiFallback) {
-      out += '?';
+      out += LOSSY_ASCII_MAP[ch] ?? '?';
       replacedCount++;
     } else {
       throw new Error(
-        'synthesizeTextContestPdf uses PDF Base-14 ASCII/Type1 fonts and cannot encode non-ASCII characters losslessly. ' +
-        'Use ASCII statements or pass allowAsciiFallback: true to replace unsupported characters with "?".',
+        'synthesizeTextContestPdf uses PDF Base-14 ASCII/Type1 fonts and refuses lossy character rewriting ' +
+        '(non-ASCII symbols or verbatim sample tabs). Use lossless ASCII or pass allowAsciiFallback: true.',
       );
     }
   }
@@ -676,7 +687,7 @@ function escapePdfString(text: string): string {
 }
 
 function wrapText(text: string, maxChars: number, allowAsciiFallback: boolean): { lines: string[]; replacedCount: number } {
-  const encoded = encodePdfAscii(text, allowAsciiFallback);
+  const encoded = encodePdfAscii(text, allowAsciiFallback, { allowTabExpansion: true });
   const paragraphs = encoded.text.split('\n');
   const wrapped: string[] = [];
 
@@ -711,7 +722,7 @@ function wrapText(text: string, maxChars: number, allowAsciiFallback: boolean): 
 }
 
 function wrapVerbatimLines(text: string, maxChars: number, allowAsciiFallback: boolean): { lines: string[]; replacedCount: number } {
-  const encoded = encodePdfAscii(text, allowAsciiFallback);
+  const encoded = encodePdfAscii(text, allowAsciiFallback, { allowTabExpansion: false });
   const rawLines = encoded.text.split('\n');
   const out: string[] = [];
   for (const line of rawLines) {
