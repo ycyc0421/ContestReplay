@@ -70,8 +70,14 @@ export async function listBatches(root: string) {
 export function summarize(batch: Batch) {
   const jobs = batch.jobs.map((job, i) => {
     const input = batch.plan.jobs[i]!;
-    return { ...job, agent_id: input.agent_id, agent_revision: input.agent_revision,
-      contest_id: input.contest_id, data_version: input.data_version, harness: input.harness, model_family_id: input.model_family_id };
+    return {
+      ...job, agent_id: input.agent_id,
+      ...(input.agent_name ? { agent_name: input.agent_name } : {}),
+      agent_revision: input.agent_revision,
+      contest_id: input.contest_id, data_version: input.data_version, harness: input.harness,
+      ...(input.model_family_id ? { model_family_id: input.model_family_id } : {}),
+      ...(input.speed_tier ? { speed_tier: input.speed_tier } : {}),
+    };
   });
   return { id: batch.id, created_at: batch.created_at, jobs };
 }

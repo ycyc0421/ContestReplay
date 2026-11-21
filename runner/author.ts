@@ -34,8 +34,10 @@ export async function codeforcesContest(path: string, raw: unknown, signal?: Abo
   const input = z.strictObject({ contest: z.number().int().positive(), id: z.string(), pdf: z.string(), handle: z.string(),
     languages: z.record(z.string(), z.number().int().positive()) }).parse(raw);
   const result = await importCodeforces(input.contest, signal);
+  const pointsKnown = result.problems.every(p => typeof p.points === 'number' && Number.isFinite(p.points) && p.points >= 1);
   return saveContest(path, { schema_version: 2, contest_id: input.id, data_version: 1, title: result.contest.name,
     source: { name: 'Codeforces', url: `https://codeforces.com/contest/${input.contest}` },
-    materials: { entrypoint: { kind: 'pdf', path: input.pdf } }, problems: result.problems.map(p => ({ id: p.index, max_points: 1 })),
-    judge: { kind: 'codeforces', contest_id: input.contest, handle: input.handle, languages: input.languages } });
+    materials: { entrypoint: { kind: 'pdf', path: input.pdf } },
+    problems: result.problems.map(p => ({ id: p.index, max_points: typeof p.points === 'number' && Number.isFinite(p.points) && p.points >= 1 ? Math.round(p.points) : 1 })),
+    judge: { kind: 'codeforces', contest_id: input.contest, handle: input.handle, languages: input.languages, points_known: pointsKnown } });
 }

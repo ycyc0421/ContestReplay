@@ -1,21 +1,22 @@
 import { randomUUID } from 'node:crypto';
-import { createWriteStream, type WriteStream } from 'node:fs';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { constants, createWriteStream, type WriteStream } from 'node:fs';
+import { chmod, lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { once } from 'node:events';
+import { performance } from 'node:perf_hooks';
 import { finished } from 'node:stream/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { ResponseInput } from 'openai/resources/responses/responses.js';
 import { z } from 'zod';
 import { createContest, createMcp, finishArgs, statusArgs, submitArgs, type EventSink } from './contest.js';
-import { protocol, protocolDigest, toolDefinitions } from './protocol.js';
+import { protocol, protocolDigestForPreset, protocolForPreset, resolveProtocolPreset, resolveScoringMode } from './protocol.js';
 import { agentRevision, type Inputs } from './config.js';
 import { launch, renderPdf, resources, SandboxCleanupError } from './docker.js';
 import { match } from './match.js';
 import { codeforces, type ProgramJudge } from './codeforces.js';
-import { codexConfig, serveContestChannels } from './codex.js';
+import { codexConfig, serveContestChannels, type ContestChannelsHandle, type SessionArchiveResult } from './codex.js';
 import type { Infer } from './model.js';
 import { send } from './wire.js';
 import { credentialJson, redactCredentialStream } from './credential-redaction.js';
@@ -33,6 +34,117 @@ function interrupt(signal: AbortSignal): Promise<never> {
   });
 }
 
+function waitForGraceExit(exited: Promise<number | null>, signal: AbortSignal, ms = 1_500): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  return new Promise<void>(resolve => {
+    const done = () => {
+      if (timer) clearTimeout(timer);
+      if (onAbort) signal.removeEventListener('abort', onAbort);
+      resolve();
+    };
+    onAbort = done;
+    timer = setTimeout(done, ms);
+    timer.unref();
+    signal.addEventListener('abort', done, { once: true });
+    void exited.then(done, done);
+  });
+}
+
+export const SESSION_ARCHIVE_MAX_BYTES = 32 * 1024 * 1024;
+const SESSION_ARCHIVE_MAX_FILES = 256;
+const SESSION_ARCHIVE_MAX_ENTRIES = 2048;
+const SESSION_ARCHIVE_MAX_DEPTH = 8;
+
+export async function archiveSessionDir(
+  sourceDir: string,
+  targetDir: string,
+  key?: string,
+  maxBytes = SESSION_ARCHIVE_MAX_BYTES,
+  maxEntriesVisited = SESSION_ARCHIVE_MAX_ENTRIES,
+): Promise<string[]> {
+  let rootInfo;
+  try { rootInfo = await lstat(sourceDir); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) return [];
+  const rootReal = await realpath(sourceDir);
+  const rootPrefix = rootReal.endsWith(sep) ? rootReal : rootReal + sep;
+
+  const archived: string[] = [];
+  let remaining = maxBytes;
+  let entriesVisited = 0;
+
+  const walk = async (currentDir: string, relPrefix: string, depth: number): Promise<void> => {
+    if (depth > SESSION_ARCHIVE_MAX_DEPTH || remaining <= 0 || archived.length >= SESSION_ARCHIVE_MAX_FILES || entriesVisited >= maxEntriesVisited) return;
+    const names = (await readdir(currentDir)).sort();
+    for (const name of names) {
+      if (remaining <= 0 || archived.length >= SESSION_ARCHIVE_MAX_FILES || ++entriesVisited > maxEntriesVisited) break;
+      if (!name || name === '.' || name === '..' || name.includes('/') || name.includes('\\') || name.includes('\0')) continue;
+      const srcPath = join(currentDir, name);
+      let info;
+      try { info = await lstat(srcPath); } catch { continue; }
+      if (info.isSymbolicLink()) continue;
+      let resolvedPath: string;
+      try { resolvedPath = await realpath(srcPath); } catch { continue; }
+      if (!resolvedPath.startsWith(rootPrefix)) continue;
+      const rel = relPrefix ? `${relPrefix}/${name}` : name;
+      if (info.isDirectory()) {
+        await walk(srcPath, rel, depth + 1);
+      } else if (info.isFile()) {
+        if (info.nlink > 1) continue;
+        let handle;
+        try { handle = await open(srcPath, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW); }
+        catch { continue; }
+        try {
+          const statInfo = await handle.stat();
+          if (!statInfo.isFile() || statInfo.nlink > 1) continue;
+          const destPath = join(targetDir, ...rel.split('/'));
+          await mkdir(dirname(destPath), { recursive: true, mode: 0o700 });
+          const out = createWriteStream(destPath, { mode: 0o600, flags: 'wx' });
+          const outClosed = finished(out);
+          void outClosed.catch(() => {});
+          await once(out, 'open');
+          let truncated = false;
+          const redactor = redactCredentialStream(key, bytes => {
+            if (truncated || out.destroyed || bytes.length === 0) return;
+            if (bytes.length <= remaining) {
+              remaining -= bytes.length;
+              out.write(bytes);
+            } else {
+              if (remaining > 0) out.write(bytes.subarray(0, remaining));
+              remaining = 0;
+              truncated = true;
+              out.write('\n[cr: session archive truncated at byte limit]\n');
+            }
+          });
+          const buf = Buffer.alloc(64 * 1024);
+          let pos = 0;
+          try {
+            while (!truncated && remaining > 0) {
+              const { bytesRead } = await handle.read(buf, 0, buf.length, pos);
+              if (!bytesRead) break;
+              pos += bytesRead;
+              redactor.push(Buffer.from(buf.subarray(0, bytesRead)));
+            }
+            redactor.end();
+          } finally {
+            out.end();
+            await outClosed;
+          }
+          await chmod(destPath, 0o600).catch(() => {});
+          archived.push(rel);
+        } finally {
+          await handle.close();
+        }
+      }
+    }
+  };
+
+  await walk(sourceDir, '', 0);
+  return archived;
+}
+
 export async function runBench(inputs: Inputs, opts: {
   out: string; image: string; infer?: Infer; key?: string; programJudge?: ProgramJudge; signal: AbortSignal;
   runId?: string;
@@ -40,25 +152,44 @@ export async function runBench(inputs: Inputs, opts: {
 }) {
   const runId = opts.runId ?? randomUUID();
   const directory = resolve(opts.out, runId);
+  const presetName = resolveProtocolPreset(inputs.contest.rules);
+  const preset = protocolForPreset(presetName);
+  const effectiveProtocolDigest = protocolDigestForPreset(presetName);
+  const scoringMode = resolveScoringMode(inputs.contest.rules);
+  const sandboxResources = inputs.profile.harness === 'codex' ? preset.sandbox : resources;
+
   await mkdir(resolve(opts.out), { recursive: true, mode: 0o700 });
   await mkdir(directory, { mode: 0o700 });
-  await writeFile(join(directory, 'run.json'), credentialJson({
+  const runMeta: Record<string, unknown> = {
     schema_version: 1, run_id: runId, created_at: new Date().toISOString(),
     contest_id: inputs.contest.contest_id, data_version: inputs.contest.data_version,
     local_inputs: { contest: inputs.contestPath, agent: inputs.agentPath, pdf: inputs.pdfPath, judge: inputs.judgePath },
     input_sha256: { contest: inputs.contestDigest, pdf: inputs.contest.statement.sha256,
       judge: inputs.contest.judge.kind === 'local' ? inputs.contest.judge.answers.sha256 : undefined },
     contest_title: inputs.contest.title, contest_revision: inputs.contestRevision,
+    problems: inputs.contest.problems.map(({ id, max_points }) => ({ id, max_points })),
+    ...(inputs.contest.judge.kind === 'codeforces' && inputs.contest.judge.points_known !== undefined
+      ? { points_known: inputs.contest.judge.points_known } : {}),
     protocol_id: inputs.profile.harness === 'codex' ? 'codex-pdf-pages-mcp' : protocol.id, protocol_version: 2,
-    protocol_sha256: protocolDigest, rules: inputs.contest.rules,
+    protocol_preset: presetName, scoring_mode: scoringMode,
+    protocol_sha256: effectiveProtocolDigest, rules: inputs.contest.rules,
     agent_id: inputs.agent.agent_id,
-    agent_revision: agentRevision(inputs, opts.image, protocolDigest),
+    ...(inputs.agentName ? { agent_name: inputs.agentName } : {}),
+    agent_revision: agentRevision(inputs, opts.image, effectiveProtocolDigest),
     agent_digests: { source_sha256: inputs.agentDigest, profile_sha256: inputs.profileDigest, native_sha256: inputs.nativeDigest, effective_sha256: inputs.effectiveDigest },
     harness: inputs.agent.harness, runner_version: '0.2.0', adapter_version: '0.2.0', judge_kind: inputs.contest.judge.kind,
-    sandbox: { runtime: 'docker', image: opts.image, resources: inputs.profile.harness === 'codex' ? { ...resources, memory: '2g', workspace: '256m' } : resources },
-    model: { model: inputs.profile.model, api: inputs.profile.api, base_url: inputs.profile.base_url, vendor: inputs.vendor, model_family_id: inputs.profile.model_family_id,
-      ...(inputs.profile.harness === 'codex' ? { reasoning_effort: inputs.profile.reasoning_effort } : { temperature: inputs.profile.temperature, max_output_tokens: protocol.maxOutputTokens }) },
-  }, opts.key, 2) + '\n', { mode: 0o600, flag: 'wx' });
+    sandbox: { runtime: 'docker', image: opts.image, resources: sandboxResources },
+    model: {
+      model: inputs.profile.model, api: inputs.profile.api, base_url: inputs.profile.base_url,
+      vendor: inputs.vendor, model_family_id: inputs.profile.model_family_id,
+      speed_tier: inputs.speedTier,
+      ...(inputs.profile.harness === 'codex'
+        ? { reasoning_effort: inputs.profile.reasoning_effort, ...(inputs.profile.service_tier ? { service_tier: inputs.profile.service_tier } : {}) }
+        : { temperature: inputs.profile.temperature, max_output_tokens: preset.maxOutputTokens }),
+    },
+  };
+  const runJsonPath = join(directory, 'run.json');
+  await writeFile(runJsonPath, credentialJson(runMeta, opts.key, 2) + '\n', { mode: 0o600, flag: 'wx' });
   const log: WriteStream = createWriteStream(join(directory, 'events.jsonl'), { mode: 0o600, flags: 'wx' });
   const logClosed = finished(log);
   // Attach a rejection handler before the first async operation; await below to surface failure.
@@ -71,14 +202,15 @@ export async function runBench(inputs: Inputs, opts: {
     void closed.catch(() => {});
     let total = 0;
     let truncated = false;
+    const maxBytes = preset.diagnosticMaxBytes;
     const redactor = redactCredentialStream(opts.key, bytes => {
       if (truncated || stream.destroyed || bytes.length === 0) return;
-      const budget = 1024 * 1024 - total;
+      const budget = maxBytes - total;
       total += bytes.length;
       stream.write(bytes.subarray(0, budget));
       if (bytes.length > budget) {
         truncated = true;
-        stream.write('\n[cr: diagnostics truncated at 1 MiB]\n');
+        stream.write(`\n[cr: diagnostics truncated at ${Math.round(maxBytes / (1024 * 1024))} MiB]\n`);
       }
     });
     writers.push({ stream, closed, flush: redactor.end });
@@ -96,13 +228,15 @@ export async function runBench(inputs: Inputs, opts: {
   void stoppedPromise.catch(() => {});
   const wait = <T>(p: Promise<T>) => Promise.race([p, stoppedPromise]);
   let stage: string | undefined;
+  let sessionResult: SessionArchiveResult = { status: 'not_connected', files: [] };
+  const isCodex = inputs.profile.harness === 'codex';
   let sandbox: Awaited<ReturnType<typeof launch>> | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let client: Client | undefined;
   let mcp: ReturnType<typeof createMcp> | undefined;
   let contest: ReturnType<typeof createContest> | undefined;
   let contestMatch: ReturnType<typeof match> | undefined;
-  let closeChannels: (() => Promise<void>) | undefined;
+  let closeChannels: ContestChannelsHandle | undefined;
   let started = false;
   let status: 'completed' | 'void' = 'void';
   let reason = 'runner_error';
@@ -123,7 +257,7 @@ export async function runBench(inputs: Inputs, opts: {
       await writeFile(join(input, 'problems.pdf'), inputs.pdf, { mode: 0o444 });
       const pages = join(input, 'pages');
       await mkdir(pages, { mode: 0o755 });
-      await renderPdf(runId, opts.image, pdfPath, pages, opts.signal);
+      await renderPdf(runId, opts.image, pdfPath, pages, opts.signal, { maxPages: preset.pdfMaxPages, maxBytes: preset.pdfMaxBytes });
       const attachments = join(input, 'attachments');
       await mkdir(attachments, { mode: 0o755 });
       for (const file of inputs.attachments) await writeFile(join(attachments, file.name), file.bytes, { mode: 0o444 });
@@ -135,12 +269,22 @@ export async function runBench(inputs: Inputs, opts: {
       const session = () => live ??= (contestMatch = match(inputs, event, judge));
       let endRun!: (reason: string) => void;
       const terminal = new Promise<string>(resolve => { endRun = resolve; });
-      closeChannels = await serveContestChannels({ dir: channels, profile: inputs.profile, native: inputs.native, key: opts.key, signal: stopped,
+      closeChannels = await serveContestChannels({
+        dir: channels, profile: inputs.profile, native: inputs.native, key: opts.key, signal: stopped,
+        maxTurns: preset.maxTurns, requestTimeoutMs: preset.requestTimeoutMs, maxRequestBytes: preset.maxRequestBytes,
+        sessionArchive: {
+          dir: join(directory, 'session'),
+          maxBytes: SESSION_ARCHIVE_MAX_BYTES,
+          onResult: res => { sessionResult = res; },
+        },
         contest: { submit: args => session().submit(args), status: id => session().status(id), close: () => session().close() },
         event, finish: () => {
           endRun('finish');
-        }, fault: endRun });
-      sandbox = await launch(runId, opts.image, pdfPath, opts.signal, stderr, { input, channels, env: inputs.env, onStdout: stdout });
+        }, fault: endRun,
+      });
+      sandbox = await launch(runId, opts.image, pdfPath, opts.signal, stderr, {
+        input, channels, env: inputs.env, resources: preset.sandbox, onStdout: stdout,
+      });
       elapsed = session().elapsed;
       started = true;
       timer = setTimeout(() => deadline.abort(), limits.time_limit_ms);
@@ -150,8 +294,14 @@ export async function runBench(inputs: Inputs, opts: {
       const task = `You are competing in a timed contest. The attached images are all pages of the complete problem PDF, in order. The original is /inputs/problems.pdf. Optional contest materials are read-only in /inputs/attachments. Use the contest MCP tools: submit, status, finish. ${form} Only submissions are scored. No external resources. Work independently; call finish when done.`;
       sandbox.input.end(task);
       const end = await wait(Promise.race([terminal, sandbox.exited.then(code => code === 0 ? 'agent_ended' : 'sandbox_exited')]));
+      // Immediately lock out further submissions and model inference before waiting for session flush.
+      contestMatch?.close();
+      closeChannels.stopInference();
       reason = end;
       status = ['finish', 'agent_ended', 'turn_limit'].includes(end) ? 'completed' : 'void';
+      if (end === 'finish' || end === 'turn_limit') {
+        await waitForGraceExit(sandbox.exited, opts.signal, 1_500);
+      }
     } else {
     if (!opts.infer) throw new RunFailure('missing_model_adapter');
     if (inputs.contest.judge.kind !== 'local' || inputs.attachments.length) throw new RunFailure('unsupported_contest');
@@ -174,7 +324,7 @@ export async function runBench(inputs: Inputs, opts: {
       { type: 'input_text', text: 'This is the complete contest paper. Begin the contest.' },
     ] }];
     reason = 'turn_limit';
-    for (let turn = 1; turn <= protocol.maxTurns; turn++) {
+    for (let turn = 1; turn <= preset.maxTurns; turn++) {
       const frame = await wait(sandbox.frames.next());
       if (frame.done || !next.safeParse(frame.value).success) throw new RunFailure('sandbox_protocol_error');
       if (elapsed() >= limits.time_limit_ms) { deadline.abort(); stopped.throwIfAborted(); }
@@ -182,9 +332,10 @@ export async function runBench(inputs: Inputs, opts: {
       // messages and turn activity as operator logs instead of leaking IPC frames.
       stdout(`[cr] model turn ${turn}\n`);
       event({ type: 'model_request', turn });
-      const apiTimeout = AbortSignal.timeout(protocol.requestTimeoutMs);
+      const apiTimeout = AbortSignal.timeout(preset.requestTimeoutMs);
       const requestSignal = AbortSignal.any([stopped, apiTimeout]);
       const requestEnd = interrupt(requestSignal);
+      const turnStart = performance.now();
       let result: Awaited<ReturnType<Infer>>;
       try {
         result = await Promise.race([opts.infer(history, requestSignal), requestEnd]);
@@ -193,9 +344,10 @@ export async function runBench(inputs: Inputs, opts: {
         if (stopped.aborted) stopped.throwIfAborted();
         throw new RunFailure(apiTimeout.aborted ? 'model_timeout' : 'model_request_failed');
       }
+      const durationMs = Math.max(0, Math.round(performance.now() - turnStart));
       event({ type: 'model_response', turn, model: result.model || null, request_id: result.requestId ?? null,
         response_id: result.responseId ?? null, usage: result.usage ?? null, status: result.status ?? null,
-        incomplete_reason: result.incompleteReason ?? null, output: result.output });
+        incomplete_reason: result.incompleteReason ?? null, duration_ms: durationMs, output: result.output });
       if (result.model && result.model !== inputs.profile.model) throw new RunFailure('unexpected_model');
       if (result.status === 'incomplete' && result.incompleteReason === 'max_output_tokens') {
         reason = 'output_limit';
@@ -239,7 +391,7 @@ export async function runBench(inputs: Inputs, opts: {
           event({ type: 'tool_rejected', turn, call_id: call.call_id, reason: 'invalid_arguments_or_tool' });
         }
         history.push({ type: 'function_call_output', call_id: call.call_id, output: JSON.stringify(output) });
-        const done = contest.finished() || (turn === protocol.maxTurns && index === calls.length - 1);
+        const done = contest.finished() || (turn === preset.maxTurns && index === calls.length - 1);
         await wait(send(sandbox.input, { done }));
         if (done) break;
       }
@@ -252,32 +404,66 @@ export async function runBench(inputs: Inputs, opts: {
   } catch (error) {
     if (error instanceof SandboxCleanupError) reason = 'sandbox_cleanup_failed';
     else if (opts.signal.aborted) reason = 'interrupted';
-    else if (deadline.signal.aborted && started) { status = 'completed'; reason = 'time_limit'; }
+    else if (deadline.signal.aborted && started) {
+      status = 'completed';
+      reason = 'time_limit';
+      contestMatch?.close();
+      closeChannels?.stopInference();
+      if (inputs.profile.harness === 'codex' && sandbox) {
+        // Gently signal bridge.js (SIGTERM) and wait up to 1.5s for session flush before force removal.
+        void sandbox.stop(2);
+        await waitForGraceExit(sandbox.exited, opts.signal, 1_500);
+      }
+    }
     else reason = error instanceof RunFailure ? error.message : !started ? 'sandbox_start_failed' : 'runner_error';
   } finally {
-    cleanup.abort();
     contestMatch?.close();
+    closeChannels?.stopInference();
+    cleanup.abort();
     if (timer) clearTimeout(timer);
-    try { await closeChannels?.(); }
-    catch { status = 'void'; reason = 'relay_cleanup_failed'; }
-    try { await client?.close(); await mcp?.close(); }
-    catch { status = 'void'; reason = 'mcp_cleanup_failed'; }
+    let sandboxCleanupFailed = reason === 'sandbox_cleanup_failed';
     try { await sandbox?.close(); }
-    catch { status = 'void'; reason = 'sandbox_cleanup_failed'; }
+    catch { status = 'void'; reason = 'sandbox_cleanup_failed'; sandboxCleanupFailed = true; }
+    try { await closeChannels?.(); }
+    catch { status = 'void'; if (!sandboxCleanupFailed) reason = 'relay_cleanup_failed'; }
+    try { await client?.close(); await mcp?.close(); }
+    catch { status = 'void'; if (!sandboxCleanupFailed) reason = 'mcp_cleanup_failed'; }
+    if (isCodex) {
+      if (sandboxCleanupFailed) {
+        sessionResult = { status: 'failed', files: [] };
+        await rm(join(directory, 'session'), { recursive: true, force: true }).catch(() => {});
+      }
+      const tmp = `${runJsonPath}.${randomUUID()}.tmp`;
+      try {
+        await writeFile(tmp, credentialJson({
+          ...runMeta,
+          session_archive_status: sessionResult.status,
+          ...(sessionResult.files.length > 0 ? { session_files: sessionResult.files } : {}),
+        }, opts.key, 2) + '\n', { mode: 0o600, flag: 'wx' });
+        await rename(tmp, runJsonPath);
+      } catch {
+        await rm(tmp, { force: true }).catch(() => {});
+      }
+    }
     try { if (stage) await rm(stage, { recursive: true, force: true }); }
     catch { status = 'void'; if (reason !== 'sandbox_cleanup_failed') reason = 'staging_cleanup_failed'; }
     if (contestMatch) {
       if (status === 'completed') {
         if (contestMatch.hasPending()) event({ type: 'settling' });
-        try { await contestMatch.settle(AbortSignal.any([opts.signal, AbortSignal.timeout(120_000)])); }
+        try { await contestMatch.settle(AbortSignal.any([opts.signal, AbortSignal.timeout(preset.settlementMs)])); }
         catch { status = 'void'; reason = opts.signal.aborted ? 'interrupted' : 'judge_unsettled'; }
       }
       await contestMatch.dispose();
     }
     for (const writer of writers) { writer.flush(); writer.stream.end(); }
     await Promise.allSettled(writers.map(writer => writer.closed));
-    event({ type: 'run_ended', status, reason, score: status === 'completed' ? contestMatch?.score() ?? contest?.score() ?? 0 : null,
-      max_score: inputs.contest.problems.reduce((sum, p) => sum + p.max_points, 0) });
+    event({
+      type: 'run_ended', status, reason,
+      score: status === 'completed' ? contestMatch?.score() ?? contest?.score() ?? 0 : null,
+      max_score: inputs.contest.problems.reduce((sum, p) => sum + p.max_points, 0),
+      ...(isCodex ? { session_archive_status: sessionResult.status } : {}),
+      ...(sessionResult.files.length > 0 ? { session_files: sessionResult.files } : {}),
+    });
     log.end();
     await logClosed;
   }

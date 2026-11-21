@@ -8,8 +8,9 @@ import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { id } from './config.js';
 import { FieldError } from './agent-manifest.js';
+import { protocolPresets } from './protocol.js';
 
-const PDF = 40_000_000;
+const PDF = protocolPresets['icpc-5h'].pdfMaxBytes;
 const ATTACHMENT = 16_000_000;
 const TOTAL = 32_000_000;
 const assetName = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;

@@ -1,16 +1,25 @@
 import { z } from 'zod';
-import { builtinModel, codexModel, effectiveFor, harness, harnessKind, parseNative } from './harnesses.js';
+import { builtinModel, codexModel, effectiveFor, harness, harnessKind, parseNative, speedTierSchema } from './harnesses.js';
 import { formatSchema } from './serialization.js';
 import { connectionId, type Connections } from './connections.js';
 
 export const agentKind = 'contestreplay.dev/agent';
+export const agentNameSchema = z.string().trim().min(1).max(120);
 const configRef = { format: formatSchema, schema: z.string().max(128).optional() };
 export const nativeConfigSchema = z.union([
   z.strictObject({ ...configRef, content: z.string().max(64_000) }),
   z.strictObject({ ...configRef, path: z.string().min(1).max(4096), sha256: z.string().regex(/^[a-f0-9]{64}$/) }),
 ]);
-export const manifestSchema = z.strictObject({ kind: z.literal(agentKind), schema_version: z.literal(1), id: connectionId,
-  vendor: connectionId.optional(), model: z.string(), provider: connectionId.optional(), connection: connectionId.optional(),
+export const manifestSchema = z.strictObject({
+  kind: z.literal(agentKind),
+  schema_version: z.literal(1),
+  id: connectionId,
+  name: agentNameSchema.optional(),
+  vendor: connectionId.optional(),
+  model: z.string(),
+  speed_tier: speedTierSchema.optional(),
+  provider: connectionId.optional(),
+  connection: connectionId.optional(),
   harness: z.strictObject({ kind: harnessKind, version: z.string(), options: z.record(z.string(), z.unknown()).default({}), env: z.record(z.string(), z.string()).optional(), native_config: nativeConfigSchema.optional() }),
 }).refine(value => Boolean(value.provider) !== Boolean(value.connection), 'Specify exactly one provider (legacy: connection)');
 export const manifestProvider = (manifest: z.infer<typeof manifestSchema>) => (manifest.provider ?? manifest.connection)!;
@@ -32,13 +41,40 @@ export async function resolveManifest(raw: unknown, store: Connections, readExte
     return result.data;
   };
   const env = validate(kind === 'codex' ? harness('codex').env : harness('builtin-responses').env, manifest.harness.env ?? {}, ['harness', 'env']);
-  const shared = { id: manifest.id, api: connection.protocol, base_url: connection.base_url, api_key_env: 'OPENAI_API_KEY' };
+  if (connection.protocol !== 'responses' && connection.protocol !== 'passthrough') {
+    fail([manifest.provider ? 'provider' : 'connection'], `Harness ${kind} requires a responses or passthrough provider`);
+  }
+  if (manifest.speed_tier === 'fast' && connection.supports_fast === false) {
+    fail(['speed_tier'], 'Selected provider does not support fast speed_tier');
+  }
+  if (manifest.speed_tier === 'ultrafast' && connection.supports_ultrafast === false) {
+    fail(['speed_tier'], 'Selected provider does not support ultrafast speed_tier');
+  }
+  const common = {
+    id: manifest.id,
+    ...(manifest.name ? { name: manifest.name } : {}),
+    ...(manifest.speed_tier ? { speed_tier: manifest.speed_tier } : {}),
+    api: connection.protocol,
+    base_url: connection.base_url,
+    api_key_env: 'OPENAI_API_KEY',
+  };
   const profile = kind === 'codex' ? (() => {
     const selected = validate(harness('codex').options, options, ['harness', 'options']);
     const effort = selected.reasoning_effort;
-    return { ...shared, harness: kind, model: validate(codexModel, manifest.model, ['model']), reasoning_effort: effort === 'default' ? undefined : effort } as const;
-  })() : { ...shared, harness: kind, model: validate(builtinModel, manifest.model, ['model']),
-    temperature: validate(harness('builtin-responses').options, options, ['harness', 'options']).temperature } as const;
+    const serviceTier = selected.service_tier;
+    return {
+      ...common,
+      harness: kind,
+      model: validate(codexModel, manifest.model, ['model']),
+      reasoning_effort: effort === 'default' ? undefined : effort,
+      ...(serviceTier && serviceTier !== 'default' ? { service_tier: serviceTier } : {}),
+    } as const;
+  })() : {
+    ...common,
+    harness: kind,
+    model: validate(builtinModel, manifest.model, ['model']),
+    temperature: validate(harness('builtin-responses').options, options, ['harness', 'options']).temperature,
+  } as const;
   let nativeText: string | undefined;
   let native;
   if (native_config) {
@@ -49,6 +85,9 @@ export async function resolveManifest(raw: unknown, store: Connections, readExte
       native = parseNative(kind, nativeText);
     } catch (err) { return fail(['harness', 'native_config'], err instanceof Error ? err.message : 'Invalid native override'); }
   }
-  manifest.harness.options = profile.harness === 'codex' ? (profile.reasoning_effort ? { reasoning_effort: profile.reasoning_effort } : {}) : { temperature: profile.temperature };
+  manifest.harness.options = profile.harness === 'codex' ? {
+    ...(profile.reasoning_effort ? { reasoning_effort: profile.reasoning_effort } : {}),
+    ...(profile.service_tier ? { service_tier: profile.service_tier } : {}),
+  } : { temperature: profile.temperature };
   return { manifest, profile, native, nativeText, env, connection, effective: effectiveFor(profile, native) };
 }

@@ -52,7 +52,12 @@ test('fresh Docker containers run MCP turns, redact failed scores and clean up',
     assert.equal(ok.status, 'completed', ok.reason);
     const logs = await read(join(ok.directory, 'events.jsonl'));
     assert.deepEqual(logs.filter(e => e.type === 'submission_judged').map(e => e.verdict), ['wrong_answer', 'accepted']);
+    assert.ok(logs.some(e => e.type === 'model_response' && typeof e.duration_ms === 'number'));
     assert.equal(logs.at(-1).score, 3);
+    const runMeta = JSON.parse(await readFile(join(ok.directory, 'run.json'), 'utf8'));
+    assert.equal(runMeta.protocol_preset, 'short');
+    assert.equal(runMeta.scoring_mode, 'last_ac');
+    assert.deepEqual(runMeta.problems, [{ id: '1', max_points: 3 }, { id: '2', max_points: 5 }]);
     gone(ok.runId);
     const bad = await runBench(inputs, { out, image, signal, infer: async history => {
       if (history.length === 1) return answer('a', 'submit', { problem_id: '2', answer: '12' });

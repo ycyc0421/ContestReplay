@@ -90,7 +90,9 @@ export async function startStudio(root: string, port = 0, opts: { base?: string;
         while (plans.size >= 8) plans.delete(plans.keys().next().value!);
         const token = randomUUID();
         plans.set(token, plan);
-        return json(res, { token, jobs: plan.jobs.map(({ agent_id, agent_revision, contest_id, data_version }) => ({ agent_id, agent_revision, contest_id, data_version })) });
+        return json(res, { token, jobs: plan.jobs.map(({ agent_id, agent_name, agent_revision, contest_id, data_version, speed_tier }) => ({
+          agent_id, ...(agent_name ? { agent_name } : {}), agent_revision, contest_id, data_version, ...(speed_tier ? { speed_tier } : {}),
+        })) });
       }
       if (req.method === 'POST' && path === '/api/batches') {
         const { token } = await body(req);

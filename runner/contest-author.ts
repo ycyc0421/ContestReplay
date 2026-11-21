@@ -37,6 +37,7 @@ export async function createContestDocument(root: string, base: string, raw: unk
   let answers: z.infer<typeof judgeSchema> | undefined;
   let problems = document.problems;
   const rules = document.rules;
+  let cfPointsKnown: boolean | undefined;
   if (judge.kind === 'local' && (payload || Array.isArray(judge.problems) || Array.isArray(problems) && problems.some(p => p && Object.hasOwn(p, 'accepted_answers')))) {
     authoredJudge.parse(document.judge);
     if (payload && judge.problems) throw new FieldError(['judge'], 'Only one local answer table may be supplied');
@@ -48,15 +49,21 @@ export async function createContestDocument(root: string, base: string, raw: unk
     if (!problems) {
       const contest = z.number().int().positive().parse(judge.contest_id);
       const imported = await importCodeforces(contest, signal);
-      problems = imported.problems.map(p => ({ id: p.index, max_points: 1 }));
+      cfPointsKnown = imported.problems.every(p => typeof p.points === 'number' && Number.isFinite(p.points) && p.points >= 1);
+      problems = imported.problems.map(p => ({ id: p.index, max_points: typeof p.points === 'number' && Number.isFinite(p.points) && p.points >= 1 ? Math.round(p.points) : 1 }));
     }
   }
   const answersPath = join(dirname(target), 'judge.json');
   if (answers && answersPath === target) throw new FieldError(['file'], 'Contest cannot be named judge.json');
+  const resolvedJudge = answers
+    ? { kind: 'local', answers: { path: 'judge.json', redistribution: 'restricted' } }
+    : (cfPointsKnown !== undefined && document.judge && typeof document.judge === 'object'
+      ? { ...(document.judge as Record<string, unknown>), points_known: cfPointsKnown }
+      : document.judge);
   const manifest = contestSchema.parse({ ...fields, problems, rules,
     materials: { entrypoint: { ...artifact(materials.entrypoint, 'entrypoint'), kind: 'pdf' },
       attachments: materials.attachments.map(item => ({ ...artifact(item, 'attachment'), name: item.name ?? item.path.split('/').at(-1) })) },
-    judge: answers ? { kind: 'local', answers: { path: 'judge.json', redistribution: 'restricted' } } : document.judge });
+    judge: resolvedJudge });
   // Stage private data beside its destination. No existing file is overwritten.
   const temp = await mkdtemp(join(dirname(target), '.cr-contest-'));
   let linkedJudge = false;
