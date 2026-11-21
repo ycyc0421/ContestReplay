@@ -5,7 +5,7 @@ import { exportBatch } from './results.js';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { makePlan, type Plan } from './plan.js';
 import { dispatch, enqueue, listBatches, lookupRun, readRunLog, requestBatchStop, requestRunCancel, summarize, type QueueOptions } from './queue.js';
-import { page, browserCode } from './studio-page.js';
+import { serveStudioStatic, studioCsp } from './studio-static.js';
 import { Connections } from './connections.js';
 import { configError, configRoute, isConfigRoute } from './studio-config-api.js';
 
@@ -28,7 +28,7 @@ async function body(req: IncomingMessage, limit = 64 * 1024) {
 }
 function reply(res: ServerResponse, status: number, content: string, type = 'application/json; charset=utf-8') {
   res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
-    'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'",
+    'Content-Security-Policy': studioCsp,
     'Referrer-Policy': 'no-referrer' });
   res.end(content);
 }
@@ -57,8 +57,7 @@ export async function startStudio(root: string, port = 0, opts: { base?: string;
       if ((origin && origin !== `http://${host}`) || req.headers['sec-fetch-site'] === 'cross-site') throw new HttpError(403, 'Invalid origin');
       if (['POST', 'PATCH', 'DELETE'].includes(req.method ?? '') && (origin !== `http://${host}` || req.headers['x-cr-studio'] !== '1')) throw new HttpError(403, 'Same-origin Studio requests only');
       const path = new URL(req.url ?? '/', 'http://' + host).pathname;
-      if (req.method === 'GET' && path === '/') return reply(res, 200, page, 'text/html; charset=utf-8');
-      if (req.method === 'GET' && path === '/studio.js') return reply(res, 200, browserCode, 'text/javascript; charset=utf-8');
+      if (req.method === 'GET' && path !== '/api' && !path.startsWith('/api/') && await serveStudioStatic(path, res)) return;
       if (isConfigRoute(path)) {
         try {
           const result = await configRoute(path, req, { root, base, store, signal: control.signal, getImage: opts.getImage }, () => body(req, 512 * 1024));
