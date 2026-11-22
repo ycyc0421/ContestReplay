@@ -52,6 +52,8 @@ export interface ProgramJudge {
   verdicts(ids: number[], problems: Map<number, string>, signal: AbortSignal): Promise<Map<number, string>>;
 }
 export function codeforces(backend: Backend): ProgramJudge {
+  const handle = backend.handle;
+  if (!handle) throw new Error('Legacy Codeforces adapter requires handle');
   const executable = cfExecutable();
   let checkedContest: Promise<unknown> | undefined;
   const targetFor = (problem: string) => Object.hasOwn(backend.problem_map ?? {}, problem) ? backend.problem_map![problem]! : problem;
@@ -60,16 +62,23 @@ export function codeforces(backend: Backend): ProgramJudge {
       checkedContest ??= importCodeforces(backend.contest_id, signal);
       await checkedContest;
       const target = targetFor(problem);
+      const rawLanguage = Object.hasOwn(backend.languages, language) ? backend.languages[language] : undefined;
+      if (rawLanguage === undefined) throw new Error(`Unsupported Codeforces language key: ${language}`);
       if (!executable) {
+        const rawStr = String(rawLanguage).trim();
+        const languageId = Number(rawStr);
+        if (!/^\d+$/.test(rawStr) || !Number.isSafeInteger(languageId) || languageId <= 0) {
+          throw new Error(`Invalid numeric Codeforces language ID for ${language}`);
+        }
         const cookie = process.env.CR_CODEFORCES_COOKIE;
         if (!cookie) throw new Error('Missing Codeforces session');
         const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(30_000)]);
         let baseline = 0;
         let since = 0;
         return submitCodeforcesWeb({ contest: backend.contest_id, problem: target,
-          language: backend.languages[language]!, source, handle: backend.handle, cookie, signal: requestSignal,
+          language: languageId, source, handle, cookie, signal: requestSignal,
           async beforePost() {
-            const before = await userSubmissions(backend.handle, 10, requestSignal);
+            const before = await userSubmissions(handle, 10, requestSignal);
             baseline = Math.max(0, ...before.map(row => row.id));
             since = Math.floor(Date.now() / 1000) - 10;
           },
@@ -77,8 +86,8 @@ export function codeforces(backend: Backend): ProgramJudge {
             const { setTimeout: delay } = await import('node:timers/promises');
             for (let i = 0; i < 4; i++) {
               await delay(2500, undefined, { signal: requestSignal });
-              const rows = await userSubmissions(backend.handle, 30, requestSignal);
-              const candidates = exactPracticeCandidates(rows, { baseline, contest: backend.contest_id, problem: target, handle: backend.handle, since });
+              const rows = await userSubmissions(handle, 30, requestSignal);
+              const candidates = exactPracticeCandidates(rows, { baseline, contest: backend.contest_id, problem: target, handle, since });
               if (candidates.length === 1 && rows.filter(row => row.id > baseline).length === 1) return candidates[0]!;
               if (rows.some(row => row.id > baseline)) throw new Error('Ambiguous Codeforces submission: the account must be dedicated to this run');
             }
@@ -93,18 +102,18 @@ export function codeforces(backend: Backend): ProgramJudge {
         // No shell, no discovery of "latest submission", and never retry a write
         // whose outcome is unknown. Operator installs the authorized transport.
         const { stdout } = await exec(executable, [String(backend.contest_id), target,
-          String(backend.languages[language]), file, backend.handle], { signal, timeout: 30_000, maxBuffer: 4096 });
+          String(backend.languages[language]), file, handle], { signal, timeout: 30_000, maxBuffer: 4096 });
         return z.strictObject({ submission_id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).parse(JSON.parse(stdout)).submission_id;
       } finally { await rm(dir, { recursive: true, force: true }); }
     },
     async verdicts(ids, problems, signal) {
-      const rows = await userSubmissions(backend.handle, 1000, signal);
+      const rows = await userSubmissions(handle, 1000, signal);
       const wanted = new Set(ids);
       const result = new Map<number, string>();
       for (const row of rows) if (wanted.has(row.id)) {
         const problem = problems.get(row.id)!;
         if ((row.contestId ?? row.problem.contestId) !== backend.contest_id || row.problem.index !== targetFor(problem) || row.author.participantType !== 'PRACTICE' ||
-          row.author.members.length !== 1 || row.author.members[0]?.handle.toLowerCase() !== backend.handle.toLowerCase()) throw new Error('Remote submission identity mismatch');
+          row.author.members.length !== 1 || row.author.members[0]?.handle.toLowerCase() !== handle.toLowerCase()) throw new Error('Remote submission identity mismatch');
         if (row.verdict && !['TESTING', 'SUBMITTED'].includes(row.verdict)) result.set(row.id, row.verdict);
       }
       return result;

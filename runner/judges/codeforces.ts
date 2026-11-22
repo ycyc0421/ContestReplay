@@ -889,10 +889,16 @@ export function createCodeforcesJudge(
     settlementMs,
 
     async submit(problem, language, source, signal) {
-      const langId = config.languages[language];
-      if (langId === undefined) {
+      const rawLangId = config.languages[language];
+      if (rawLangId === undefined) {
         throw new Error(`Unsupported Codeforces language key: ${language}`);
       }
+      const langStr = typeof rawLangId === 'number' ? String(rawLangId) : String(rawLangId).trim();
+      const langNum = /^[0-9]+$/.test(langStr) ? Number(langStr) : NaN;
+      if (!Number.isSafeInteger(langNum) || langNum < 1) {
+        throw new Error(`Invalid Codeforces programTypeId for language: ${language}`);
+      }
+      const langId = String(langNum);
       // Resolve transport & origin binding BEFORE any network requests.
       const transport = await resolveTransport();
 

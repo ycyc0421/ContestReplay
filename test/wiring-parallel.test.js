@@ -1,0 +1,1197 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { createServer } from 'node:http';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { loadContest, loadInputs, resolveContest, resolveOjAccountPolicy } from '../dist/config.js';
+import { Connections } from '../dist/connections.js';
+import { createCodeforcesJudge, JudgeInfrastructureError, OjAccountPool, OjAccounts } from '../dist/judges/index.js';
+import { match } from '../dist/match.js';
+import { makePlan, planSchema, verifyPlan } from '../dist/plan.js';
+import { PushDispatcher, PushTargets } from '../dist/push.js';
+import { dispatch, enqueue, getBatch, listBatches, MAX_BATCH_BYTES, requestBatchStop, requestRunCancel } from '../dist/queue.js';
+import { exportRun } from '../dist/results.js';
+import { runBench } from '../dist/run.js';
+
+const FAKE_IMAGE = 'sha256:' + 'a'.repeat(64);
+const getImage = async () => FAKE_IMAGE;
+const DEMO_PDF = resolve('examples/demo/problems.pdf');
+const DEMO_AGENT = resolve('examples/demo/codex.toml');
+
+async function makeTempDir(prefix) {
+  return mkdtemp(join(tmpdir(), prefix));
+}
+
+function baseContestDoc(judge, extra = {}) {
+  return {
+    schema_version: 2,
+    contest_id: 'multi-oj-demo',
+    data_version: 1,
+    title: 'Multi-OJ Demo',
+    source: { name: 'Fixture' },
+    materials: { entrypoint: { kind: 'pdf', path: DEMO_PDF } },
+    problems: [
+      { id: 'P1', max_points: 100 },
+      { id: 'P2', max_points: 100 },
+    ],
+    judge,
+    rules: { time_limit_ms: 600_000, max_submissions: 50, scoring_mode: 'ioi' },
+    ...extra,
+  };
+}
+
+test('multi-OJ config validates all 5 backends, problem_map uniqueness, and deterministic contestRevision', async t => {
+  const dir = await makeTempDir('cr-multi-oj-');
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const contestPath = join(dir, 'contest.json');
+
+  // Codeforces with pool/account_id (no handle required), gym flag
+  const cfPool = await resolveContest(
+    baseContestDoc({
+      kind: 'codeforces',
+      contest_id: 104000,
+      gym: true,
+      pool: 'cf-main',
+      languages: { cpp20: '89', cpp17: 54 },
+      problem_map: { P1: 'A', P2: 'B' },
+    }),
+    contestPath,
+  );
+  const cfOtherAccount = await resolveContest(
+    baseContestDoc({
+      kind: 'codeforces',
+      contest_id: 104000,
+      gym: true,
+      account_id: 'acc-alt',
+      handle: 'ignored-handle',
+      languages: { cpp17: 54, cpp20: '89' },
+      problem_map: { P1: 'A', P2: 'B' },
+    }),
+    contestPath,
+  );
+  assert.equal(cfPool.contestRevision, cfOtherAccount.contestRevision, 'account_id/pool/handle must not alter contestRevision');
+
+  // Regular vs Gym must change contestRevision
+  const cfRegular = await resolveContest(
+    baseContestDoc({
+      kind: 'codeforces',
+      contest_id: 104000,
+      gym: false,
+      pool: 'cf-main',
+      languages: { cpp20: '89', cpp17: 54 },
+      problem_map: { P1: 'A', P2: 'B' },
+    }),
+    contestPath,
+  );
+  assert.notEqual(cfPool.contestRevision, cfRegular.contestRevision);
+
+  // Codeforces with none of handle / account_id / pool must be rejected
+  await assert.rejects(
+    resolveContest(
+      baseContestDoc({
+        kind: 'codeforces',
+        contest_id: 1900,
+        languages: { cpp20: '89' },
+        problem_map: { P1: 'A', P2: 'B' },
+      }),
+      contestPath,
+    ),
+    /Invalid config/,
+  );
+
+  // QOJ backend
+  const qoj = await resolveContest(
+    baseContestDoc({
+      kind: 'qoj',
+      contest_id: 1420,
+      pool: 'qoj-pool',
+      languages: { cpp20: 'C++20' },
+      problem_map: { P1: 'qoj:7001', P2: 'qoj:7002' },
+    }),
+    contestPath,
+  );
+  assert.equal(qoj.contest.judge.kind, 'qoj');
+
+  // VJudge backend with custom settlement_ms and direct upstream refs
+  const vj = await resolveContest(
+    baseContestDoc({
+      kind: 'vjudge',
+      account_id: 'vj-1',
+      languages: { cpp20: 'C++20' },
+      problem_map: { P1: 'CodeForces-1234A', P2: 'AtCoder-abc300_a' },
+      settlement_ms: 420_000,
+    }),
+    contestPath,
+  );
+  assert.equal(vj.contest.judge.kind, 'vjudge');
+  assert.equal(vj.contest.judge.settlement_ms, 420_000);
+
+  // Hydro backend with domain and live_contest
+  const hydroA = await resolveContest(
+    baseContestDoc({
+      kind: 'hydro',
+      base_url: 'https://oj.example.org',
+      domain: 'oi',
+      contest_id: 'c100',
+      live_contest: false,
+      account_id: 'hydro-1',
+      languages: { cpp20: 'cc.cc20o2' },
+      problem_map: { P1: 'P1001', P2: 'P1002' },
+    }),
+    contestPath,
+  );
+  const hydroB = await resolveContest(
+    baseContestDoc({
+      kind: 'hydro',
+      base_url: 'https://oj.example.org',
+      domain: 'acm',
+      contest_id: 'c100',
+      account_id: 'hydro-1',
+      languages: { cpp20: 'cc.cc20o2' },
+      problem_map: { P1: 'P1001', P2: 'P1002' },
+    }),
+    contestPath,
+  );
+  assert.notEqual(hydroA.contestRevision, hydroB.contestRevision, 'Hydro domain must affect contestRevision');
+
+  // Duplicate problem_map target and empty languages must be rejected across remote backends
+  await assert.rejects(
+    resolveContest(
+      baseContestDoc({
+        kind: 'qoj',
+        pool: 'qoj',
+        languages: { cpp20: 'C++20' },
+        problem_map: { P1: '7001', P2: '7001' },
+      }),
+      contestPath,
+    ),
+    /duplicate qoj target/i,
+  );
+  await assert.rejects(
+    resolveContest(
+      baseContestDoc({
+        kind: 'hydro',
+        base_url: 'https://oj.example.org',
+        languages: {},
+      }),
+      contestPath,
+    ),
+    /requires explicit problems and language IDs/i,
+  );
+});
+
+test('match() supports unified ProgramJudge across QOJ/Hydro, accumulates IOI partial scores, and marks JudgeInfrastructureError as void', async t => {
+  const dir = await makeTempDir('cr-match-ioi-');
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const contestFile = join(dir, 'qoj-contest.json');
+  await writeFile(
+    contestFile,
+    JSON.stringify(
+      baseContestDoc({
+        kind: 'qoj',
+        contest_id: 99,
+        handle: 'tester',
+        languages: { cpp20: 'C++20' },
+        problem_map: { P1: '7001', P2: '7002' },
+      }),
+    ),
+  );
+  const inputs = await loadInputs(contestFile, DEMO_AGENT);
+
+  // 1. IOI partial score accumulation & clamping
+  let seq = 0;
+  const verdictQueue = new Map();
+  const unifiedJudge = {
+    kind: 'qoj',
+    settlementMs: 180_000,
+    async submit() { return `sub-${++seq}`; },
+    async verdicts(ids) {
+      const out = new Map();
+      for (const id of ids) {
+        if (verdictQueue.has(id)) out.set(id, verdictQueue.get(id));
+      }
+      return out;
+    },
+  };
+  let now = 0;
+  const events = [];
+  const m = match(inputs, e => events.push({ elapsed: now, ...e }), unifiedJudge, () => now, 5);
+  try {
+    now = 10;
+    const s1 = m.submit({ problem_id: 'P1', language: 'cpp20', source: '// 40 pts' });
+    assert.equal(s1.verdict, 'pending');
+    verdictQueue.set('sub-1', { remote_submission_id: 'sub-1', verdict: 'partial', raw_verdict: '40', score: 40, max_score: 100, final: true });
+    await m.settle(AbortSignal.timeout(1000));
+    assert.equal(m.score(), 40);
+
+    // Higher partial score (135 gets clamped to max_points=100)
+    now = 20;
+    m.submit({ problem_id: 'P1', language: 'cpp20', source: '// 135 -> 100' });
+    verdictQueue.set('sub-2', { remote_submission_id: 'sub-2', verdict: 'partial', raw_verdict: '135', score: 135, max_score: 100, final: true });
+    await m.settle(AbortSignal.timeout(1000));
+    assert.equal(m.score(), 100);
+
+    // Lower subsequent submission on P1 must NOT reduce bestScore
+    now = 30;
+    m.submit({ problem_id: 'P1', language: 'cpp20', source: '// 25 pts' });
+    verdictQueue.set('sub-3', { remote_submission_id: 'sub-3', verdict: 'partial', raw_verdict: '25', score: 25, max_score: 100, final: true });
+    await m.settle(AbortSignal.timeout(1000));
+    assert.equal(m.score(), 100);
+
+    // Accepted on P2 awards full max_points (100)
+    now = 40;
+    m.submit({ problem_id: 'P2', language: 'cpp20', source: '// AC' });
+    verdictQueue.set('sub-4', { remote_submission_id: 'sub-4', verdict: 'accepted', raw_verdict: 'Accepted', final: true });
+    await m.settle(AbortSignal.timeout(1000));
+    assert.equal(m.score(), 200);
+
+    const judged = events.filter(e => e.type === 'submission_judged');
+    assert.equal(judged.length, 4);
+    assert.equal(judged[0].score, 40);
+    assert.equal(judged[0].max_score, 100);
+    assert.equal(judged[1].score, 100);
+    assert.equal(judged[3].score, 100);
+    assert.equal(judged[3].verdict, 'accepted');
+  } finally {
+    await m.dispose();
+  }
+
+  // 2. JudgeInfrastructureError from verdicts() marks failure (judge_error), never wrong_answer
+  const failingJudge = {
+    kind: 'qoj',
+    settlementMs: 180_000,
+    async submit() { return 'sub-fail-1'; },
+    async verdicts() {
+      throw new JudgeInfrastructureError('auth_expired', 'Session expired', { platform: 'qoj', status: 403 });
+    },
+  };
+  const failEvents = [];
+  const mFail = match(inputs, e => failEvents.push(e), failingJudge, () => 0, 5);
+  try {
+    mFail.submit({ problem_id: 'P1', language: 'cpp20', source: '// test' });
+    await assert.rejects(mFail.settle(AbortSignal.timeout(1000)), /did not settle/i);
+    assert.equal(mFail.failed(), true);
+    assert.ok(failEvents.some(e => e.type === 'judge_error'));
+    assert.equal(failEvents.some(e => e.type === 'submission_judged' && e.verdict === 'wrong_answer'), false);
+  } finally {
+    await mFail.dispose();
+  }
+});
+
+test('makePlan repeats expansion, verifyPlan OJ readiness, parallel dispatch concurrency, OJ pool leasing, and push webhooks', async t => {
+  const dir = await makeTempDir('cr-parallel-');
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const runsRoot = join(dir, 'runs');
+  const store = new Connections(join(dir, 'connections'));
+  const ojAccounts = new OjAccounts(join(dir, 'oj-accounts'));
+  const pushTargets = new PushTargets(join(dir, 'push-targets'));
+
+  // Create provider + agent + QOJ contest using a 2-account pool
+  await store.create({
+    id: 'openai-main',
+    label: 'OpenAI',
+    protocol: 'responses',
+    base_url: 'https://api.openai.com/v1',
+    secret: 'sk-test-parallel-secret',
+  });
+  const agentFile = join(dir, 'agent.toml');
+  await writeFile(
+    agentFile,
+    [
+      'kind = "contestreplay.dev/agent"',
+      'schema_version = 1',
+      'id = "solver-a"',
+      'name = "Solver A"',
+      'model = "gpt-5.4"',
+      'provider = "openai-main"',
+      '',
+      '[harness]',
+      'kind = "codex"',
+      'version = "0.170.0"',
+      '',
+    ].join('\n'),
+  );
+  const contestFile = join(dir, 'qoj.json');
+  await writeFile(
+    contestFile,
+    JSON.stringify(
+      baseContestDoc({
+        kind: 'qoj',
+        contest_id: 500,
+        pool: 'qoj-workers',
+        languages: { cpp20: 'C++20' },
+        problem_map: { P1: '7001', P2: '7002' },
+      }),
+    ),
+  );
+
+  // Plan with repeats: 3 -> expands to 3 jobs with repeat_index 1..3 and repeat_total 3
+  const plan = await makePlan(
+    { schema_version: 2, cells: [{ agent: agentFile, contest: contestFile, repeats: 3 }] },
+    dir,
+    getImage,
+    store,
+  );
+  assert.equal(plan.jobs.length, 3);
+  assert.deepEqual(
+    plan.jobs.map(j => [j.repeat_index, j.repeat_total]),
+    [[1, 3], [2, 3], [3, 3]],
+  );
+
+  // verifyPlan(runtime=true) fails when no OJ account exists in pool
+  await assert.rejects(verifyPlan(plan, true, store, ojAccounts), /No ready qoj OJ accounts in pool "qoj-workers"/);
+
+  // Add 2 ready accounts to the pool -> verifyPlan passes!
+  await ojAccounts.create({
+    id: 'qoj-acc-1',
+    label: 'QOJ 1',
+    platform: 'qoj',
+    handle: 'bot1',
+    pool: 'qoj-workers',
+    transport: 'cookie',
+    secret: 'UOJSESSID=cookie-one-1234',
+  });
+  await ojAccounts.create({
+    id: 'qoj-acc-2',
+    label: 'QOJ 2',
+    platform: 'qoj',
+    handle: 'bot2',
+    pool: 'qoj-workers',
+    transport: 'cookie',
+    secret: 'UOJSESSID=cookie-two-5678',
+  });
+  await verifyPlan(plan, true, store, ojAccounts);
+
+  // Start local webhook receiver + also register one unreachable push target to verify non-blocking failure tolerance
+  const receivedHooks = [];
+  const hookServer = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      receivedHooks.push({
+        event: req.headers['x-cr-event'],
+        body: JSON.parse(Buffer.concat(chunks).toString('utf8')),
+      });
+      res.writeHead(200).end('ok');
+    });
+  });
+  await new Promise(resolvePromise => hookServer.listen(0, '127.0.0.1', resolvePromise));
+  t.after(() => new Promise(resolvePromise => hookServer.close(() => resolvePromise())));
+  const hookPort = hookServer.address().port;
+
+  await pushTargets.create({
+    id: 'hook-ok',
+    label: 'Local Hook',
+    url: `http://127.0.0.1:${hookPort}/webhook`,
+    events: ['run.completed', 'batch.completed'],
+    auth_mode: 'none',
+    timeout_ms: 2000,
+    max_retries: 0,
+  });
+  await pushTargets.create({
+    id: 'hook-dead',
+    label: 'Dead Hook',
+    url: 'http://127.0.0.1:1/unreachable',
+    events: ['run.completed', 'batch.completed'],
+    auth_mode: 'none',
+    timeout_ms: 500,
+    max_retries: 0,
+  });
+  const pushDispatcher = new PushDispatcher(pushTargets, { sleep: async () => {} });
+
+  // Dispatch with concurrency: 3 across 3 jobs while leasing from the 2-account OJ pool
+  const batch = await enqueue(runsRoot, plan, { concurrency: 3 });
+  assert.equal(batch.concurrency, 3);
+
+  let inFlight = 0;
+  let peakInFlight = 0;
+  let peakLeases = 0;
+  const activeLeasedIds = new Set();
+  const usedAccounts = new Set();
+
+  const finished = await dispatch(runsRoot, batch.id, new AbortController().signal, {
+    store,
+    ojAccounts,
+    pushDispatcher,
+    concurrency: 3,
+    preflight: async p => verifyPlan(p, true, store, ojAccounts),
+    execute: async (_plan, job, opts) => {
+      inFlight++;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      const lease = await opts.ojPool.acquire('qoj', { pool: 'qoj-workers' }, opts.signal);
+      try {
+        assert.equal(activeLeasedIds.has(lease.account.id), false, 'Account lease must be exclusive');
+        activeLeasedIds.add(lease.account.id);
+        usedAccounts.add(lease.account.id);
+        peakLeases = Math.max(peakLeases, activeLeasedIds.size);
+        await new Promise(r => setTimeout(r, 80));
+        // Write minimal run.json + events.jsonl so run.completed push includes progress
+        const runDir = join(opts.out, opts.runId);
+        await mkdir(runDir, { recursive: true, mode: 0o700 });
+        await writeFile(
+          join(runDir, 'run.json'),
+          JSON.stringify({
+            schema_version: 1,
+            run_id: opts.runId,
+            contest_id: job.contest_id,
+            data_version: job.data_version,
+            agent_id: job.agent_id,
+            problems: [{ id: 'P1', max_points: 100 }, { id: 'P2', max_points: 100 }],
+            rules: { time_limit_ms: 600_000, max_submissions: 50 },
+          }),
+        );
+        await writeFile(
+          join(runDir, 'events.jsonl'),
+          [
+            JSON.stringify({ schema_version: 1, seq: 1, elapsed_ms: 0, type: 'run_started', started_at: new Date().toISOString() }),
+            JSON.stringify({ schema_version: 1, seq: 2, elapsed_ms: 1000, type: 'run_ended', status: 'completed', reason: 'finish', score: 100, max_score: 200 }),
+          ].join('\n') + '\n',
+        );
+        return { runId: opts.runId, directory: runDir, status: 'completed', reason: 'finish' };
+      } finally {
+        activeLeasedIds.delete(lease.account.id);
+        lease.release();
+        inFlight--;
+      }
+    },
+  });
+
+  assert.equal(peakInFlight, 3, 'All 3 workers should run concurrently');
+  assert.equal(peakLeases, 2, 'Pool of 2 accounts should lease at most 2 simultaneously');
+  assert.equal(usedAccounts.size, 2, 'Both accounts in the pool should be utilized');
+  assert.ok(finished.jobs.every(j => j.status === 'completed'));
+
+  // Persisted batch.json must be intact and match
+  const reloaded = await getBatch(runsRoot, batch.id);
+  assert.equal(reloaded.concurrency, 3);
+  assert.equal(reloaded.jobs.filter(j => j.status === 'completed').length, 3);
+
+  // Webhooks received 3 run.completed + 1 batch.completed (dead target did not break dispatch!)
+  assert.equal(receivedHooks.filter(h => h.event === 'run.completed').length, 3);
+  assert.equal(receivedHooks.filter(h => h.event === 'batch.completed').length, 1);
+  assert.equal(receivedHooks.find(h => h.event === 'batch.completed').body.completed, 3);
+});
+
+test('parallel dispatch handles per-run cancellation, batch stop, and sandbox_cleanup_failed cleanly', async t => {
+  const dir = await makeTempDir('cr-parallel-cancel-');
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const runsRoot = join(dir, 'runs');
+  const contestFile = resolve('examples/demo/contest.json');
+  const agentFile = resolve('examples/demo/codex.toml');
+
+  const plan = await makePlan(
+    { schema_version: 2, cells: [{ agent: agentFile, contest: contestFile, repeats: 4 }] },
+    dir,
+    getImage,
+  );
+  const batch = await enqueue(runsRoot, plan, { concurrency: 2 });
+
+  const startedRuns = [];
+  let cancelTriggered = false;
+  const finished = await dispatch(runsRoot, batch.id, new AbortController().signal, {
+    concurrency: 2,
+    preflight: async () => {},
+    onJobStart: runId => {
+      startedRuns.push(runId);
+      if (startedRuns.length === 1 && !cancelTriggered) {
+        cancelTriggered = true;
+        void requestRunCancel(runsRoot, runId);
+      }
+    },
+    execute: async (_plan, _job, opts) => {
+      const myIdx = startedRuns.indexOf(opts.runId);
+      if (myIdx === 0) {
+        await new Promise(resolvePromise => {
+          if (opts.signal.aborted) return resolvePromise();
+          opts.signal.addEventListener('abort', () => resolvePromise(), { once: true });
+        });
+        return { runId: opts.runId, directory: join(opts.out, opts.runId), status: 'void', reason: 'interrupted' };
+      }
+      if (myIdx === 1) {
+        await new Promise(r => setTimeout(r, 50));
+        await requestBatchStop(runsRoot, batch.id);
+        return { runId: opts.runId, directory: join(opts.out, opts.runId), status: 'completed', reason: 'finish' };
+      }
+      return { runId: opts.runId, directory: join(opts.out, opts.runId), status: 'completed', reason: 'finish' };
+    },
+  });
+
+  assert.equal(finished.jobs[0].status, 'cancelled');
+  assert.equal(finished.jobs[1].status, 'completed');
+  assert.equal(finished.jobs[2].status, 'cancelled');
+  assert.equal(finished.jobs[3].status, 'cancelled');
+
+  // Verify sandbox_cleanup_failed halts new job launches and keeps failed job running for recovery
+  const batch2 = await enqueue(runsRoot, plan, { concurrency: 2 });
+  let launchedCount = 0;
+  await assert.rejects(
+    dispatch(runsRoot, batch2.id, new AbortController().signal, {
+      concurrency: 2,
+      preflight: async () => {},
+      execute: async (_plan, _job, opts) => {
+        const n = ++launchedCount;
+        if (n === 1) {
+          return { runId: opts.runId, directory: join(opts.out, opts.runId), status: 'void', reason: 'sandbox_cleanup_failed' };
+        }
+        await new Promise(r => setTimeout(r, 60));
+        return { runId: opts.runId, directory: join(opts.out, opts.runId), status: 'completed', reason: 'finish' };
+      },
+    }),
+    /Could not confirm cleanup/,
+  );
+  assert.equal(launchedCount, 2, 'Should not dispatch queued jobs after sandbox_cleanup_failed');
+  const persisted2 = await getBatch(runsRoot, batch2.id);
+  assert.equal(persisted2.jobs[0].status, 'running');
+  assert.equal(persisted2.jobs[0].reason, 'sandbox_cleanup_failed');
+  assert.equal(persisted2.jobs[1].status, 'completed');
+  assert.equal(persisted2.jobs[2].status, 'queued');
+});
+
+test('review regressions: Hydro/QOJ revision canonicalization, partial scaling, legacy FAILED->void, OJ policy, settlement_ms, and repeat validation', async t => {
+  const dir = await makeTempDir('cr-review-reg-');
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const contestPath = join(dir, 'contest.json');
+
+  // 1. Hydro base_url & live_contest affect contestRevision; trailing slash canonicalizes identically
+  const hydroA = await resolveContest(
+    baseContestDoc({
+      kind: 'hydro',
+      base_url: 'https://hydro-a.example.com',
+      domain: 'system',
+      contest_id: 'round-1',
+      live_contest: false,
+      languages: { cpp: 'cc.cc20o2' },
+    }),
+    contestPath,
+  );
+  const hydroATrailing = await resolveContest(
+    baseContestDoc({
+      kind: 'hydro',
+      base_url: 'https://hydro-a.example.com/',
+      contest_id: 'round-1',
+      languages: { cpp: 'cc.cc20o2' },
+    }),
+    contestPath,
+  );
+  const hydroB = await resolveContest(
+    baseContestDoc({
+      kind: 'hydro',
+      base_url: 'https://hydro-b.example.com',
+      contest_id: 'round-1',
+      languages: { cpp: 'cc.cc20o2' },
+    }),
+    contestPath,
+  );
+  const hydroLive = await resolveContest(
+    baseContestDoc({
+      kind: 'hydro',
+      base_url: 'https://hydro-a.example.com',
+      contest_id: 'round-1',
+      live_contest: true,
+      languages: { cpp: 'cc.cc20o2' },
+    }),
+    contestPath,
+  );
+  assert.equal(hydroA.contestRevision, hydroATrailing.contestRevision, 'Trailing slash and default system domain canonicalize identically');
+  assert.notEqual(hydroA.contestRevision, hydroB.contestRevision, 'Different Hydro base_url must produce distinct contestRevision');
+  assert.notEqual(hydroA.contestRevision, hydroLive.contestRevision, 'Hydro live_contest flag must affect contestRevision');
+
+  // 2. QOJ qoj:7001 vs 7001 canonicalize identically and detect duplicates
+  const qojPlain = await resolveContest(
+    baseContestDoc({
+      kind: 'qoj',
+      contest_id: 42,
+      languages: { cpp20: 'C++20' },
+      problem_map: { P1: '7001', P2: '7002' },
+    }),
+    contestPath,
+  );
+  const qojPrefixed = await resolveContest(
+    baseContestDoc({
+      kind: 'qoj',
+      contest_id: 'qoj:42',
+      languages: { cpp20: 'C++20' },
+      problem_map: { P1: 'qoj:7001', P2: 'qoj:7002' },
+    }),
+    contestPath,
+  );
+  assert.equal(qojPlain.contestRevision, qojPrefixed.contestRevision, 'qoj:7001 and 7001 must canonicalize to the same contestRevision');
+  await assert.rejects(
+    resolveContest(
+      baseContestDoc({
+        kind: 'qoj',
+        contest_id: 42,
+        languages: { cpp20: 'C++20' },
+        problem_map: { P1: '7001', P2: 'qoj:7001' },
+      }),
+      contestPath,
+    ),
+    /Invalid or duplicate qoj target/,
+  );
+
+  // 3. Explicit settlement_ms is validated & preserved in contest config
+  const withSettlement = await resolveContest(
+    baseContestDoc({
+      kind: 'qoj',
+      contest_id: 42,
+      settlement_ms: 12_345,
+      languages: { cpp20: 'C++20' },
+    }),
+    contestPath,
+  );
+  assert.equal(withSettlement.contest.judge.settlement_ms, 12_345);
+
+  // 4. match() partial score scaling (jv.max_score !== maxPts) + problem_id/max_points on submission_judged
+  const scaledContestFile = join(dir, 'scaled-contest.json');
+  await writeFile(
+    scaledContestFile,
+    JSON.stringify(
+      baseContestDoc(
+        { kind: 'qoj', contest_id: 42, languages: { cpp20: 'C++20' }, problem_map: { P1: '7001' } },
+        { problems: [{ id: 'P1', max_points: 50 }] },
+      ),
+    ),
+  );
+  const scaledInputs = await loadInputs(scaledContestFile, DEMO_AGENT);
+  const scaledEvents = [];
+  const scaledJudge = {
+    kind: 'qoj',
+    settlementMs: 1000,
+    async submit() { return 'sub-scale-1'; },
+    async verdicts(ids) {
+      return new Map(ids.map(id => [id, {
+        remote_submission_id: id,
+        verdict: 'partial',
+        raw_verdict: 'Partial 30/100',
+        score: 30,
+        max_score: 100,
+        final: true,
+      }]));
+    },
+  };
+  const mScaled = match(scaledInputs, e => scaledEvents.push(e), scaledJudge, undefined, 10);
+  await mScaled.submit({ problem_id: 'P1', language: 'cpp20', source: 'int main(){}' });
+  await mScaled.settle(AbortSignal.timeout(2000));
+  assert.equal(mScaled.score(), 15, '30/100 scaled to max_points=50 must equal 15');
+  const judgedEv = scaledEvents.find(e => e.type === 'submission_judged');
+  assert.ok(judgedEv);
+  assert.equal(judgedEv.problem_id, 'P1');
+  assert.equal(judgedEv.max_points, 50);
+  assert.equal(judgedEv.max_score, 50);
+  assert.equal(judgedEv.remote_max_score, 100);
+
+  // 5. Legacy string-returning ProgramJudge returning 'FAILED' marks match failed (void on settle)
+  const legacyEvents = [];
+  const legacyFailJudge = {
+    async submit() { return 'legacy-sub-1'; },
+    async verdicts(ids) {
+      return new Map(ids.map(id => [id, 'FAILED']));
+    },
+  };
+  const mLegacy = match(scaledInputs, e => legacyEvents.push(e), legacyFailJudge, undefined, 10);
+  await mLegacy.submit({ problem_id: 'P1', language: 'cpp20', source: 'int main(){}' });
+  await assert.rejects(mLegacy.settle(AbortSignal.timeout(2000)), /Judge did not settle/);
+  assert.equal(mLegacy.failed(), true);
+  assert.ok(legacyEvents.some(e => e.type === 'judge_error'));
+
+  // 6. Unified preflight/execution account selection & handle-required env fallback
+  const accounts = new OjAccounts(join(dir, 'oj-policy'));
+  const prevCfCookie = process.env.CR_CODEFORCES_COOKIE;
+  const prevCfSub = process.env.CR_CODEFORCES_SUBMITTER;
+  delete process.env.CR_CODEFORCES_SUBMITTER;
+  process.env.CR_CODEFORCES_COOKIE = 'JSESSIONID=env-cookie-test-value';
+  t.after(() => {
+    if (prevCfCookie === undefined) delete process.env.CR_CODEFORCES_COOKIE;
+    else process.env.CR_CODEFORCES_COOKIE = prevCfCookie;
+    if (prevCfSub === undefined) delete process.env.CR_CODEFORCES_SUBMITTER;
+    else process.env.CR_CODEFORCES_SUBMITTER = prevCfSub;
+  });
+
+  // Without handle, env cookie MUST NOT be selected
+  await assert.rejects(
+    resolveOjAccountPolicy({ kind: 'codeforces', contest_id: 1900, gym: false, languages: { cpp20: '89' } }, accounts),
+    /No ready codeforces OJ account/i,
+  );
+  // With explicit handle, env cookie fallback resolves cleanly
+  const envPolicy = await resolveOjAccountPolicy(
+    { kind: 'codeforces', contest_id: 1900, gym: false, handle: 'cf_env_user', languages: { cpp20: '89' } },
+    accounts,
+  );
+  assert.equal(envPolicy.mode, 'env_cookie');
+
+  // Stored ready account takes precedence when matching handle/origin
+  await accounts.create({
+    id: 'cf-stored-1',
+    label: 'CF Stored',
+    platform: 'codeforces',
+    handle: 'cf_env_user',
+    pool: 'default',
+    transport: 'cookie',
+    secret: 'JSESSIONID=stored-cookie-value',
+  });
+  const storedPolicy = await resolveOjAccountPolicy(
+    { kind: 'codeforces', contest_id: 1900, gym: false, handle: 'cf_env_user', languages: { cpp20: '89' } },
+    accounts,
+  );
+  assert.equal(storedPolicy.mode, 'account_pool');
+  assert.deepEqual(storedPolicy.matchedAccounts.map(a => a.id), ['cf-stored-1']);
+
+  // Conflicting account_id + pool rejected
+  await assert.rejects(
+    resolveOjAccountPolicy(
+      { kind: 'codeforces', contest_id: 1900, gym: false, account_id: 'cf-stored-1', pool: 'default', languages: { cpp20: '89' } },
+      accounts,
+    ),
+    /cannot specify both account_id and pool/,
+  );
+
+  // 7. Contradictory / incomplete repeat_index & repeat_total rejected by planSchema
+  const basePlan = await makePlan(
+    { schema_version: 2, cells: [{ agent: DEMO_AGENT, contest: resolve('examples/demo/contest.json'), repeats: 2 }] },
+    dir,
+    getImage,
+  );
+  assert.equal(planSchema.safeParse(basePlan).success, true);
+
+  // Missing repeat_total when repeat_index is set
+  const badMissingTotal = structuredClone(basePlan);
+  delete badMissingTotal.jobs[0].repeat_total;
+  assert.equal(planSchema.safeParse(badMissingTotal).success, false, 'repeat_index without repeat_total must be rejected');
+
+  // repeat_index > repeat_total
+  const badGtTotal = structuredClone(basePlan);
+  badGtTotal.jobs[1].repeat_index = 3;
+  assert.equal(planSchema.safeParse(badGtTotal).success, false, 'repeat_index > repeat_total must be rejected');
+
+  // Incomplete repeat group (repeat_total: 2, only 1 job)
+  const badIncomplete = { ...basePlan, jobs: [basePlan.jobs[0]] };
+  assert.equal(planSchema.safeParse(badIncomplete).success, false, 'incomplete repeat group must be rejected');
+
+  // Duplicate repeat_index in group
+  const badDuplicateIdx = structuredClone(basePlan);
+  badDuplicateIdx.jobs[1].repeat_index = 1;
+  assert.equal(planSchema.safeParse(badDuplicateIdx).success, false, 'duplicate repeat_index must be rejected');
+});
+
+test('parallel dispatch regressions: sibling drain before flock release, default shared OjAccountPool, shutdown omits batch.completed, and >1000 jobs omits payload jobs array', async t => {
+  const dir = await makeTempDir('cr-dispatch-reg-');
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const runsRoot = join(dir, 'runs');
+  const contestFile = resolve('examples/demo/contest.json');
+
+  // 1. Default dispatch creates ONE shared OjAccountPool instance across parallel workers
+  const plan2 = await makePlan(
+    { schema_version: 2, cells: [{ agent: DEMO_AGENT, contest: contestFile, repeats: 2 }] },
+    dir,
+    getImage,
+  );
+  const batchPool = await enqueue(runsRoot, plan2, { concurrency: 2 });
+  const observedPools = new Set();
+  await dispatch(runsRoot, batchPool.id, new AbortController().signal, {
+    concurrency: 2,
+    preflight: async () => {},
+    execute: async (_plan, _job, opts) => {
+      assert.ok(opts.ojPool instanceof OjAccountPool, 'Default dispatch must supply an OjAccountPool');
+      observedPools.add(opts.ojPool);
+      return { runId: opts.runId, directory: join(opts.out, opts.runId), status: 'completed', reason: 'finish' };
+    },
+  });
+  assert.equal(observedPools.size, 1, 'Parallel workers must share a single OjAccountPool instance');
+
+  // 2. Sibling worker error drains active workers BEFORE releasing flock
+  const batchDrain = await enqueue(runsRoot, plan2, { concurrency: 2 });
+  let siblingExited = false;
+  let workerIdx = 0;
+  await assert.rejects(
+    dispatch(runsRoot, batchDrain.id, new AbortController().signal, {
+      concurrency: 2,
+      preflight: async () => {},
+      onJobStart: () => {
+        const my = ++workerIdx;
+        if (my === 2) throw new Error('Simulated fatal worker error');
+      },
+      execute: async (_plan, _job, opts) => {
+        await new Promise(r => setTimeout(r, 120));
+        siblingExited = true;
+        return { runId: opts.runId, directory: join(opts.out, opts.runId), status: 'completed', reason: 'finish' };
+      },
+    }),
+    /Simulated fatal worker error/,
+  );
+  assert.equal(siblingExited, true, 'Sibling active worker must finish draining BEFORE dispatch() rejects and releases flock');
+
+  // 3. Shutdown leaving queued jobs must NOT emit batch.completed webhook
+  const receivedHooks = [];
+  const hookServer = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      receivedHooks.push({
+        event: req.headers['x-cr-event'],
+        body: JSON.parse(Buffer.concat(chunks).toString('utf8')),
+      });
+      res.writeHead(200).end('ok');
+    });
+  });
+  await new Promise(r => hookServer.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise(r => hookServer.close(() => r())));
+  const hookPort = hookServer.address().port;
+
+  const pushTargets = new PushTargets(join(dir, 'push-targets'));
+  await pushTargets.create({
+    id: 'reg-hook',
+    label: 'Regression Hook',
+    url: `http://127.0.0.1:${hookPort}/hook`,
+    events: ['run.completed', 'batch.completed'],
+    auth_mode: 'none',
+  });
+  const pushDispatcher = new PushDispatcher(pushTargets, { sleep: async () => {} });
+
+  const plan3 = await makePlan(
+    { schema_version: 2, cells: [{ agent: DEMO_AGENT, contest: contestFile, repeats: 3 }] },
+    dir,
+    getImage,
+  );
+  const batchAbort = await enqueue(runsRoot, plan3, { concurrency: 1 });
+  const ac = new AbortController();
+  await dispatch(runsRoot, batchAbort.id, ac.signal, {
+    concurrency: 1,
+    pushDispatcher,
+    preflight: async () => {},
+    execute: async (_plan, _job, opts) => {
+      ac.abort();
+      return { runId: opts.runId, directory: join(opts.out, opts.runId), status: 'void', reason: 'interrupted' };
+    },
+  });
+  const afterAbort = await getBatch(runsRoot, batchAbort.id);
+  assert.ok(afterAbort.jobs.some(j => j.status === 'queued'), 'Aborted batch should retain queued jobs');
+  assert.equal(
+    receivedHooks.filter(h => h.event === 'batch.completed').length,
+    0,
+    'batch.completed must NOT be emitted when shutdown leaves queued jobs',
+  );
+
+  // 4. Oversized batch (>1000 jobs) emits batch.completed WITHOUT oversized jobs array
+  const singlePlan = await makePlan(
+    { schema_version: 1, agents: [DEMO_AGENT], contests: [contestFile] },
+    dir,
+    getImage,
+  );
+  const templateJob = singlePlan.jobs[0];
+  const hugeBatchId = randomUUID();
+  const hugePlanJobs = [];
+  const hugeJobStates = [];
+  for (let i = 0; i < 1001; i++) {
+    hugePlanJobs.push({
+      ...templateJob,
+      contest_path: join(dir, `synthetic-contest-${i}.json`),
+      contest_id: `synthetic-${i}`,
+    });
+    hugeJobStates.push(i < 1000 ? { status: 'completed', run_id: randomUUID(), reason: 'finish' } : { status: 'queued' });
+  }
+  await mkdir(join(runsRoot, '.batches'), { recursive: true, mode: 0o700 });
+  await writeFile(
+    join(runsRoot, '.batches', `${hugeBatchId}.json`),
+    JSON.stringify({
+      schema_version: 1,
+      id: hugeBatchId,
+      created_at: new Date().toISOString(),
+      concurrency: 1,
+      plan: { schema_version: 2, protocol_sha256: singlePlan.protocol_sha256, jobs: hugePlanJobs },
+      jobs: hugeJobStates,
+    }),
+  );
+  receivedHooks.length = 0;
+  await dispatch(runsRoot, hugeBatchId, new AbortController().signal, {
+    concurrency: 1,
+    pushDispatcher,
+    preflight: async () => {},
+    execute: async (_plan, _job, opts) => ({
+      runId: opts.runId,
+      directory: join(opts.out, opts.runId),
+      status: 'completed',
+      reason: 'finish',
+    }),
+  });
+  const hugeHook = receivedHooks.find(h => h.event === 'batch.completed');
+  assert.ok(hugeHook, 'Completed >1000-job batch should emit batch.completed');
+  assert.equal(hugeHook.body.total, 1001);
+  assert.equal(hugeHook.body.completed, 1001);
+  assert.equal(hugeHook.body.jobs, undefined, 'Oversized >1000-job batch.completed must omit jobs array');
+});
+
+test('final polish regressions: 5000-job batch persistence & oversized rejection, aborted sibling interrupted status, CF language canonicalization & pre-network check, account_id+handle & drift check, legacy Accepted normalization', async t => {
+  const dir = await makeTempDir('cr-final-polish-');
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const runsRoot = join(dir, 'runs');
+  const contestFile = join(dir, 'local-contest.json');
+  const answersFile = join(dir, 'local.judge.json');
+  await writeFile(answersFile, JSON.stringify({
+    schema_version: 1,
+    problems: [{ id: '1', max_points: 10, accepted_answers: ['42'] }],
+  }));
+  await writeFile(contestFile, JSON.stringify({
+    schema_version: 2,
+    contest_id: 'polish-local',
+    data_version: 1,
+    title: 'Polish Local',
+    source: { name: 'Fixture' },
+    materials: { entrypoint: { kind: 'pdf', path: DEMO_PDF } },
+    problems: [{ id: '1', max_points: 10 }],
+    judge: { kind: 'local', answers: { path: answersFile } },
+  }));
+
+  // 1. 5,000-job batch serialization stays under MAX_BATCH_BYTES and readable by listBatches
+  const singlePlan = await makePlan(
+    { schema_version: 1, agents: [DEMO_AGENT], contests: [contestFile] },
+    dir,
+    getImage,
+  );
+  const templateJob = singlePlan.jobs[0];
+  const jobs5000 = Array.from({ length: 5000 }, (_, i) => ({
+    ...templateJob,
+    contest_path: join(dir, `batch-contest-${i}.json`),
+    contest_id: `batch-contest-${i}`,
+  }));
+  const plan5000 = planSchema.parse({
+    schema_version: 2,
+    protocol_sha256: singlePlan.protocol_sha256,
+    jobs: jobs5000,
+  });
+  const batch5000 = await enqueue(runsRoot, plan5000, { concurrency: 4 });
+  const batchFileBytes = (await readFile(join(runsRoot, '.batches', `${batch5000.id}.json`))).length;
+  assert.ok(batchFileBytes < MAX_BATCH_BYTES, '5000-job batch must stay under MAX_BATCH_BYTES');
+  const listed = await listBatches(runsRoot);
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].jobs.length, 5000);
+
+  // Oversized batch rejected BEFORE writing to .batches/
+  const hugeId = 'x'.repeat(14_000);
+  const oversizedPlan = planSchema.parse({
+    schema_version: 2,
+    protocol_sha256: singlePlan.protocol_sha256,
+    jobs: Array.from({ length: 5000 }, (_, i) => ({
+      ...templateJob,
+      agent_id: hugeId,
+      contest_path: join(dir, `huge-contest-${i}.json`),
+      contest_id: `huge-${i}`,
+    })),
+  });
+  await assert.rejects(enqueue(runsRoot, oversizedPlan), /maximum persisted size/i);
+  assert.equal((await listBatches(runsRoot)).length, 1, 'Rejected oversized batch must not leave a file in .batches/');
+
+  // 2. Fatal sibling worker abort persists 'interrupted' (NOT 'void')
+  const plan2 = await makePlan(
+    { schema_version: 2, cells: [{ agent: DEMO_AGENT, contest: contestFile, repeats: 2 }] },
+    dir,
+    getImage,
+  );
+  const siblingRuns = join(dir, 'sibling-runs');
+  const batchSibling = await enqueue(siblingRuns, plan2, { concurrency: 2 });
+  let startCount = 0;
+  await assert.rejects(
+    dispatch(siblingRuns, batchSibling.id, new AbortController().signal, {
+      concurrency: 2,
+      preflight: async () => {},
+      onJobStart: () => {
+        if (++startCount === 2) throw new Error('Fatal sibling crash');
+      },
+      execute: async (_plan, _job, opts) => {
+        await new Promise(resolveWait => {
+          if (opts.signal.aborted) return resolveWait();
+          opts.signal.addEventListener('abort', () => resolveWait(), { once: true });
+        });
+        return { runId: opts.runId, directory: join(opts.out, opts.runId), status: 'void', reason: 'interrupted' };
+      },
+    }),
+    /Fatal sibling crash/,
+  );
+  const afterSiblingCrash = await getBatch(siblingRuns, batchSibling.id);
+  const abortedSibling = afterSiblingCrash.jobs[0];
+  assert.equal(abortedSibling.status, 'interrupted', 'Aborted sibling worker must persist interrupted, not void');
+  assert.equal(abortedSibling.reason, 'executor_stopped');
+
+  // 3. Codeforces language canonicalization ("089" == "89" == 89) & non-numeric rejection (config + adapter pre-network)
+  const cfPath = join(dir, 'cf-lang.json');
+  const cfNum = await resolveContest(
+    baseContestDoc({ kind: 'codeforces', contest_id: 1900, handle: 'cf_bot', languages: { cpp20: 89 } }),
+    cfPath,
+  );
+  const cfStr = await resolveContest(
+    baseContestDoc({ kind: 'codeforces', contest_id: 1900, handle: 'cf_bot', languages: { cpp20: '89' } }),
+    cfPath,
+  );
+  const cfLeadingZero = await resolveContest(
+    baseContestDoc({ kind: 'codeforces', contest_id: 1900, handle: 'cf_bot', languages: { cpp20: '089' } }),
+    cfPath,
+  );
+  assert.equal(cfNum.contestRevision, cfStr.contestRevision);
+  assert.equal(cfNum.contestRevision, cfLeadingZero.contestRevision);
+  assert.equal(cfLeadingZero.contest.judge.languages.cpp20, '89');
+
+  await assert.rejects(
+    resolveContest(
+      baseContestDoc({ kind: 'codeforces', contest_id: 1900, handle: 'cf_bot', languages: { cpp20: 'C++20' } }),
+      cfPath,
+    ),
+    /Invalid config/,
+  );
+  await assert.rejects(
+    resolveContest(
+      baseContestDoc({ kind: 'codeforces', contest_id: 1900, handle: 'cf_bot', languages: { cpp20: '0' } }),
+      cfPath,
+    ),
+    /Invalid config/,
+  );
+
+  let networkCalled = false;
+  const cfAdapter = createCodeforcesJudge(
+    { contest_id: 1900, handle: 'cf_bot', languages: { cpp20: 'C++20' } },
+    {
+      cookie: 'JSESSIONID=test-cookie',
+      fetchImpl: async () => {
+        networkCalled = true;
+        throw new Error('should not be called');
+      },
+    },
+  );
+  await assert.rejects(
+    cfAdapter.submit('A', 'cpp20', 'int main(){}', AbortSignal.timeout(2000)),
+    /Invalid Codeforces programTypeId/i,
+  );
+  assert.equal(networkCalled, false, 'Invalid programTypeId must fail BEFORE network I/O');
+
+  // 4. account_id + mismatched handle rejected; matching handle accepted; post-acquire drift rejected & lease released
+  const ojStore = new OjAccounts(join(dir, 'oj-accounts'));
+  await ojStore.create({
+    id: 'cf-acc-1',
+    label: 'CF One',
+    platform: 'codeforces',
+    handle: 'Real_Handle',
+    pool: 'default',
+    transport: 'cookie',
+    secret: 'JSESSIONID=secret-val-12345',
+  });
+  await assert.rejects(
+    resolveOjAccountPolicy(
+      { kind: 'codeforces', contest_id: 1900, account_id: 'cf-acc-1', handle: 'different_handle', languages: { cpp20: '89' } },
+      ojStore,
+    ),
+    /handle.*does not match/i,
+  );
+  const okPolicy = await resolveOjAccountPolicy(
+    { kind: 'codeforces', contest_id: 1900, account_id: 'cf-acc-1', handle: 'real_handle', languages: { cpp20: '89' } },
+    ojStore,
+  );
+  assert.equal(okPolicy.matchedAccounts[0].id, 'cf-acc-1');
+
+  // Post-acquire drift in runBench: mock pool returns an account whose handle drifted while waiting
+  const cfContestFile = join(dir, 'cf-drift-contest.json');
+  await writeFile(
+    cfContestFile,
+    JSON.stringify(
+      baseContestDoc({
+        kind: 'codeforces',
+        contest_id: 1900,
+        account_id: 'cf-acc-1',
+        handle: 'Real_Handle',
+        languages: { cpp20: '89' },
+      }),
+    ),
+  );
+  const driftInputs = await loadInputs(cfContestFile, DEMO_AGENT);
+  let leaseReleased = false;
+  const driftedPool = {
+    async acquire() {
+      return {
+        account: {
+          id: 'cf-acc-1',
+          label: 'CF One',
+          platform: 'codeforces',
+          handle: 'Drifted_Handle',
+          pool: 'default',
+          transport: 'cookie',
+          ready: true,
+        },
+        release() {
+          leaseReleased = true;
+        },
+      };
+    },
+  };
+  const driftResult = await runBench(driftInputs, {
+    out: join(dir, 'drift-runs'),
+    image: FAKE_IMAGE,
+    key: 'test-model-key',
+    signal: new AbortController().signal,
+    ojAccounts: ojStore,
+    ojPool: driftedPool,
+  });
+  assert.equal(leaseReleased, true, 'Drifted OJ lease must be released immediately');
+  assert.equal(driftResult.status, 'void');
+  assert.equal(driftResult.reason, 'oj_account_drifted');
+
+  // 5. Legacy ProgramJudge emitting 'Accepted' normalizes verdict -> 'accepted' + raw_verdict: 'Accepted' and counts as solved in exportRun
+  const legacyContestFile = join(dir, 'legacy-verdict-contest.json');
+  await writeFile(
+    legacyContestFile,
+    JSON.stringify(
+      baseContestDoc(
+        { kind: 'qoj', contest_id: 42, languages: { cpp20: 'C++20' }, problem_map: { P1: '7001' } },
+        { problems: [{ id: 'P1', max_points: 50 }] },
+      ),
+    ),
+  );
+  const legacyInputs = await loadInputs(legacyContestFile, DEMO_AGENT);
+  const legacyEvents = [];
+  const legacyAcJudge = {
+    async submit() { return 'legacy-ac-1'; },
+    async verdicts(ids) { return new Map(ids.map(id => [id, 'Accepted'])); },
+  };
+  const mAc = match(legacyInputs, e => legacyEvents.push(e), legacyAcJudge, undefined, 10);
+  try {
+    mAc.submit({ problem_id: 'P1', language: 'cpp20', source: 'int main(){}' });
+    await mAc.settle(AbortSignal.timeout(2000));
+    assert.equal(mAc.score(), 50);
+    assert.equal(mAc.status('s1').verdict, 'accepted');
+    const judged = legacyEvents.find(e => e.type === 'submission_judged');
+    assert.ok(judged);
+    assert.equal(judged.verdict, 'accepted');
+    assert.equal(judged.raw_verdict, 'Accepted');
+
+    // Verify exportRun counts this normalized event as solved
+    const exportRoot = join(dir, 'export-legacy');
+    const expRunId = randomUUID();
+    const expDir = join(exportRoot, expRunId);
+    await mkdir(expDir, { recursive: true });
+    await writeFile(join(expDir, 'run.json'), JSON.stringify({
+      schema_version: 1,
+      run_id: expRunId,
+      contest_id: legacyInputs.contest.contest_id,
+      data_version: 1,
+      contest_revision: legacyInputs.contestRevision,
+      input_sha256: { contest: legacyInputs.contestDigest },
+      problems: legacyInputs.contest.problems,
+      protocol_id: 'codex-pdf-pages-mcp',
+      protocol_version: 2,
+      protocol_sha256: 'd'.repeat(64),
+      agent_id: legacyInputs.agent.agent_id,
+      agent_revision: 'e'.repeat(64),
+      harness: legacyInputs.agent.harness,
+      model: { model: legacyInputs.profile.model },
+    }));
+    const fullEvents = [
+      { schema_version: 1, seq: 1, elapsed_ms: 0, type: 'run_started', started_at: new Date().toISOString() },
+      ...legacyEvents.map((ev, idx) => ({ schema_version: 1, seq: idx + 2, elapsed_ms: (idx + 1) * 100, ...ev })),
+      { schema_version: 1, seq: legacyEvents.length + 2, elapsed_ms: 1000, type: 'run_ended', status: 'completed', reason: 'finish', score: 50, max_score: 50 },
+    ];
+    await writeFile(join(expDir, 'events.jsonl'), fullEvents.map(e => JSON.stringify(e)).join('\n') + '\n');
+    const exported = await exportRun(exportRoot, expRunId);
+    assert.equal(exported.score, 50);
+    assert.equal(exported.submissions[0].verdict, 'accepted');
+  } finally {
+    await mAc.dispose();
+  }
+});

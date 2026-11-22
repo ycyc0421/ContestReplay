@@ -86,8 +86,11 @@ test('fresh Docker containers run MCP turns, redact failed scores and clean up',
 
 test('a queued Docker run can be stopped while inference is stalled, and the next job completes', { skip: !enabled, timeout: 30_000 }, async () => {
   const inputs = await loadInputs('examples/demo/contest.json', 'examples/demo/agent.json');
-  const basePlan = await makePlan({ schema_version: 1, agents: [inputs.agentPath], contests: [inputs.contestPath] }, process.cwd());
-  const plan = { ...basePlan, jobs: [...basePlan.jobs, ...basePlan.jobs] };
+  const basePlan = await makePlan({
+    schema_version: 2,
+    cells: [{ agent: inputs.agentPath, contest: inputs.contestPath, repeats: 2 }],
+  }, process.cwd());
+  const plan = basePlan;
   const out = await mkdtemp(join(tmpdir(), 'cr-docker-queue-test-'));
   const abort = new AbortController();
   let task;

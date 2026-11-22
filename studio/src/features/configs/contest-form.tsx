@@ -58,7 +58,7 @@ function ProblemEditor({ problems, setProblems }: { problems: ProblemDraft[]; se
       <Button type="button" variant="ghost" size="icon" aria-label={`删除题目 ${index + 1}`} disabled={problems.length === 1} onClick={() => setProblems(problems.filter((_, i) => i !== index))}><Trash2 className="size-4" /></Button>
     </motion.div>)}</AnimatePresence>
     <Button type="button" variant="secondary" size="sm" onClick={() => setProblems([...problems, { id: String(problems.length + 1), maxPoints: 1, answers: '' }])}><Plus className="size-3.5" />添加题目</Button>
-    <p className="text-[11px] leading-5 text-muted-foreground">去除提交答案首尾空白后精确匹配，命中任一可接受答案即得分。保存时同步生成 Contest 题目表与 judge.json。</p></div>;
+    <p className="text-[11px] leading-5 text-muted-foreground">去除提交答案首尾空白后精确匹配，命中任一可接受答案即得分。保存时同步生成 Contest 题目表与私有答案文件。</p></div>;
 }
 
 function ContestManifestForm({ capabilities }: { capabilities: StudioCapabilities }) {
@@ -146,7 +146,7 @@ function ContestManifestForm({ capabilities }: { capabilities: StudioCapabilitie
         {!capabilities.features.contest_upload && <Note>当前 runner 尚未提供上传接口，因此保留本机路径模式。实现材料上传契约后，上传入口会自动启用。</Note>}
       </div>}
       {step === 2 && <div className="space-y-5"><div><h3 className="font-semibold">判题方式</h3><p className="mt-1 text-xs text-muted-foreground">判题后端写入 Contest Manifest；只有本地答案模式会生成 judge.json。</p></div>
-        <Field label="判题后端"><Controller control={control} name="judge" render={({ field }) => <Select value={field.value} onValueChange={field.onChange}>{capabilities.judge_backends.map(backend => <SelectItem key={backend.kind} value={backend.kind}>{backend.label}</SelectItem>)}</Select>} /></Field>
+        <Field label="判题后端"><Controller control={control} name="judge" render={({ field }) => <Select value={field.value} onValueChange={field.onChange}>{capabilities.judge_backends.filter(backend => backend.kind === 'local' || backend.kind === 'codeforces').map(backend => <SelectItem key={backend.kind} value={backend.kind}>{backend.label}</SelectItem>)}</Select>} /></Field>
         {values.judge === 'local' ? capabilities.features.judge_authoring ? <ProblemEditor problems={problems} setProblems={setProblems} />
           : <div className="space-y-4 border-l-2 border-primary/25 bg-muted/20 p-4"><Field label="答案 JSON" hint="相对于清单" error={errors.answers?.message}><Input className="font-mono text-xs" {...register('answers')} /></Field><p className="text-xs leading-5 text-muted-foreground">当前后端读取已有 judge.json。题目表编辑器将在判题制作契约启用后开放。</p></div>
           : <div className="space-y-5 border-l-2 border-primary/25 bg-muted/20 p-4"><div className="grid gap-5 sm:grid-cols-2"><Field label="Codeforces 赛事 ID" error={errors.cfId?.message}><Input type="number" min="1" {...register('cfId')} /></Field><Field label="专用账号名" error={errors.handle?.message}><Input {...register('handle')} /></Field></div>

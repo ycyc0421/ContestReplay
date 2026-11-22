@@ -12,10 +12,10 @@ import type { ResponseInput } from 'openai/resources/responses/responses.js';
 import { z } from 'zod';
 import { createContest, createMcp, finishArgs, statusArgs, submitArgs, type EventSink } from './contest.js';
 import { protocol, protocolDigestForPreset, protocolForPreset, resolveProtocolPreset, resolveScoringMode } from './protocol.js';
-import { agentRevision, type Inputs } from './config.js';
+import { agentRevision, resolveOjAccountPolicy, selectMatchingOjAccounts, type Inputs } from './config.js';
 import { launch, renderPdf, resources, SandboxCleanupError } from './docker.js';
-import { match } from './match.js';
-import { codeforces, type ProgramJudge } from './codeforces.js';
+import { match, type AnyProgramJudge } from './match.js';
+import { createProgramJudge, OjAccountPool, OjAccounts, type OjAccountLease, type ProgramJudge as UnifiedProgramJudge } from './judges/index.js';
 import { codexConfig, serveContestChannels, type ContestChannelsHandle, type SessionArchiveResult } from './codex.js';
 import type { Infer } from './model.js';
 import { send } from './wire.js';
@@ -146,8 +146,10 @@ export async function archiveSessionDir(
 }
 
 export async function runBench(inputs: Inputs, opts: {
-  out: string; image: string; infer?: Infer; key?: string; programJudge?: ProgramJudge; signal: AbortSignal;
+  out: string; image: string; infer?: Infer; key?: string; programJudge?: AnyProgramJudge; signal: AbortSignal;
   runId?: string;
+  ojAccounts?: OjAccounts;
+  ojPool?: OjAccountPool;
   onStart?: (id: string, directory: string) => void;
 }) {
   const runId = opts.runId ?? randomUUID();
@@ -178,6 +180,17 @@ export async function runBench(inputs: Inputs, opts: {
     agent_revision: agentRevision(inputs, opts.image, effectiveProtocolDigest),
     agent_digests: { source_sha256: inputs.agentDigest, profile_sha256: inputs.profileDigest, native_sha256: inputs.nativeDigest, effective_sha256: inputs.effectiveDigest },
     harness: inputs.agent.harness, runner_version: '0.2.0', adapter_version: '0.2.0', judge_kind: inputs.contest.judge.kind,
+    ...(inputs.contest.judge.kind !== 'local'
+      ? {
+          judge_selector: {
+            kind: inputs.contest.judge.kind,
+            ...(inputs.contest.judge.account_id ? { account_id: inputs.contest.judge.account_id } : {}),
+            ...(inputs.contest.judge.pool ? { pool: inputs.contest.judge.pool } : {}),
+            ...(inputs.contest.judge.handle ? { handle: inputs.contest.judge.handle } : {}),
+            ...(inputs.contest.judge.base_url ? { base_url: inputs.contest.judge.base_url } : {}),
+          },
+        }
+      : {}),
     sandbox: { runtime: 'docker', image: opts.image, resources: sandboxResources },
     model: {
       model: inputs.profile.model, api: inputs.profile.api, base_url: inputs.profile.base_url,
@@ -237,6 +250,9 @@ export async function runBench(inputs: Inputs, opts: {
   let contest: ReturnType<typeof createContest> | undefined;
   let contestMatch: ReturnType<typeof match> | undefined;
   let closeChannels: ContestChannelsHandle | undefined;
+  let ojLease: OjAccountLease | undefined;
+  let ownedJudge: UnifiedProgramJudge | undefined;
+  let activeJudge: AnyProgramJudge | undefined;
   let started = false;
   let status: 'completed' | 'void' = 'void';
   let reason = 'runner_error';
@@ -252,6 +268,42 @@ export async function runBench(inputs: Inputs, opts: {
     const limits = inputs.contest.rules;
     if (inputs.profile.harness === 'codex') {
       if (!opts.key) throw new RunFailure('missing_model_key');
+      let judge: AnyProgramJudge | undefined = opts.programJudge;
+      if (!judge && inputs.contest.judge.kind !== 'local') {
+        const backend = inputs.contest.judge;
+        const accounts = opts.ojAccounts ?? new OjAccounts();
+        const policy = await resolveOjAccountPolicy(backend, accounts);
+        let pool = opts.ojPool;
+        if (policy.mode === 'account_pool') {
+          pool ??= new OjAccountPool(accounts);
+          const lease = await pool.acquire(
+            backend.kind,
+            { accountIds: policy.matchedAccounts.map(acc => acc.id) },
+            opts.signal,
+          );
+          if (selectMatchingOjAccounts(backend, [lease.account], policy.targetOrigin).length !== 1) {
+            lease.release();
+            throw new RunFailure('oj_account_drifted');
+          }
+          ojLease = lease;
+          runMeta.oj_account_id = lease.account.id;
+          const tmpMeta = `${runJsonPath}.${randomUUID()}.tmp`;
+          try {
+            await writeFile(tmpMeta, credentialJson(runMeta, opts.key, 2) + '\n', { mode: 0o600, flag: 'wx' });
+            await rename(tmpMeta, runJsonPath);
+          } catch {
+            await rm(tmpMeta, { force: true }).catch(() => {});
+          }
+        }
+        ownedJudge = createProgramJudge(backend, {
+          accounts,
+          pool,
+          ...(ojLease ? { account: ojLease.account } : {}),
+        });
+        judge = ownedJudge;
+      }
+      activeJudge = judge;
+      opts.signal.throwIfAborted();
       const input = join(stage, 'input');
       await mkdir(input, { mode: 0o755 });
       await writeFile(join(input, 'problems.pdf'), inputs.pdf, { mode: 0o444 });
@@ -263,7 +315,6 @@ export async function runBench(inputs: Inputs, opts: {
       for (const file of inputs.attachments) await writeFile(join(attachments, file.name), file.bytes, { mode: 0o444 });
       await codexConfig(input, inputs.profile, inputs.native);
       const channels = join(stage, 'channels');
-      const judge = opts.programJudge ?? (inputs.contest.judge.kind === 'codeforces' ? codeforces(inputs.contest.judge) : undefined);
       // Create the session lazily at t=0, after the container is launched.
       let live: ReturnType<typeof match> | undefined;
       const session = () => live ??= (contestMatch = match(inputs, event, judge));
@@ -289,7 +340,7 @@ export async function runBench(inputs: Inputs, opts: {
       started = true;
       timer = setTimeout(() => deadline.abort(), limits.time_limit_ms);
       event({ type: 'run_started', started_at: new Date().toISOString() });
-      const form = judge ? `Submit programming solutions with problem_id, language (one of ${Object.keys(inputs.contest.judge.kind === 'codeforces' ? inputs.contest.judge.languages : {}).join(', ')}), and source.` :
+      const form = judge ? `Submit programming solutions with problem_id, language (one of ${Object.keys(inputs.contest.judge.kind !== 'local' ? inputs.contest.judge.languages : {}).join(', ')}), and source.` :
         'Submit final answers with problem_id and answer.';
       const task = `You are competing in a timed contest. The attached images are all pages of the complete problem PDF, in order. The original is /inputs/problems.pdf. Optional contest materials are read-only in /inputs/attachments. Use the contest MCP tools: submit, status, finish. ${form} Only submissions are scored. No external resources. Work independently; call finish when done.`;
       sandbox.input.end(task);
@@ -449,12 +500,21 @@ export async function runBench(inputs: Inputs, opts: {
     catch { status = 'void'; if (reason !== 'sandbox_cleanup_failed') reason = 'staging_cleanup_failed'; }
     if (contestMatch) {
       if (status === 'completed') {
-        if (contestMatch.hasPending()) event({ type: 'settling' });
-        try { await contestMatch.settle(AbortSignal.any([opts.signal, AbortSignal.timeout(preset.settlementMs)])); }
-        catch { status = 'void'; reason = opts.signal.aborted ? 'interrupted' : 'judge_unsettled'; }
+        if (!contestMatch.failed() && contestMatch.hasPending()) event({ type: 'settling' });
+        const explicitSettlementMs =
+          inputs.contest.judge.kind !== 'local' ? inputs.contest.judge.settlement_ms : undefined;
+        const judgeSettlementMs =
+          activeJudge && 'settlementMs' in activeJudge && typeof activeJudge.settlementMs === 'number'
+            ? activeJudge.settlementMs
+            : 0;
+        const settlementMs = explicitSettlementMs ?? Math.max(preset.settlementMs, judgeSettlementMs);
+        try { await contestMatch.settle(AbortSignal.any([opts.signal, AbortSignal.timeout(settlementMs)])); }
+        catch { status = 'void'; reason = opts.signal.aborted ? 'interrupted' : contestMatch.failed() ? 'judge_error' : 'judge_unsettled'; }
       }
       await contestMatch.dispose();
     }
+    try { await ownedJudge?.dispose?.(); } catch { /* ignore dispose errors */ }
+    ojLease?.release();
     for (const writer of writers) { writer.flush(); writer.stream.end(); }
     await Promise.allSettled(writers.map(writer => writer.closed));
     event({
