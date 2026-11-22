@@ -3,9 +3,11 @@ import {
   batchesResponseSchema, cancelResponseSchema, idResponseSchema, logsResponseSchema,
   connectionResponseSchema as connectionSchema, materialResponseSchema as materialSchema, effectiveConfigSchema,
   catalogAgentSchema, catalogContestSchema, matrixResponseSchema, pathResponseSchema, planResponseSchema,
+  runProgressSchema, runLogSliceSchema, runReplaySchema, ghostRaceSchema, rankedResultsResponseSchema,
+  coverageResponseSchema, preflightReportSchema,
 } from '@studio-api';
 
-export async function api<T>(path: string, schema: z.ZodType<T>, payload?: unknown, method?: 'POST' | 'PATCH' | 'DELETE'): Promise<T> {
+export async function api<T>(path: string, schema: z.ZodType<T>, payload?: unknown, method?: 'POST' | 'PATCH' | 'PUT' | 'DELETE'): Promise<T> {
   const httpMethod = method ?? (payload === undefined ? 'GET' : 'POST');
   let response: Response;
   try {
@@ -29,15 +31,39 @@ const documentPathSchema = z.looseObject({ path: z.string() });
 export const studioApi = {
   batches: () => api('/api/batches', batchesResponseSchema),
   plan: (agents: string[], contests: string[]) => api('/api/plan', planResponseSchema, { schema_version: 1, agents, contests }),
-  planCells: (cells: { agent: string; contest: string }[]) => api('/api/plan', planResponseSchema, { schema_version: 2, cells }),
+  planCells: (cells: { agent: string; contest: string; repeats?: number }[]) => api('/api/plan', planResponseSchema, { schema_version: 2, cells }),
   catalogAgents: () => api('/api/catalog/agents', z.strictObject({ agents: z.array(catalogAgentSchema) })),
   catalogContests: () => api('/api/catalog/contests', z.strictObject({ contests: z.array(catalogContestSchema) })),
   matrix: (agents: string[], contests: string[]) => api('/api/matrix', matrixResponseSchema, { agents, contests }),
-  startBatch: (token: string) => api('/api/batches', idResponseSchema, { token }),
+  startBatch: (token: string, concurrency?: number) => api('/api/batches', idResponseSchema, { token, ...(concurrency ? { concurrency } : {}) }),
   stopBatch: (id: string) => api(`/api/batches/${id}/stop`, idResponseSchema, {}),
   resumeBatch: (id: string) => api(`/api/batches/${id}/resume`, idResponseSchema, {}),
   cancelRun: (id: string) => api(`/api/runs/${id}/cancel`, cancelResponseSchema, {}),
   logs: (id: string) => api(`/api/runs/${id}/logs`, logsResponseSchema),
+  progress: (id: string) => api(`/api/runs/${id}/progress`, runProgressSchema),
+  logSlice: (id: string, stream: 'stdout' | 'stderr', offset: number, limit = 65_536) =>
+    api(`/api/runs/${id}/logs?stream=${stream}&offset=${offset}&limit=${limit}`, runLogSliceSchema),
+  replay: (id: string, options: { includeSources?: boolean; includeSession?: boolean } = {}) => {
+    const query = new URLSearchParams();
+    if (options.includeSources) query.set('include_sources', 'true');
+    if (options.includeSession) query.set('include_session', 'true');
+    const suffix = query.size ? `?${query}` : '';
+    return api(`/api/runs/${id}/replay${suffix}`, runReplaySchema);
+  },
+  race: (runIds: string[], scoringMode?: 'icpc' | 'cf' | 'ioi' | 'last_ac', sampleStepMs = 60_000) =>
+    api('/api/runs/race', ghostRaceSchema, { run_ids: runIds, ...(scoringMode ? { scoring_mode: scoringMode } : {}), sample_step_ms: sampleStepMs }),
+  ranked: (options: { scoring?: 'icpc' | 'cf' | 'ioi' | 'last_ac'; groupBy?: 'revision' | 'model'; vendor?: string; family?: string; batchId?: string } = {}) => {
+    const query = new URLSearchParams();
+    if (options.scoring) query.set('scoring', options.scoring);
+    if (options.groupBy) query.set('group_by', options.groupBy);
+    if (options.vendor) query.set('vendor', options.vendor);
+    if (options.family) query.set('family', options.family);
+    if (options.batchId) query.set('batch_id', options.batchId);
+    const suffix = query.size ? `?${query}` : '';
+    return api(`/api/results/ranked${suffix}`, rankedResultsResponseSchema);
+  },
+  coverage: () => api('/api/coverage', coverageResponseSchema),
+  preflight: (cells: { agent: string; contest: string }[]) => api('/api/preflight', preflightReportSchema, { schema_version: 2, cells }),
   saveAgent: (file: string, config: unknown) => api('/api/config/agent', pathResponseSchema, { file, config }),
   saveContest: (file: string, config: unknown) => api('/api/config/contest', pathResponseSchema, { file, config }),
   importCodeforces: (file: string, config: unknown) => api('/api/config/codeforces', pathResponseSchema, { file, config }),

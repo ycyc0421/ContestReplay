@@ -8,6 +8,15 @@ export const formatDate = (value: string) => new Intl.DateTimeFormat('zh-CN', {
   month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
 }).format(new Date(value));
 export const formatBytes = (value: number) => value < 1024 ? `${value} B` : value < 1024 ** 2 ? `${(value / 1024).toFixed(1)} KB` : `${(value / 1024 ** 2).toFixed(1)} MB`;
+export const formatDuration = (value: number, compact = false) => {
+  const seconds = Math.max(0, Math.floor(value / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = seconds % 60;
+  if (compact && hours === 0) return `${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`;
+};
+export const formatNumber = (value: number) => new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 }).format(value);
 
 export const statusMeta: Record<RunStatus, { label: string; className: string }> = {
   queued: { label: '等待中', className: 'bg-muted text-muted-foreground' },

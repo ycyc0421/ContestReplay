@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link, Outlet, useLocation } from '@tanstack/react-router';
-import { Activity, Braces, FilePlus2, FolderCog, KeyRound, Menu, Moon, ShieldCheck, Sun, X } from 'lucide-react';
+import { Activity, BarChart3, Braces, FilePlus2, FolderCog, KeyRound, Menu, Moon, ShieldCheck, Sun, X } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import { Toaster } from 'sonner';
 import { cn } from '@/lib/utils';
@@ -9,6 +9,7 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 const nav = [
   { to: '/', label: '运行总览', icon: Activity, exact: true },
   { to: '/batches/new', label: '新建批次', icon: FilePlus2, exact: false },
+  { to: '/results', label: '结果分析', icon: BarChart3, exact: false },
   { to: '/configs', label: '配置工具', icon: FolderCog, exact: false },
   { to: '/providers', label: 'Providers', icon: KeyRound, exact: false },
 ] as const;
@@ -42,7 +43,7 @@ export function AppShell() {
   return <TooltipProvider delayDuration={350}><div className="min-h-screen">
     <aside className="fixed inset-y-0 left-0 z-30 hidden w-[232px] flex-col border-r bg-sidebar px-4 py-5 lg:flex">
       <div className="px-2"><Brand /></div>
-      <div className="mt-10"><div className="mb-3 flex items-center justify-between px-3 font-mono text-[9px] font-semibold uppercase tracking-[0.18em] text-muted-foreground"><span>Workspace</span><span>01—04</span></div><NavItems id="desktop" /></div>
+      <div className="mt-10"><div className="mb-3 flex items-center justify-between px-3 font-mono text-[9px] font-semibold uppercase tracking-[0.18em] text-muted-foreground"><span>Workspace</span><span>01—05</span></div><NavItems id="desktop" /></div>
       <div className="mt-auto overflow-hidden rounded-[3px] border bg-card p-3.5">
         <div className="flex items-center gap-2 text-xs font-medium"><ShieldCheck className="size-4 text-primary" />仅在本机运行</div>
         <p className="mt-2 text-[11px] leading-5 text-muted-foreground">配置、日志和凭据不会上传至公共服务。</p>

@@ -14,8 +14,9 @@ const dashboardRoute = createRoute({ getParentRoute: () => rootRoute, path: '/',
 const newBatchRoute = createRoute({ getParentRoute: () => rootRoute, path: '/batches/new', component: lazyRouteComponent(() => import('@/features/batches/new-batch-page'), 'NewBatchPage') });
 const configsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/configs', component: lazyRouteComponent(() => import('@/features/configs/configs-page'), 'ConfigsPage') });
 const providersRoute = createRoute({ getParentRoute: () => rootRoute, path: '/providers', component: lazyRouteComponent(() => import('@/features/providers/providers-page'), 'ProvidersPage') });
+const resultsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/results', component: lazyRouteComponent(() => import('@/features/results/results-page'), 'ResultsPage') });
 const runRoute = createRoute({ getParentRoute: () => rootRoute, path: '/runs/$runId', component: lazyRouteComponent(() => import('@/features/runs/run-page'), 'RunPage') });
-const routeTree = rootRoute.addChildren([dashboardRoute, newBatchRoute, configsRoute, providersRoute, runRoute]);
+const routeTree = rootRoute.addChildren([dashboardRoute, newBatchRoute, configsRoute, providersRoute, resultsRoute, runRoute]);
 const router = createRouter({ routeTree, defaultPreload: 'intent' });
 declare module '@tanstack/react-router' { interface Register { router: typeof router } }
 

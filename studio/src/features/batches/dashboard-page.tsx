@@ -29,7 +29,7 @@ export function DashboardPage() {
       </div>)}</div></Card>
     </motion.div>
     {query.data?.error && <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="mb-5 flex gap-3 rounded-[3px] border border-red-500/20 bg-red-500/5 p-4 text-sm text-danger"><AlertTriangle className="mt-0.5 size-4 shrink-0" /><div><strong className="font-medium">执行器报告了错误</strong><p className="mt-1 text-xs leading-5">{query.data.error}</p></div></motion.div>}
-    <div className="mb-4 flex items-end justify-between"><div><div className="mb-1.5 font-mono text-[9px] uppercase tracking-[0.18em] text-primary">Serial queue</div><h2 className="text-base font-semibold tracking-tight">批次队列</h2><p className="mt-1 text-xs text-muted-foreground">同一工作区中的任务沿赛道串行执行</p></div>
+    <div className="mb-4 flex items-end justify-between"><div><div className="mb-1.5 font-mono text-[9px] uppercase tracking-[0.18em] text-primary">Execution queue</div><h2 className="text-base font-semibold tracking-tight">批次队列</h2><p className="mt-1 text-xs text-muted-foreground">串行或受控并行执行，任务状态与最近提交实时汇总</p></div>
       <Button variant="ghost" size="sm" onClick={() => void query.refetch()}><RotateCw className="size-3.5" />刷新</Button></div>
     <Separator className="mb-4" />
     {query.isError ? <Card><EmptyState icon={AlertTriangle} title="暂时无法读取批次" description={(query.error as Error).message} action={<Button variant="secondary" onClick={() => void query.refetch()}>重新连接</Button>} /></Card>
