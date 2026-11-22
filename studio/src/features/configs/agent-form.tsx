@@ -80,7 +80,7 @@ function LegacyAgentReadOnly({ initial }: { initial: AgentItemResponse }) {
   </div>;
 }
 
-function AgentManifestForm({ capabilities, initial, onSaved }: { capabilities: StudioCapabilities; initial?: AgentItemResponse; onSaved?: () => void }) {
+function AgentManifestForm({ capabilities, initial, onSaved }: { capabilities: StudioCapabilities; initial?: AgentItemResponse; onSaved?: (intent?: 'save' | 'batch') => Promise<void> | void }) {
   const [saved, setSaved] = useState<string>();
   const navigate = useNavigate();
   const intent = useRef<'save' | 'batch'>('save');
@@ -141,9 +141,10 @@ function AgentManifestForm({ capabilities, initial, onSaved }: { capabilities: S
           base_url: form.baseUrl || undefined, api_key_env: form.keyEnv || undefined,
           ...(form.harnessOptions.reasoning_effort && form.harnessOptions.reasoning_effort !== 'default' ? { reasoning_effort: form.harnessOptions.reasoning_effort } : {}) });
       if (intent.current === 'batch') {
+        void onSaved?.('batch');
         sessionStorage.setItem('cr.batch.pending', JSON.stringify({ kind: 'agent', path: result.path }));
         toast.success('Agent 已保存，正在加入批次'); void navigate({ to: '/batches/new' });
-      } else { setSaved(result.path); toast.success(initial ? 'Agent 配置已更新' : 'Agent 配置已保存'); onSaved?.(); }
+      } else { setSaved(result.path); toast.success(initial ? 'Agent 配置已更新' : 'Agent 配置已保存'); await onSaved?.('save'); }
     } catch (error) { toast.error('无法保存 Agent', { description: (error as Error).message }); }
   });
   const renderHarnessField = (field: HarnessField) => <Field key={field.id} label={field.label} hint={field.required ? undefined : '可选'}>
@@ -187,7 +188,7 @@ function AgentManifestForm({ capabilities, initial, onSaved }: { capabilities: S
   </form>;
 }
 
-export function AgentForm({ initial, onSaved }: { initial?: AgentItemResponse; onSaved?: () => void }) {
+export function AgentForm({ initial, onSaved }: { initial?: AgentItemResponse; onSaved?: (intent?: 'save' | 'batch') => Promise<void> | void }) {
   const capabilities = useCapabilities();
   if (capabilities.isLoading) return <div className="skeleton h-[560px] border bg-muted/30" />;
   if (capabilities.isError || !capabilities.data) return <Note>无法读取 Harness 能力描述：{(capabilities.error as Error)?.message ?? '未知错误'}</Note>;

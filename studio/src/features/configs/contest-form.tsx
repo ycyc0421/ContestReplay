@@ -108,7 +108,7 @@ function RemoteProblemEditor({ problems, setProblems }: { problems: ProblemDraft
   return <div className="space-y-3"><div><div className="text-xs font-medium">本地题目表</div><p className="mt-1 text-[11px] leading-5 text-muted-foreground">这里定义 PDF 中的稳定题号与满分；下方的 problem_map 再把这些本地题号映射到远端。拉取预览只会生成可编辑草稿。</p></div><AnimatePresence initial={false}>{problems.map((problem, index) => <motion.div layout key={index} initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, height: 0 }} className="grid grid-cols-[1fr_100px_32px] gap-3 border-b pb-3"><Input aria-label={`远程题目 ${index + 1} 题号`} value={problem.id} onChange={event => update(index, { id: event.target.value })} /><Input aria-label={`远程题目 ${index + 1} 分值`} type="number" min="1" value={problem.maxPoints} onChange={event => update(index, { maxPoints: Number(event.target.value) })} /><Button type="button" variant="ghost" size="icon" aria-label={`删除远程题目 ${index + 1}`} disabled={problems.length === 1} onClick={() => setProblems(problems.filter((_, current) => current !== index))}><Trash2 className="size-4" /></Button></motion.div>)}</AnimatePresence><Button type="button" variant="secondary" size="sm" onClick={() => setProblems([...problems, { id: String(problems.length + 1), maxPoints: 100, answers: '' }])}><Plus className="size-3.5" />添加本地题目</Button></div>;
 }
 
-function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities: StudioCapabilities; initial?: ContestItemResponse; onSaved?: () => void }) {
+function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities: StudioCapabilities; initial?: ContestItemResponse; onSaved?: (intent?: 'save' | 'batch') => Promise<void> | void }) {
   const [step, setStep] = useState(0);
   const [maxStep, setMaxStep] = useState(0);
   const [saved, setSaved] = useState<string>();
@@ -168,42 +168,52 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
     setRemotePreview(result);
     if (!getValues('title').trim()) setValue('title', result.preview.title);
     if (result.language_presets.length) setValue('languages', JSON.stringify(Object.fromEntries(result.language_presets.map(language => [language.id, language.remote_id]))));
-    const existingMap = parsePlainRecord(getValues('problemMap')) ?? {};
+    const existingMapRaw = parsePlainRecord(getValues('problemMap')) ?? {};
+    const existingMap = Object.fromEntries(Object.entries(existingMapRaw).filter(([, value]) => typeof value === 'string' && value.trim().length > 0)) as Record<string, string>;
     const suggestedMap = result.problem_map_suggestion?.problem_map ?? {};
-    const mergedMap = Object.keys(suggestedMap).length ? { ...existingMap, ...suggestedMap } : existingMap;
+    // Fill missing keys from preview suggestions while preserving deliberate explicit mappings.
+    const mergedMap: Record<string, string> = Object.keys(suggestedMap).length ? { ...suggestedMap, ...existingMap } : existingMap;
     if (result.problem_map_suggestion && Object.keys(mergedMap).length) {
       setValue('problemMap', JSON.stringify(mergedMap, null, 2));
     }
+    const isUntouchedDefault = !initial && problems.length === 1 && problems[0]!.id === '1' && problems[0]!.maxPoints === 1 && !problems[0]!.answers.trim();
+    const orderedIds: string[] = [];
+    const addId = (candidate: string) => { const trimmed = candidate.trim(); if (trimmed && !orderedIds.includes(trimmed)) orderedIds.push(trimmed); };
+    if (!isUntouchedDefault) problems.forEach(problem => addId(problem.id));
+    (result.pdf_info?.problem_ids ?? []).forEach(addId);
+    Object.keys(suggestedMap).forEach(addId);
+    (result.problem_map_suggestion?.unmapped_local ?? []).forEach(addId);
+    if (!orderedIds.length) result.preview.problems.forEach(problem => addId(problem.remote_id));
+    const replacePlaceholders = isUntouchedDefault || pointsKnown === false;
+    const nextProblems: ProblemDraft[] = orderedIds.length ? orderedIds.map(localId => {
+      const existing = isUntouchedDefault ? undefined : problems.find(problem => problem.id.trim() === localId);
+      const mappedRemoteId = mergedMap[localId] ?? localId;
+      const remoteProblem = result.preview.problems.find(problem => problem.remote_id === mappedRemoteId);
+      const remotePoints = validMaxPoints(remoteProblem?.max_points);
+      const resolvedMaxPoints = existing
+        ? (replacePlaceholders && remotePoints !== undefined ? remotePoints : existing.maxPoints)
+        : remotePoints ?? initialProblemDrafts.find(problem => problem.id === localId)?.maxPoints ?? 1;
+      return {
+        id: localId,
+        maxPoints: resolvedMaxPoints,
+        answers: existing?.answers ?? initialProblemDrafts.find(problem => problem.id === localId)?.answers ?? '',
+      };
+    }) : problems;
+    setProblems(nextProblems);
     if (values.judge === 'codeforces') {
-      const allKnown = result.preview.problems.length > 0 && result.preview.problems.every(problem => validMaxPoints(problem.max_points) !== undefined);
-      setPointsKnown(allKnown);
-      setPointsIncompleteFromPreview(!allKnown);
+      // Determine points_known strictly from the weights that will actually be saved.
+      const allSavedWeightsVerified = nextProblems.length > 0 && nextProblems.every(problem => {
+        const mappedRemoteId = mergedMap[problem.id.trim()] ?? problem.id.trim();
+        const remoteProblem = result.preview.problems.find(item => item.remote_id === mappedRemoteId);
+        const remotePoints = validMaxPoints(remoteProblem?.max_points);
+        return remotePoints !== undefined && problem.maxPoints === remotePoints;
+      });
+      setPointsKnown(allSavedWeightsVerified);
+      setPointsIncompleteFromPreview(!allSavedWeightsVerified);
     } else {
       setPointsKnown(undefined);
       setPointsIncompleteFromPreview(false);
     }
-    setProblems(currentProblems => {
-      const isUntouchedDefault = !initial && currentProblems.length === 1 && currentProblems[0]!.id === '1' && currentProblems[0]!.maxPoints === 1 && !currentProblems[0]!.answers.trim();
-      const orderedIds: string[] = [];
-      const addId = (candidate: string) => { const trimmed = candidate.trim(); if (trimmed && !orderedIds.includes(trimmed)) orderedIds.push(trimmed); };
-      if (!isUntouchedDefault) currentProblems.forEach(problem => addId(problem.id));
-      (result.pdf_info?.problem_ids ?? []).forEach(addId);
-      Object.keys(suggestedMap).forEach(addId);
-      (result.problem_map_suggestion?.unmapped_local ?? []).forEach(addId);
-      if (!orderedIds.length) result.preview.problems.forEach(problem => addId(problem.remote_id));
-      if (!orderedIds.length) return currentProblems;
-      return orderedIds.map(localId => {
-        const existing = isUntouchedDefault ? undefined : currentProblems.find(problem => problem.id.trim() === localId);
-        const mappedRemoteId = suggestedMap[localId] ?? (typeof mergedMap[localId] === 'string' ? mergedMap[localId] : localId);
-        const remoteProblem = result.preview.problems.find(problem => problem.remote_id === mappedRemoteId);
-        const remotePoints = validMaxPoints(remoteProblem?.max_points);
-        return {
-          id: localId,
-          maxPoints: existing ? existing.maxPoints : remotePoints ?? initialProblemDrafts.find(problem => problem.id === localId)?.maxPoints ?? 1,
-          answers: existing?.answers ?? initialProblemDrafts.find(problem => problem.id === localId)?.answers ?? '',
-        };
-      });
-    });
     toast.success('赛事信息已载入', { description: `${result.preview.problems.length} 道题 · ${result.preview.status}` });
   }, onError: (error: Error) => toast.error('无法拉取赛事信息', { description: error.message }) });
   const goTo = (next: number) => { setStep(next); setMaxStep(current => Math.max(current, next)); };
@@ -289,9 +299,10 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
             : await studioApi.saveContest(form.file, { schema_version: 2, contest_id: form.id, data_version: form.dataVersion,
               title: form.title || form.id, source: sourceInfo, materials, rules, judge: { kind: 'local', answers: { path: form.answers } } });
       if (intent.current === 'batch') {
+        void onSaved?.('batch');
         sessionStorage.setItem('cr.batch.pending', JSON.stringify({ kind: 'contest', path: result.path }));
         toast.success('Contest 已保存，正在加入批次'); void navigate({ to: '/batches/new' });
-      } else { setSaved(result.path); toast.success(initial ? 'Contest 配置已更新' : 'Contest 配置已保存'); onSaved?.(); }
+      } else { setSaved(result.path); toast.success(initial ? 'Contest 配置已更新' : 'Contest 配置已保存'); await onSaved?.('save'); }
     } catch (error) { toast.error('无法保存 Contest', { description: (error as Error).message }); }
   });
   const changeMaterialMode = (mode: string) => {
@@ -365,7 +376,7 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
   </form>;
 }
 
-export function ContestForm({ initial, onSaved }: { initial?: ContestItemResponse; onSaved?: () => void }) {
+export function ContestForm({ initial, onSaved }: { initial?: ContestItemResponse; onSaved?: (intent?: 'save' | 'batch') => Promise<void> | void }) {
   const capabilities = useCapabilities();
   if (capabilities.isLoading) return <div className="skeleton h-[560px] border bg-muted/30" />;
   if (capabilities.isError || !capabilities.data) return <Note>无法读取 Contest 能力描述：{(capabilities.error as Error)?.message ?? '未知错误'}</Note>;

@@ -809,7 +809,7 @@ async function prepareContestWrite(
   document: Record<string, unknown>,
   payload: z.infer<typeof judgeSchema> | undefined,
   signal: AbortSignal,
-  existingAnswersFullPath?: string,
+  existingAnswersBinding?: { fullPath: string; sha256?: string },
 ) {
   if (extname(target) !== '.json') throw new FieldError(['file'], 'Contest output must end in .json');
   if (isReservedNonManifestFilename(target)) throw new FieldError(['file'], 'Contest output filename is reserved');
@@ -879,7 +879,12 @@ async function prepareContestWrite(
     answersBytes = verifiedAnswers.bytes;
     answersHash = verifiedAnswers.sha256;
     answersRedistribution = existingLocal.answers.redistribution ?? 'restricted';
-    if (existingAnswersFullPath && existingAnswersFullPath === verifiedAnswers.fullPath) {
+    const matchesStoredBinding = Boolean(
+      existingAnswersBinding &&
+      existingAnswersBinding.fullPath === verifiedAnswers.fullPath &&
+      (!existingAnswersBinding.sha256 || existingAnswersBinding.sha256 === verifiedAnswers.sha256),
+    );
+    if (matchesStoredBinding) {
       preservedAnswersFullPath = verifiedAnswers.fullPath;
       resolvedJudge = {
         kind: 'local',
@@ -1120,29 +1125,40 @@ export async function updateContestDocument(root: string, base: string, raw: unk
     }
     assertContestDocument(target, existingParsed, 'path');
 
-    let existingAnswersFullPath: string | undefined;
+    let existingAnswersBinding: { fullPath: string; sha256?: string } | undefined;
     if (existingParsed && typeof existingParsed === 'object' && !Array.isArray(existingParsed)) {
       const existingObj = existingParsed as Record<string, unknown>;
       const existingJudge = existingObj.judge && typeof existingObj.judge === 'object' && !Array.isArray(existingObj.judge)
         ? existingObj.judge as Record<string, unknown>
         : undefined;
-      const existingAnswersRef = existingJudge?.kind === 'local' && existingJudge.answers && typeof existingJudge.answers === 'object' && typeof (existingJudge.answers as Record<string, unknown>).path === 'string'
-        ? String((existingJudge.answers as Record<string, unknown>).path)
+      const existingAnswersObj = existingJudge?.kind === 'local' && existingJudge.answers && typeof existingJudge.answers === 'object' && !Array.isArray(existingJudge.answers)
+        ? existingJudge.answers as Record<string, unknown>
+        : undefined;
+      const existingAnswersRef = typeof existingAnswersObj?.path === 'string'
+        ? existingAnswersObj.path
         : existingObj.schema_version === 1 && typeof existingJudge?.path === 'string'
-          ? String(existingJudge.path)
+          ? existingJudge.path
+          : undefined;
+      const existingAnswersSha256 = typeof existingAnswersObj?.sha256 === 'string'
+        ? existingAnswersObj.sha256
+        : existingObj.schema_version === 1 && typeof existingJudge?.sha256 === 'string'
+          ? existingJudge.sha256
           : undefined;
       if (existingAnswersRef) {
         const realBase = await realpath(base);
         const candidate = isAbsolute(existingAnswersRef) ? resolve(existingAnswersRef) : resolve(dirname(target), existingAnswersRef);
         const relFromBase = relative(realBase, candidate);
         if (relFromBase && relFromBase !== '..' && !relFromBase.startsWith(`..${sep}`) && !isAbsolute(relFromBase)) {
-          existingAnswersFullPath = await existingWorkspaceFile(base, relFromBase, 'path', root).catch(() => undefined);
+          const fullPath = await existingWorkspaceFile(base, relFromBase, 'path', root).catch(() => undefined);
+          if (fullPath) {
+            existingAnswersBinding = { fullPath, ...(existingAnswersSha256 ? { sha256: existingAnswersSha256 } : {}) };
+          }
         }
       }
     }
 
     const { manifest, answersBytes, answersHash, answersRedistribution, judgeFileName, preservedAnswersFullPath, makeArtifactReader } =
-      await prepareContestWrite(root, base, target, document, payload, signal, existingAnswersFullPath);
+      await prepareContestWrite(root, base, target, document, payload, signal, existingAnswersBinding);
 
     const temp = await mkdtemp(join(dirname(target), '.cr-contest-'));
     let createdJudgePath: string | undefined;

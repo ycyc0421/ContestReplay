@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Bot, FileCheck2, FilePlus2, LockKeyhole, X } from 'lucide-react';
 import { motion } from 'motion/react';
+import { toast } from 'sonner';
 import type { AgentItemResponse, ContestItemResponse } from '@studio-api';
 import { studioApi } from '@/lib/api';
 import { Card, PageHeader } from '@/components/ui/card';
@@ -16,6 +17,8 @@ export function ConfigsPage() {
   const [tab, setTab] = useState('agent');
   const [agent, setAgent] = useState<AgentItemResponse>();
   const [contest, setContest] = useState<ContestItemResponse>();
+  const agentReloadSeq = useRef(0);
+  const contestReloadSeq = useRef(0);
   const client = useQueryClient();
   const refresh = () => {
     void Promise.all([
@@ -27,28 +30,44 @@ export function ConfigsPage() {
       client.invalidateQueries({ queryKey: ['contest-item'] }),
     ]);
   };
-  const savedAgent = () => {
+  const savedAgent = async (intent: 'save' | 'batch' = 'save') => {
     refresh();
-    if (agent) {
-      const editingPath = agent.path;
-      void studioApi.agentItem(editingPath).then(updated => {
+    if (intent !== 'save' || !agent) return;
+    const editingPath = agent.path;
+    const seq = ++agentReloadSeq.current;
+    try {
+      const updated = await studioApi.agentItem(editingPath);
+      if (agentReloadSeq.current === seq) {
         setAgent(current => current?.path === editingPath ? updated : current);
-      }).catch(() => {});
+      }
+    } catch (error) {
+      if (agentReloadSeq.current === seq) {
+        setAgent(current => current?.path === editingPath ? undefined : current);
+        toast.error('Agent 已保存，但刷新编辑器快照失败，请重新打开编辑', { description: (error as Error).message });
+      }
     }
   };
-  const savedContest = () => {
+  const savedContest = async (intent: 'save' | 'batch' = 'save') => {
     refresh();
-    if (contest) {
-      const editingPath = contest.path;
-      void studioApi.contestItem(editingPath).then(updated => {
+    if (intent !== 'save' || !contest) return;
+    const editingPath = contest.path;
+    const seq = ++contestReloadSeq.current;
+    try {
+      const updated = await studioApi.contestItem(editingPath);
+      if (contestReloadSeq.current === seq) {
         setContest(current => current?.path === editingPath ? updated : current);
-      }).catch(() => {});
+      }
+    } catch (error) {
+      if (contestReloadSeq.current === seq) {
+        setContest(current => current?.path === editingPath ? undefined : current);
+        toast.error('Contest 已保存，但刷新编辑器快照失败，请重新打开编辑', { description: (error as Error).message });
+      }
     }
   };
-  const editAgent = (item: AgentItemResponse) => { setAgent(item); setTab('agent'); document.getElementById('config-editor')?.scrollIntoView({ block: 'start' }); };
-  const editContest = (item: ContestItemResponse) => { setContest(item); setTab('contest'); document.getElementById('config-editor')?.scrollIntoView({ block: 'start' }); };
-  const deletedAgent = (path: string) => { setAgent(current => current?.path === path ? undefined : current); refresh(); };
-  const deletedContest = (path: string) => { setContest(current => current?.path === path ? undefined : current); refresh(); };
+  const editAgent = (item: AgentItemResponse) => { agentReloadSeq.current += 1; setAgent(item); setTab('agent'); document.getElementById('config-editor')?.scrollIntoView({ block: 'start' }); };
+  const editContest = (item: ContestItemResponse) => { contestReloadSeq.current += 1; setContest(item); setTab('contest'); document.getElementById('config-editor')?.scrollIntoView({ block: 'start' }); };
+  const deletedAgent = (path: string) => { agentReloadSeq.current += 1; setAgent(current => current?.path === path ? undefined : current); refresh(); };
+  const deletedContest = (path: string) => { contestReloadSeq.current += 1; setContest(current => current?.path === path ? undefined : current); refresh(); };
   return <>
     <PageHeader eyebrow="06 / Configuration library" title="配置库" description="检索、编辑、克隆并派生可复现的比赛输入；不再需要手工查找 Manifest 文件。" actions={<div className="flex gap-2"><Button variant="secondary" onClick={() => { setAgent(undefined); setTab('agent'); }}><Bot className="size-4" />新建 Agent</Button><Button onClick={() => { setContest(undefined); setTab('contest'); }}><FilePlus2 className="size-4" />新建 Contest</Button></div>} />
     <div className="mb-8"><ConfigLibrary onEditAgent={editAgent} onEditContest={editContest} onDeletedAgent={deletedAgent} onDeletedContest={deletedContest} /></div>

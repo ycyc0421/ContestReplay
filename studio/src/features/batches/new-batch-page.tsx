@@ -117,11 +117,31 @@ export function NewBatchPage() {
       if ((pending.kind === 'agent' && !agentsQuery.data) || (pending.kind === 'contest' && !contestsQuery.data)) return;
       const entries = pending.kind === 'agent' ? agents : contests;
       const entry = entries.find(item => pending.path === item.path || pending.path.endsWith(`/${item.path}`));
-      if (entry && 'harness' in entry) { setSelectedAgents(previous => new Set(previous).add(entry.path)); addAgentCells(entry.path); }
-      else if (entry) { setSelectedContests(previous => new Set(previous).add(entry.path)); addContestCells(entry.path); }
+      const fetching = pending.kind === 'agent' ? agentsQuery.isFetching : contestsQuery.isFetching;
+      // Wait for an in-flight catalog refetch before consuming a newly saved pending config.
+      if ((!entry || !entry.valid) && fetching) return;
+      if (entry?.valid) {
+        if ('harness' in entry) {
+          const validContests = contestsQuery.data ? new Set(contests.filter(item => item.valid).map(item => item.path)) : undefined;
+          setSelectedAgents(previous => new Set(previous).add(entry.path));
+          setSelectedCells(previous => {
+            const next = new Set(previous);
+            for (const contest of selectedContests) if (!validContests || validContests.has(contest)) next.add(cellKey(entry.path, contest));
+            return next;
+          });
+        } else {
+          const validAgents = agentsQuery.data ? new Set(agents.filter(item => item.valid).map(item => item.path)) : undefined;
+          setSelectedContests(previous => new Set(previous).add(entry.path));
+          setSelectedCells(previous => {
+            const next = new Set(previous);
+            for (const agent of selectedAgents) if (!validAgents || validAgents.has(agent)) next.add(cellKey(agent, entry.path));
+            return next;
+          });
+        }
+      }
       setPlan(null); setStage('catalog'); sessionStorage.removeItem('cr.batch.pending');
     } catch { sessionStorage.removeItem('cr.batch.pending'); }
-  }, [agentsQuery.data, contestsQuery.data]);
+  }, [agentsQuery.data, contestsQuery.data, agentsQuery.isFetching, contestsQuery.isFetching]);
   const invalidate = () => { setPlan(null); if (stage === 'review') setStage('matrix'); };
   const toggleAgent = (path: string) => {
     invalidate();

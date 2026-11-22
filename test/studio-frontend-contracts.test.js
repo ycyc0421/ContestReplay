@@ -308,6 +308,28 @@ test('Studio frontend contracts against real backend: preflight, remote contests
   const contestFiles = await readdir(join(base, 'contests'));
   assert.ok(!contestFiles.some(name => name.startsWith('hand-demo.judge.')), `Unexpected generated judge copy: ${contestFiles.join(', ')}`);
 
+  // 4b-ii. When answers.json changes on disk (new digest differs from stored manifest digest), PUT publishes a fresh immutable copy
+  const mutatedAnswers = JSON.stringify({ schema_version: 1, problems: [{ id: 'A', max_points: 10, accepted_answers: ['99'] }] }, null, 2) + '\n';
+  const mutatedAnswersSha = createHash('sha256').update(mutatedAnswers).digest('hex');
+  await writeFile(join(base, 'contests', 'answers.json'), mutatedAnswers, 'utf8');
+  const handMutatedPut = await req('/api/contests/item', {
+    method: 'PUT',
+    body: {
+      path: handReloaded.path,
+      document: {
+        ...handReloaded.document,
+        judge: { kind: 'local', answers: { path: 'answers.json', sha256: mutatedAnswersSha, redistribution: 'restricted' } },
+      },
+    },
+  });
+  assert.equal(handMutatedPut.status, 200, handMutatedPut.text);
+  assert.match(handMutatedPut.value.judge_path, /^contests\/hand-demo\.judge\.[a-f0-9]{12}\.json$/);
+  const handAfterMutated = contestItemResponseSchema.parse(
+    (await req(`/api/contests/item?path=${encodeURIComponent('contests/hand-demo.json')}&include_judge=1`)).value,
+  );
+  assert.match(handAfterMutated.document.judge.answers.path, /^hand-demo\.judge\.[a-f0-9]{12}\.json$/);
+  assert.notEqual(handAfterMutated.contest_revision, handReloaded.contest_revision);
+
   // 4c. Remote Contest preview resolves manifest-relative pdf_path (contests/problems.pdf) and saved relative managed upload path
   const remotePreviewRel = await req('/api/contests/preview', {
     body: {

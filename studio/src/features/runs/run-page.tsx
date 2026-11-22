@@ -35,10 +35,12 @@ export function RunPage() {
     void queryClient.invalidateQueries({ queryKey: ['batches'] });
   }, onError: (error: Error) => toast.error(error.message) });
   const data = progress.data;
-  const terminalFromProgress = Boolean(progress.terminalStatus) || data?.status === 'completed' || data?.status === 'void';
-  const terminalFromBatch = Boolean(located && located.job.status !== 'running' && located.job.status !== 'queued');
+  const progressTerminalStatus = data?.status === 'completed' || data?.status === 'void' ? data.status : undefined;
+  const batchTerminalStatus = located && located.job.status !== 'running' && located.job.status !== 'queued' ? located.job.status : undefined;
+  const terminalFromProgress = Boolean(progress.terminalStatus || progressTerminalStatus);
+  const terminalFromBatch = Boolean(batchTerminalStatus);
   const running = !terminalFromProgress && !terminalFromBatch && (located?.job.status === 'running' || data?.status === 'running');
-  const displayStatus = progress.terminalStatus?.status ?? located?.job.status ?? (data?.status === 'unknown' ? undefined : data?.status);
+  const displayStatus = progress.terminalStatus?.status ?? progressTerminalStatus ?? batchTerminalStatus ?? located?.job.status ?? (data?.status === 'unknown' ? undefined : data?.status);
   const displayReason = located?.job.reason ?? progress.terminalStatus?.reason ?? data?.reason;
   return <>
     <div className="mb-5 flex items-center justify-between gap-3"><Link to="/" className="inline-flex items-center gap-1.5 text-xs text-muted-foreground transition hover:text-primary"><ArrowLeft className="size-3.5" />返回运行总览</Link>

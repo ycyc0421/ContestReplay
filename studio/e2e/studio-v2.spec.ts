@@ -170,6 +170,8 @@ test('keeps terminal SSE progress against slower GET and stops polling', async (
 
   await page.goto(`/runs/${runA}`);
   await expect(page.getByText('运行已结束')).toBeVisible();
+  await expect(page.getByText('已完赛', { exact: true })).toBeVisible();
+  await expect(page.getByText('运行中', { exact: true })).toHaveCount(0);
   await expect(page.getByText('2 / 2', { exact: true }).first()).toBeVisible();
   // Wait past the delayed GET to ensure it never rolls back the terminal SSE snapshot.
   await page.waitForTimeout(450);
