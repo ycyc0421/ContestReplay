@@ -99,7 +99,7 @@ test('keeps queue controls usable with reduced motion', async ({ page }) => {
 
 test('supports configuration and theme navigation', async ({ page }) => {
   await page.goto('/configs');
-  await expect(page.getByRole('heading', { name: '配置工具' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '配置库' })).toBeVisible();
   await page.getByRole('tab', { name: '新建 Contest' }).click();
   await page.getByLabel('Contest ID').fill('e2e-contest');
   await page.getByRole('button', { name: '继续' }).click();
@@ -125,7 +125,7 @@ test('supports configuration and theme navigation', async ({ page }) => {
 
 test('uses backend capabilities for vendor, provider, max effort and native overrides', async ({ page }) => {
   await page.route('**/api/capabilities', route => route.fulfill({ json: nextCapabilities }));
-  await page.route('**/api/providers', route => route.fulfill({ json: { providers: [{ id: 'demo', label: 'OpenAI 测试', protocol: 'responses', base_url: 'https://api.openai.com/v1', credential_ref: 'a720a849-3c7d-4f35-a4bd-51ee0baf7f15', approved_origin: 'https://api.openai.com' }] } }));
+  await page.route('**/api/providers', route => route.fulfill({ json: { providers: [{ id: 'demo', label: 'OpenAI 测试', protocol: 'responses', base_url: 'https://api.openai.com/v1', credential_ref: 'a720a849-3c7d-4f35-a4bd-51ee0baf7f15', approved_origin: 'https://api.openai.com', backend: 'file', credential_available: true }] } }));
   let saved: any;
   await page.route('**/api/agents', route => { saved = route.request().postDataJSON(); return route.fulfill({ status: 201, json: { path: '/tmp/anthropic.yaml' } }); });
   await page.goto('/configs');
@@ -175,7 +175,7 @@ test('uploads contest materials and authors local judge data', async ({ page }) 
 
 test('creates, edits, rotates and deletes Providers without echoing secrets', async ({ page }) => {
   let providers: any[] = [];
-  const publicProvider = { id: 'demo', label: 'OpenAI 测试', protocol: 'responses', base_url: 'https://api.openai.com/v1', credential_ref: token, approved_origin: 'https://api.openai.com' };
+  const publicProvider = { id: 'demo', label: 'OpenAI 测试', protocol: 'responses', base_url: 'https://api.openai.com/v1', credential_ref: token, approved_origin: 'https://api.openai.com', backend: 'file', credential_available: true };
   await page.route('**/api/providers', async route => {
     if (route.request().method() === 'GET') return route.fulfill({ json: { providers } });
     const input = route.request().postDataJSON();

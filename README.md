@@ -25,8 +25,8 @@ node dist/cli.js studio
 - **运行总览**：查看批次与最近提交摘要、展开任务格、导出已完赛结果、停止单格或整批。
 - **新建批次**：三步编排（选择配置目录 → 精修稀疏矩阵/任务列表 → 核对并启动锁定计划），支持每格重复运行、1–8 路受控并行和启动前 Preflight。
 - **结果分析**：按 Revision 或模型主代表查看多口径排名、检查执行覆盖率，并选择同场运行进行 Ghost Racing 同步竞速回放。
-- **配置工具**：按后端能力创建 Agent Manifest（默认托管保存到 `agents/<id>.toml`）或上传完整 PDF 并制作本地题目表。
-- **Providers**：安全创建、编辑元数据、轮换 API Key 和删除可复用接入配置（秘密只写不读）。
+- **配置库**：检索、编辑、克隆和删除 Agent / Contest，按 effort × speed tier 派生 Agent 变体矩阵；支持多 OJ 赛事预览、题号映射、附件保留和本地判题表编辑。
+- **接入与通知**：安全创建、编辑、轮换和删除模型 Provider、OJ 账号及 Push Target；Cookie、API Key 和 Webhook Secret 均只写不读，并可查看脱敏投递记录。
 - **Run Inspector**：通过 SSE 查看实时赛时、逐题状态和最近活动，拖动时间轴回放可信事件，或增量读取 `stdout` / `stderr`。
 
 关闭浏览器不会停赛；退出 `cr studio` 会中断当前运行，未启动的格子可显式续跑。Studio 只监听本机，不要把它反向代理到公网。
@@ -48,7 +48,7 @@ cr agent validate codex-high.yaml
 
 | Harness | 题面 | 判题 |
 | --- | --- | --- |
-| `codex` 0.170.0 | 完整 PDF 的全部逐页 PNG，原 PDF 与附件在只读目录 | 本地答案、Codeforces |
+| `codex` 0.170.0 | 完整 PDF 的全部逐页 PNG，原 PDF 与附件在只读目录 | 本地答案、Codeforces/Gym、QOJ、VJudge、Hydro |
 | `builtin-responses` | 原生 PDF；不支持附件 | 本地答案 |
 
 Codex 在每场新建的无外网容器中自己跑一个会话，可在临时工作区编译和运行程序。`cr` 生成本场原生配置，通过宿主受限中继调用模型，不挂载用户的 `auth.json`、API Key 或 OJ 凭据。比赛 MCP 提供 `submit`、`status`、`finish`。正常退出或到时可有效完赛；交卷后最多等 120 秒已受理的判定，未确认则作废，不计作 WA。Codex 上游需要支持 Responses SSE 和该 CLI 发出的工具格式。
@@ -58,25 +58,23 @@ Codex 在每场新建的无外网容器中自己跑一个会话，可在临时�
 只用于有权限的历史题 Practice 提交。运行前需要准备四样东西：
 
 1. **完整题面 PDF**：自行放置或上传到场次目录（题号与平台题号不一致时在 `contest.json` 中配置 `problem_map`）。
-2. **已结束的赛事 ID**（`contest`）：用于从 `codeforces.com/api/contest.standings` 导入题号并校验提交归属。
-3. **专用账号名（`handle`）与语言映射（`languages`）**：`languages` 将 Agent 提交时使用的语言标识映射到 Codeforces 内部 `programTypeId`（例如 `{"cpp17":54}`；请按目标赛事实际可用语言 ID 核对）。运行期间不得在别处使用同一账号提交。
-4. **宿主提交通道（二选一，勿写入配置文件）**：
-   - `CR_CODEFORCES_COOKIE`：已登录专用账号的网页会话 Cookie；或
-   - `CR_CODEFORCES_SUBMITTER`：获准使用的提交程序绝对路径，接收 `contest_id problem_index language_id source_file handle` 五个参数，stdout 只返回 `{"submission_id":123}`。
+2. **已结束的赛事 ID**：支持普通 Round 与 Gym；用于拉取题号并校验提交归属。
+3. **OJ 账号与语言映射**：在 Studio「接入与通知 → OJ 账号池」登记 write-only Cookie 或授权 submitter，Contest 只引用账号 ID / pool；`languages` 将 Agent 语言标识映射到 Codeforces `programTypeId`（例如 `{"cpp17":54}`），前端提供常见语言预设。运行期间不得在别处使用同一账号提交。
+4. **题号映射**：在 Contest 向导中先拉取赛事信息，结合 PDF 识别结果核对 `problem_map`。旧版 `CR_CODEFORCES_COOKIE` / `CR_CODEFORCES_SUBMITTER` 宿主通道仍可读取，但新配置推荐使用账号池，不要把秘密写入清单。
 
 ```sh
 cr contest import-codeforces cf4.json --contest 4 --pdf cf4.pdf \
   --handle YOUR_DEDICATED_HANDLE --languages '{"cpp17":54}'
 ```
 
-`cr` 通过 `user.status` 按提交 ID 验证账号、比赛和题号并跟踪 verdict。提交时间以 `cr` 受理为准，不使用远端排队时间，也不复刻官方榜单公式。上传结果不明确时不会自动重交。Codeforces 配置体验重构以及 QOJ / VJudge 适配计划见 [路线思考](docs/roadmap.md)。
+`cr` 通过 `user.status` 按提交 ID 验证账号、比赛和题号并跟踪 verdict。提交时间以 `cr` 受理为准，不使用远端排队时间，也不复刻官方榜单公式。上传结果不明确时不会自动重交。QOJ、VJudge 与 Hydro 使用同一账号池和题号映射模型；评分、故障分类及协议细节见 [路线思考](docs/roadmap.md)。
 
 ## 批处理与结果
 
 `Batch Spec` 支持两种格式：
 
 - **v1（全矩阵）**：`{ "schema_version": 1, "agents": [...], "contests": [...] }`，展开完整笛卡尔积；
-- **v2（稀疏矩阵）**：`{ "schema_version": 2, "cells": [{ "agent": "...", "contest": "...", "repeats": 2 }] }`，只展开显式选中的单元格；`repeats` 可省略（默认 1，最大 20），用于同格重复运行。
+- **v2（稀疏矩阵）**：`{ "schema_version": 2, "cells": [{ "agent": "...", "contest": "...", "repeats": 2 }] }`，只展开显式选中的单元格（最多 1,000 格）；`repeats` 可省略（默认 1，最大 20），用于同格重复运行，展开后最多 5,000 个任务。
 
 路径相对于 Spec 文件。`Plan` 锁定输入摘要、协议和每格镜像；选中格若不兼容会阻止计划生成。执行计划会创建一个批次，格子开跑才分配 Run ID、容器和计时器。单格失败不影响后续格；同一 Studio 进程一次执行一个批次，批次内可选择 1–8 路受控并行，同一 OJ 账号仍互斥。输入变化时重新生成计划，不能用旧计划悄悄换版本。
 

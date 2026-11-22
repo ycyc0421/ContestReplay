@@ -4,6 +4,7 @@ import { Controller, useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useQuery } from '@tanstack/react-query';
 import { z } from 'zod';
+import type { AgentItemResponse } from '@studio-api';
 import { Braces, Eye, FileCode2, KeyRound, RefreshCw, Settings2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { studioApi } from '@/lib/api';
@@ -18,6 +19,7 @@ import { formatLabel, useCapabilities, type ConfigFormat, type HarnessField, typ
 
 const schema = z.object({
   id: z.string().trim().min(1, '请输入 Agent ID').regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/, 'ID 仅支持字母、数字、点、下划线与连字符'),
+  name: z.string().trim().max(120), speedTier: z.enum(['standard', 'fast', 'ultrafast']),
   vendor: z.string(), connection: z.string(), harness: z.string().min(1), model: z.string().trim().min(1, '请输入模型标识'),
   baseUrl: z.string(), keyEnv: z.string(), nativeConfig: z.string(), harnessOptions: z.record(z.string(), z.string()),
 });
@@ -44,24 +46,35 @@ function ConnectionField({ capabilities, value, onChange, register, error }: {
     <p className="border-l border-primary/30 pl-3 text-[11px] leading-5 text-muted-foreground">当前 runner 使用宿主环境变量提供凭据。实现连接库契约后，这里会自动替换为可复用连接，不再要求理解变量名。</p></div>;
 }
 
-function AgentManifestForm({ capabilities }: { capabilities: StudioCapabilities }) {
+type AgentDocument = {
+  id?: string; name?: string; vendor?: string; provider?: string; connection?: string; model?: string; model_family_id?: string; speed_tier?: 'standard' | 'fast' | 'ultrafast';
+  harness?: { kind?: string; options?: Record<string, string>; env?: Record<string, string>; native_config?: { content?: string } };
+};
+function AgentManifestForm({ capabilities, initial, onSaved }: { capabilities: StudioCapabilities; initial?: AgentItemResponse; onSaved?: () => void }) {
   const [saved, setSaved] = useState<string>();
   const navigate = useNavigate();
   const intent = useRef<'save' | 'batch'>('save');
   const [preview, setPreview] = useState<{ content: string; format: ConfigFormat; revision?: string }>();
-  const initialHarness = capabilities.harnesses[0]!;
+  const source = initial?.document as AgentDocument | undefined;
+  const initialHarness = capabilities.harnesses.find(item => item.id === source?.harness?.kind) ?? capabilities.harnesses[0]!;
   const { register, control, handleSubmit, watch, setValue, setError, formState: { errors, isSubmitting } } = useForm<Values>({ resolver: zodResolver(schema), defaultValues: {
-    id: '', vendor: capabilities.features.agent_vendor ? 'openai' : 'unspecified',
-    connection: 'default', harness: initialHarness.id, model: '',
-    baseUrl: 'https://api.openai.com/v1', keyEnv: 'OPENAI_API_KEY', nativeConfig: '', harnessOptions: defaultsFor(initialHarness?.fields ?? []),
+    id: source?.id ?? '', name: source?.name ?? '', speedTier: source?.speed_tier ?? 'standard',
+    vendor: source?.vendor ?? (capabilities.features.agent_vendor ? 'openai' : 'unspecified'),
+    connection: source?.provider ?? source?.connection ?? 'default', harness: initialHarness.id, model: source?.model ?? '',
+    baseUrl: 'https://api.openai.com/v1', keyEnv: 'OPENAI_API_KEY', nativeConfig: source?.harness?.native_config?.content ?? '',
+    harnessOptions: { ...defaultsFor(initialHarness.fields), ...source?.harness?.options },
   } });
   const harnessId = watch('harness');
   const harness = capabilities?.harnesses.find(item => item.id === harnessId) ?? initialHarness;
   const values = watch();
   const document = useMemo(() => capabilities ? ({
-    kind: 'contestreplay.dev/agent', schema_version: 1, id: values.id, ...(capabilities.features.agent_vendor ? { vendor: values.vendor } : {}),
+    kind: 'contestreplay.dev/agent', schema_version: 1, id: values.id, ...(values.name.trim() ? { name: values.name.trim() } : {}),
+    ...(values.speedTier !== 'standard' ? { speed_tier: values.speedTier } : {}),
+    ...(capabilities.features.agent_vendor ? { vendor: values.vendor } : {}),
+    ...(source?.model_family_id ? { model_family_id: source.model_family_id } : {}),
     model: values.model, ...(capabilities.features.connections ? { provider: values.connection } : {}),
     harness: { kind: values.harness, version: harness?.version, options: Object.fromEntries(Object.entries(values.harnessOptions).filter(([, value]) => value && value !== 'default')),
+      ...(source?.harness?.env ? { env: source.harness.env } : {}),
       ...(values.nativeConfig.trim() ? { native_config: { format: harness?.native_format, content: values.nativeConfig } } : {}) },
   }) : {}, [capabilities, values, harness]);
   if (!harness) return <Note>未找到所选 Harness 的能力描述。</Note>;
@@ -72,14 +85,15 @@ function AgentManifestForm({ capabilities }: { capabilities: StudioCapabilities 
   const submit = handleSubmit(async form => {
     try {
       if (capabilities.features.connections && form.connection === 'default') { setError('connection', { message: '请选择已保存的 Provider' }); return; }
-      const result = capabilities.features.agent_manifests ? await studioApi.saveAgentDocument(document)
+      const result = initial ? await studioApi.updateAgent(initial.path, initial.format, document)
+        : capabilities.features.agent_manifests ? await studioApi.saveAgentDocument(document)
         : await studioApi.saveAgent(`${form.id}.toml`, { id: form.id, harness: form.harness, api: 'responses', model: form.model,
           base_url: form.baseUrl || undefined, api_key_env: form.keyEnv || undefined,
           ...(form.harnessOptions.reasoning_effort && form.harnessOptions.reasoning_effort !== 'default' ? { reasoning_effort: form.harnessOptions.reasoning_effort } : {}) });
       if (intent.current === 'batch') {
         sessionStorage.setItem('cr.batch.pending', JSON.stringify({ kind: 'agent', path: result.path }));
         toast.success('Agent 已保存，正在加入批次'); void navigate({ to: '/batches/new' });
-      } else { setSaved(result.path); toast.success('Agent 配置已保存'); }
+      } else { setSaved(result.path); toast.success(initial ? 'Agent 配置已更新' : 'Agent 配置已保存'); onSaved?.(); }
     } catch (error) { toast.error('无法保存 Agent', { description: (error as Error).message }); }
   });
   const renderHarnessField = (field: HarnessField) => <Field key={field.id} label={field.label} hint={field.required ? undefined : '可选'}>
@@ -90,9 +104,10 @@ function AgentManifestForm({ capabilities }: { capabilities: StudioCapabilities 
   </Field>;
   return <form onSubmit={submit} className="space-y-8">
     <section><SectionIndex index="01" title="身份与模型" description="Agent ID 标识具体配置；厂商仅用于筛选与比较，不改变 API 行为。" />
-      <div className="grid gap-5 sm:grid-cols-2"><Field label="Agent ID" error={errors.id?.message}><Input placeholder="codex-gpt53-high" {...register('id')} /></Field>
-        <Field label="模型厂商" hint={capabilities.features.agent_vendor ? '研究元数据' : '等待后端契约'}><Controller control={control} name="vendor" render={({ field }) => <Select value={field.value} onValueChange={field.onChange} disabled={!capabilities.features.agent_vendor}>
-          {!capabilities.features.agent_vendor && <SelectItem value="unspecified">当前后端暂不支持</SelectItem>}{vendors.map(([value, label]) => <SelectItem key={value} value={value}>{label}</SelectItem>)}</Select>} /></Field></div>
+      <div className="grid gap-5 sm:grid-cols-2"><Field label="Agent ID" error={errors.id?.message}><Input placeholder="codex-gpt53-high" disabled={!!initial} {...register('id')} /></Field>
+        <Field label="展示名称" hint="可选，不改变 Revision"><Input placeholder="GPT · High · Fast" {...register('name')} /></Field></div>
+      <div className="mt-5 grid gap-5 sm:grid-cols-2"><Field label="模型厂商" hint={capabilities.features.agent_vendor ? '研究元数据' : '等待后端契约'}><Controller control={control} name="vendor" render={({ field }) => <Select value={field.value} onValueChange={field.onChange} disabled={!capabilities.features.agent_vendor}>
+          {!capabilities.features.agent_vendor && <SelectItem value="unspecified">当前后端暂不支持</SelectItem>}{vendors.map(([value, label]) => <SelectItem key={value} value={value}>{label}</SelectItem>)}</Select>} /></Field><Field label="速度档位" hint="计入成绩披露与 Revision"><Controller control={control} name="speedTier" render={({ field }) => <Select value={field.value} onValueChange={field.onChange}><SelectItem value="standard">Standard</SelectItem><SelectItem value="fast">Fast</SelectItem><SelectItem value="ultrafast">Ultrafast</SelectItem></Select>} /></Field></div>
       <div className="mt-5"><Field label="模型标识" hint="上游精确 ID" error={errors.model?.message}><Input className="font-mono text-xs" placeholder="model-id-or-snapshot" {...register('model')} /></Field></div>
     </section><Separator />
     <section><SectionIndex index="02" title="Provider" description="Provider 描述实际上游协议和凭据；模型厂商与 API 提供方可以不同。" />
@@ -114,14 +129,14 @@ function AgentManifestForm({ capabilities }: { capabilities: StudioCapabilities 
           : <Note>Effective Config 需要由 runner 合并并脱敏，前端不会伪造最终配置。</Note>}</TabsContent></div>
       </Tabs>
     </section>
-    <div className="flex flex-wrap gap-2"><Button type="submit" variant="secondary" loading={isSubmitting} onClick={() => { intent.current = 'save'; }}>仅保存</Button>
-      <Button type="submit" loading={isSubmitting} onClick={() => { intent.current = 'batch'; }}>保存并加入批次</Button></div>{saved && <SavedPath path={saved} />}
+    <div className="flex flex-wrap gap-2"><Button type="submit" variant="secondary" loading={isSubmitting} onClick={() => { intent.current = 'save'; }}>{initial ? '保存修改' : '仅保存'}</Button>
+      <Button type="submit" loading={isSubmitting} onClick={() => { intent.current = 'batch'; }}>{initial ? '保存并加入新批次' : '保存并加入批次'}</Button></div>{saved && <SavedPath path={saved} />}
   </form>;
 }
 
-export function AgentForm() {
+export function AgentForm({ initial, onSaved }: { initial?: AgentItemResponse; onSaved?: () => void }) {
   const capabilities = useCapabilities();
   if (capabilities.isLoading) return <div className="skeleton h-[560px] border bg-muted/30" />;
   if (capabilities.isError || !capabilities.data) return <Note>无法读取 Harness 能力描述：{(capabilities.error as Error)?.message ?? '未知错误'}</Note>;
-  return <AgentManifestForm capabilities={capabilities.data} />;
+  return <AgentManifestForm capabilities={capabilities.data} initial={initial} onSaved={onSaved} />;
 }
