@@ -31,6 +31,7 @@ import {
   readWorkspaceFileNoFollow,
   resolveRealPathOrAncestor,
   resolveStudioContestFromParsed,
+  resolveStudioPreviewPdf,
   updateContestDocument,
   verifyManagedMaterialFile,
   verifyManagedMaterialsRoot,
@@ -116,6 +117,8 @@ const contestPreviewRequest = z.strictObject({
   account_id: ojAccountId.optional(),
   local_problems: z.array(z.string().trim().min(1).max(128)).max(100).optional(),
   pdf_path: z.string().min(1).max(4096).optional(),
+  manifest_path: z.string().min(1).max(4096).optional(),
+  manifest_contest_id: connectionId.optional(),
 });
 
 const preflightRequest = z.strictObject({
@@ -1315,17 +1318,15 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
     let pdfInfo: Awaited<ReturnType<typeof inspectStudioPdfBytes>> | undefined;
     let displayPdfPath: string | undefined;
     if (input.pdf_path) {
-      let pdfBytes: Buffer;
-      if (input.pdf_path.startsWith('managed/')) {
-        const managed = await verifyManagedMaterialFile(root, input.pdf_path, undefined, 'pdf_path');
-        pdfBytes = await readWorkspaceFileNoFollow(managed.fullPath, 128 * 1024 * 1024, 'pdf_path');
-        displayPdfPath = input.pdf_path;
-      } else {
-        const pdfFile = await existingWorkspaceFile(base, input.pdf_path, 'pdf_path', root);
-        pdfBytes = await readWorkspaceFileNoFollow(pdfFile, 128 * 1024 * 1024, 'pdf_path');
-        displayPdfPath = relative(await realpath(base), pdfFile).split(sep).join('/');
-      }
-      pdfInfo = await inspectStudioPdfBytes(pdfBytes, displayPdfPath!);
+      const resolvedPdf = await resolveStudioPreviewPdf({
+        root,
+        base,
+        pdfPath: input.pdf_path,
+        manifestPath: input.manifest_path,
+        contestId: input.manifest_contest_id,
+      });
+      displayPdfPath = resolvedPdf.displayPath;
+      pdfInfo = await inspectStudioPdfBytes(resolvedPdf.bytes, displayPdfPath);
     }
     const localProblems = (input.local_problems ?? pdfInfo?.problem_ids ?? [])
       .map(problem => redactSecretText(problem, cookieSecrets));

@@ -2,6 +2,8 @@
 
 本文记录 ContestReplay 在完成 CLI MVP、配置契约与本机 Studio 重写后的产品路线思考、已知问题诊断与待讨论的设计口径。已实现契约见 [Studio 配置契约](studio-contract-gaps.md)，当前用法见 [README](../README.md)。
 
+> **实施状态更新**：下文第 1、3、4、5、6、7 节的核心本机能力已落地：Agent 展示名与速度档位、SSE 实时进度、增量日志、时间轴回放、Ghost Racing、多口径排名、CF/Gym + QOJ + VJudge + Hydro、OJ 账号池、配置编辑/克隆/变体、Preflight、受控并行、SQLite 覆盖率索引、自动化 CLI 与窄权限 MCP。Studio 结果分析、配置库和 Push Target 管理也已接入。剩余讨论主要涉及公开榜单默认展示口径、真实 OJ 账号验收与更大规模的样本积累。
+
 ---
 
 ## 1. Agent 身份与展示名（`id` 与 `name` 分离）

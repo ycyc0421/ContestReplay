@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, Link } from '@tanstack/react-router';
-import { ArrowLeft, ArrowRight, Check, ChevronDown, Grid3X3, List, Plus, RefreshCw, Search, SlidersHorizontal, X } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, ArrowRight, Check, ChevronDown, Grid3X3, List, Plus, RefreshCw, Search, ShieldCheck, SlidersHorizontal, X } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import { toast } from 'sonner';
-import type { CatalogAgent, CatalogContest, PlanResponse } from '@studio-api';
+import type { CatalogAgent, CatalogContest, PlanResponse, PreflightReport } from '@studio-api';
 import { studioApi } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
@@ -36,8 +36,8 @@ function FilterMenu({ count, onReset, children }: { count: number; onReset: () =
 function AgentList({ items, selected, onToggle }: { items: CatalogAgent[]; selected: Set<string>; onToggle: (path: string) => void }) {
   if (!items.length) return <p className="px-4 py-12 text-center text-xs text-muted-foreground">没有匹配的 Agent</p>;
   return <div className="divide-y">{items.map(agent => <button type="button" role="checkbox" aria-checked={selected.has(agent.path)} key={agent.path} disabled={!agent.valid} onClick={() => onToggle(agent.path)} className="flex w-full items-start gap-3 px-4 py-3.5 text-left transition-colors hover:bg-muted/45 disabled:cursor-not-allowed disabled:opacity-55">
-    <Mark selected={selected.has(agent.path)} /><div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-2"><span className="truncate text-sm font-medium">{agent.id}</span><span className="shrink-0 font-mono text-[9px] text-muted-foreground">{agent.harness}</span></div>
-      <div className="mt-1 truncate font-mono text-[10px] text-muted-foreground">{agent.model}</div><div className="mt-1.5 flex flex-wrap gap-2 text-[10px] text-muted-foreground"><span>{agent.vendor ?? '未标厂商'}</span>{!agent.provider_available && <span className="text-warning">Provider 未就绪</span>}{!agent.valid && <span className="text-danger" title={agent.issues.join('\n')}>配置无效</span>}</div></div></button>)}</div>;
+    <Mark selected={selected.has(agent.path)} /><div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-2"><span className="truncate text-sm font-medium">{agent.name ?? agent.id}</span><span className="shrink-0 font-mono text-[9px] text-muted-foreground">{agent.harness}</span></div>
+      <div className="mt-1 truncate font-mono text-[10px] text-muted-foreground">{agent.id} · {agent.model}</div><div className="mt-1.5 flex flex-wrap gap-2 text-[10px] text-muted-foreground"><span>{agent.vendor ?? '未标厂商'}</span>{!agent.provider_available && <span className="text-warning">Provider 未就绪</span>}{!agent.valid && <span className="text-danger" title={agent.issues.join('\n')}>配置无效</span>}</div></div></button>)}</div>;
 }
 function ContestList({ items, selected, onToggle }: { items: CatalogContest[]; selected: Set<string>; onToggle: (path: string) => void }) {
   if (!items.length) return <p className="px-4 py-12 text-center text-xs text-muted-foreground">没有匹配的 Contest</p>;
@@ -61,6 +61,9 @@ export function NewBatchPage() {
   const [agentsOnlySelected, setAgentsOnlySelected] = useState(false);
   const [contestsOnlySelected, setContestsOnlySelected] = useState(false);
   const [plan, setPlan] = useState<PlanResponse | null>(null);
+  const [repeats, setRepeats] = useState(1);
+  const [concurrency, setConcurrency] = useState(1);
+  const [preflight, setPreflight] = useState<PreflightReport | null>(null);
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const agentsQuery = useQuery({ queryKey: ['catalog', 'agents'], queryFn: studioApi.catalogAgents, refetchOnMount: 'always' });
@@ -74,6 +77,30 @@ export function NewBatchPage() {
   const contests = contestsQuery.data?.contests ?? [];
   const selectedAgentEntries = agents.filter(agent => selectedAgents.has(agent.path));
   const selectedContestEntries = contests.filter(contest => selectedContests.has(contest.path));
+  useEffect(() => {
+    if (!agentsQuery.data) return;
+    const validAgents = new Set(agentsQuery.data.agents.filter(agent => agent.valid).map(agent => agent.path));
+    setSelectedAgents(previous => {
+      const next = new Set([...previous].filter(path => validAgents.has(path)));
+      return next.size === previous.size ? previous : next;
+    });
+    setSelectedCells(previous => {
+      const next = new Set([...previous].filter(key => validAgents.has(parseCell(key)[0])));
+      return next.size === previous.size ? previous : next;
+    });
+  }, [agentsQuery.data]);
+  useEffect(() => {
+    if (!contestsQuery.data) return;
+    const validContests = new Set(contestsQuery.data.contests.filter(contest => contest.valid).map(contest => contest.path));
+    setSelectedContests(previous => {
+      const next = new Set([...previous].filter(path => validContests.has(path)));
+      return next.size === previous.size ? previous : next;
+    });
+    setSelectedCells(previous => {
+      const next = new Set([...previous].filter(key => validContests.has(parseCell(key)[1])));
+      return next.size === previous.size ? previous : next;
+    });
+  }, [contestsQuery.data]);
   useEffect(() => { sessionStorage.setItem(draftKey, JSON.stringify({ agents: [...selectedAgents], contests: [...selectedContests], cells: [...selectedCells] })); }, [selectedAgents, selectedContests, selectedCells]);
   useEffect(() => {
     if (!matrix.data) return;
@@ -87,14 +114,33 @@ export function NewBatchPage() {
     if (!raw) return;
     try {
       const pending = JSON.parse(raw) as { kind: 'agent' | 'contest'; path: string };
-      if ((pending.kind === 'agent' && !agentsQuery.data) || (pending.kind === 'contest' && !contestsQuery.data)) return;
+      const targetQuery = pending.kind === 'agent' ? agentsQuery : contestsQuery;
+      // Always wait for any in-flight catalog refetch and only consume after a successful response.
+      if (targetQuery.isFetching || targetQuery.isError || !targetQuery.data) return;
       const entries = pending.kind === 'agent' ? agents : contests;
       const entry = entries.find(item => pending.path === item.path || pending.path.endsWith(`/${item.path}`));
-      if (entry && 'harness' in entry) { setSelectedAgents(previous => new Set(previous).add(entry.path)); addAgentCells(entry.path); }
-      else if (entry) { setSelectedContests(previous => new Set(previous).add(entry.path)); addContestCells(entry.path); }
+      if (entry?.valid) {
+        if ('harness' in entry) {
+          const validContests = contestsQuery.data ? new Set(contests.filter(item => item.valid).map(item => item.path)) : undefined;
+          setSelectedAgents(previous => new Set(previous).add(entry.path));
+          setSelectedCells(previous => {
+            const next = new Set(previous);
+            for (const contest of selectedContests) if (!validContests || validContests.has(contest)) next.add(cellKey(entry.path, contest));
+            return next;
+          });
+        } else {
+          const validAgents = agentsQuery.data ? new Set(agents.filter(item => item.valid).map(item => item.path)) : undefined;
+          setSelectedContests(previous => new Set(previous).add(entry.path));
+          setSelectedCells(previous => {
+            const next = new Set(previous);
+            for (const agent of selectedAgents) if (!validAgents || validAgents.has(agent)) next.add(cellKey(agent, entry.path));
+            return next;
+          });
+        }
+      }
       setPlan(null); setStage('catalog'); sessionStorage.removeItem('cr.batch.pending');
     } catch { sessionStorage.removeItem('cr.batch.pending'); }
-  }, [agentsQuery.data, contestsQuery.data]);
+  }, [agentsQuery.data, contestsQuery.data, agentsQuery.isFetching, contestsQuery.isFetching, agentsQuery.isError, contestsQuery.isError]);
   const invalidate = () => { setPlan(null); if (stage === 'review') setStage('matrix'); };
   const toggleAgent = (path: string) => {
     invalidate();
@@ -126,13 +172,19 @@ export function NewBatchPage() {
     invalidate(); setSelectedCells(previous => { const next = new Set(previous); for (const key of keys) if (all) next.delete(key); else next.add(key); return next; });
   };
   const agentFilterCount = Number(vendor !== 'all') + Number(harness !== 'all');
-  const filteredAgents = agents.filter(agent => (!agentSearch || `${agent.id} ${agent.model} ${agent.vendor ?? ''}`.toLowerCase().includes(agentSearch.toLowerCase())) &&
+  const filteredAgents = agents.filter(agent => (!agentSearch || `${agent.id} ${agent.name ?? ''} ${agent.model} ${agent.vendor ?? ''}`.toLowerCase().includes(agentSearch.toLowerCase())) &&
     (vendor === 'all' || agent.vendor === vendor) && (harness === 'all' || agent.harness === harness) && (!agentsOnlySelected || selectedAgents.has(agent.path)));
   const filteredContests = contests.filter(contest => (!contestSearch || `${contest.id} ${contest.title}`.toLowerCase().includes(contestSearch.toLowerCase())) &&
     (judge === 'all' || contest.judge_kind === judge) && (!contestsOnlySelected || selectedContests.has(contest.path)));
-  const preview = useMutation({ mutationFn: () => studioApi.planCells([...selectedCells].map(parseCell).map(([agent, contest]) => ({ agent, contest }))),
-    onSuccess: result => { setPlan(result); setStage('review'); }, onError: (error: Error) => toast.error('计划生成失败', { description: error.message }) });
-  const start = useMutation({ mutationFn: (token: string) => studioApi.startBatch(token), onSuccess: async result => {
+  const selectedPairs = useMemo(() => [...selectedCells].map(parseCell).map(([agent, contest]) => ({ agent, contest })), [selectedCells]);
+  const preview = useMutation({ mutationFn: () => studioApi.planCells(selectedPairs.map(cell => ({ ...cell, ...(repeats > 1 ? { repeats } : {}) }))),
+    onSuccess: result => { setPlan(result); setPreflight(null); setStage('review'); }, onError: (error: Error) => toast.error('计划生成失败', { description: error.message }) });
+  const preflightCheck = useMutation({ mutationFn: () => studioApi.preflight(selectedPairs), onSuccess: setPreflight,
+    onError: (error: Error) => toast.error('Preflight 执行失败', { description: error.message }) });
+  const start = useMutation({ mutationFn: () => {
+    if (!plan) return Promise.reject(new Error('请先生成执行计划'));
+    return studioApi.startBatch(plan.token, concurrency);
+  }, onSuccess: async result => {
     sessionStorage.removeItem(draftKey); toast.success('批次已启动', { description: `Batch ${result.id.slice(0, 8)}` });
     await queryClient.invalidateQueries({ queryKey: ['batches'] }); void navigate({ to: '/' });
   }, onError: (error: Error) => toast.error('批次启动失败', { description: error.message }) });
@@ -140,7 +192,8 @@ export function NewBatchPage() {
   const ready = selectedCells.size > 0 && [...selectedCells].every(key => compatibility.get(key)?.compatible);
   const compatibleKeys = [...compatibility].filter(([, cell]) => cell.compatible).map(([key]) => key);
   const allSelected = compatibleKeys.length > 0 && compatibleKeys.every(key => selectedCells.has(key));
-  const estimatedMs = [...selectedCells].reduce((total, key) => total + (contests.find(contest => contest.path === parseCell(key)[1])?.time_limit_ms ?? 0), 0);
+  const estimatedMs = [...selectedCells].reduce((total, key) => total + (contests.find(contest => contest.path === parseCell(key)[1])?.time_limit_ms ?? 0), 0) * repeats;
+  const totalJobs = selectedCells.size * repeats;
   const stageIndex = stages.findIndex(([id]) => id === stage);
   return <>
     <Link to="/" className="mb-5 inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-primary"><ArrowLeft className="size-3.5" />返回运行总览</Link>
@@ -161,18 +214,24 @@ export function NewBatchPage() {
         </div>
         <div className="mt-3 flex justify-between text-xs text-muted-foreground"><span>无效配置会保留在目录中并说明原因。</span><Link to="/configs" className="inline-flex items-center gap-1 text-primary hover:underline"><Plus className="size-3.5" />创建新配置</Link></div>
       </>}
-      {stage === 'matrix' && <Card className="overflow-hidden"><div className="flex flex-col gap-3 border-b px-4 py-4 sm:flex-row sm:items-center sm:justify-between"><div><div className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">Execution matrix</div><h2 className="mt-1 text-sm font-semibold">{selectedAgents.size} 个 Agent × {selectedContests.size} 场 Contest</h2><p className="mt-1 text-[11px] text-muted-foreground">点击单元格精修；点击标题切换整行或整列。</p></div><Tabs value={view} onValueChange={value => setView(value as 'matrix' | 'list')}><TabsList><TabsTrigger value="matrix"><Grid3X3 className="size-3.5" />矩阵</TabsTrigger><TabsTrigger value="list"><List className="size-3.5" />任务列表</TabsTrigger></TabsList></Tabs></div>
+      {stage === 'matrix' && <Card className="overflow-hidden"><div className="flex flex-col gap-3 border-b px-4 py-4 sm:flex-row sm:items-center sm:justify-between"><div><div className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">Execution matrix</div><h2 className="mt-1 text-sm font-semibold">{selectedAgents.size} 个 Agent × {selectedContests.size} 场 Contest</h2><p className="mt-1 text-[11px] text-muted-foreground">点击单元格精修；点击标题切换整行或整列。</p></div><div className="flex flex-wrap items-end gap-3"><Field label="每格重复" hint="Pass@k" className="w-36"><Select value={String(repeats)} onValueChange={value => { setRepeats(Number(value)); setPlan(null); setPreflight(null); }}>{[1, 2, 3, 5, 10].map(value => <SelectItem key={value} value={String(value)}>{value} 次</SelectItem>)}</Select></Field><Tabs value={view} onValueChange={value => setView(value as 'matrix' | 'list')}><TabsList><TabsTrigger value="matrix"><Grid3X3 className="size-3.5" />矩阵</TabsTrigger><TabsTrigger value="list"><List className="size-3.5" />任务列表</TabsTrigger></TabsList></Tabs></div></div>
         {!selectedCells.size && !compatibleKeys.length && matrix.isLoading ? <div className="p-12 text-center text-xs text-muted-foreground">正在校验矩阵兼容性…</div> : view === 'matrix' ? <div className="overflow-auto p-4 scrollbar-thin sm:p-6"><table className="mx-auto w-auto min-w-[560px] border-collapse text-left"><thead><tr><th className="sticky left-0 z-10 w-52 border-b bg-card px-3 py-3"><button className="text-xs font-medium text-muted-foreground hover:text-primary" onClick={() => { invalidate(); setSelectedCells(allSelected ? new Set() : new Set(compatibleKeys)); }}>{allSelected ? '清空全部' : '全选兼容组合'}</button></th>{selectedContestEntries.map(contest => <th key={contest.path} className="min-w-36 border-b px-3 py-3 text-center"><button onClick={() => toggleColumn(contest.path)} title="切换整列"><span className="block truncate text-xs font-medium">{contest.title}</span><span className="mt-1 block font-mono text-[9px] font-normal text-muted-foreground">v{contest.data_version}</span></button></th>)}</tr></thead>
-          <tbody>{selectedAgentEntries.map(agent => <tr key={agent.path}><th className="sticky left-0 z-10 border-b bg-card px-3 py-3"><button onClick={() => toggleRow(agent.path)} className="text-left" title="切换整行"><span className="block truncate text-xs font-medium">{agent.id}</span><span className="mt-1 block font-mono text-[9px] font-normal text-muted-foreground">{agent.harness}</span></button></th>{selectedContestEntries.map(contest => { const key = cellKey(agent.path, contest.path); const state = compatibility.get(key); const selected = selectedCells.has(key); const disabled = matrix.isLoading || state?.compatible === false;
+          <tbody>{selectedAgentEntries.map(agent => <tr key={agent.path}><th className="sticky left-0 z-10 border-b bg-card px-3 py-3"><button onClick={() => toggleRow(agent.path)} className="text-left" title="切换整行"><span className="block truncate text-xs font-medium">{agent.name ?? agent.id}</span><span className="mt-1 block font-mono text-[9px] font-normal text-muted-foreground">{agent.harness}</span></button></th>{selectedContestEntries.map(contest => { const key = cellKey(agent.path, contest.path); const state = compatibility.get(key); const selected = selectedCells.has(key); const disabled = matrix.isLoading || state?.compatible === false;
             return <td key={contest.path} className="border-b p-3 text-center"><button disabled={disabled} onClick={() => toggleCell(agent.path, contest.path)} title={state?.reason ?? (selected ? '取消任务' : '选择任务')} aria-label={`${agent.id} × ${contest.title}`} aria-pressed={selected} className={cn('inline-flex size-9 items-center justify-center border transition-[background-color,border-color,transform] active:scale-95', selected ? 'border-primary bg-primary text-primary-foreground' : 'bg-card text-muted-foreground hover:border-primary/50 hover:bg-muted', disabled && 'cursor-not-allowed border-dashed opacity-30')}>{state?.compatible === false ? <X className="size-4" /> : selected ? <Check className="size-4" /> : <Plus className="size-3.5" />}</button></td>; })}</tr>)}</tbody></table></div>
-          : <div className="divide-y">{[...selectedCells].map((key, index) => { const [agentPath, contestPath] = parseCell(key); const agent = agents.find(item => item.path === agentPath); const contest = contests.find(item => item.path === contestPath); return <div key={key} className="flex items-center gap-3 px-4 py-3"><span className="w-7 font-mono text-[10px] text-muted-foreground">{String(index + 1).padStart(2, '0')}</span><div className="min-w-0 flex-1"><div className="truncate text-sm">{agent?.id ?? agentPath} <span className="mx-1 text-muted-foreground">×</span> {contest?.title ?? contestPath}</div><div className="mt-1 font-mono text-[10px] text-muted-foreground">{agent?.harness} · data v{contest?.data_version}</div></div><Button variant="ghost" size="icon" aria-label={`移除 ${agent?.id} × ${contest?.title}`} onClick={() => toggleCell(agentPath, contestPath)}><X className="size-4" /></Button></div>; })}</div>}
+          : <div className="divide-y">{[...selectedCells].map((key, index) => { const [agentPath, contestPath] = parseCell(key); const agent = agents.find(item => item.path === agentPath); const contest = contests.find(item => item.path === contestPath); return <div key={key} className="flex items-center gap-3 px-4 py-3"><span className="w-7 font-mono text-[10px] text-muted-foreground">{String(index + 1).padStart(2, '0')}</span><div className="min-w-0 flex-1"><div className="truncate text-sm">{agent?.name ?? agent?.id ?? agentPath} <span className="mx-1 text-muted-foreground">×</span> {contest?.title ?? contestPath}</div><div className="mt-1 font-mono text-[10px] text-muted-foreground">{agent?.harness} · data v{contest?.data_version}</div></div><Button variant="ghost" size="icon" aria-label={`移除 ${agent?.id} × ${contest?.title}`} onClick={() => toggleCell(agentPath, contestPath)}><X className="size-4" /></Button></div>; })}</div>}
         {matrix.isError && <p className="border-t p-4 text-xs text-danger">{(matrix.error as Error).message}</p>}
       </Card>}
-      {stage === 'review' && plan && <Card className="overflow-hidden"><div className="border-b px-5 py-4"><div className="font-mono text-[9px] uppercase tracking-wider text-primary">Revision locked</div><h2 className="mt-1 text-sm font-semibold">执行计划 · {plan.jobs.length} 个任务</h2><p className="mt-1 text-xs text-muted-foreground">串行执行 · 理论最长队列时间约 {(estimatedMs / 3_600_000).toFixed(1)} 小时</p></div>
-        <ScrollArea className="max-h-[520px]"><table className="w-full min-w-[560px] text-left text-sm"><thead className="bg-muted/45 font-mono text-[9px] text-muted-foreground"><tr><th className="px-5 py-3">Lane</th><th>Agent / revision</th><th>Contest</th><th className="px-5 text-right">Data</th></tr></thead><tbody className="divide-y">{plan.jobs.map((job, index) => <tr key={`${job.agent_revision}-${job.contest_id}-${index}`}><td className="px-5 py-3.5 font-mono text-xs text-primary">{String(index + 1).padStart(2, '0')}</td><td className="py-3.5"><div>{job.agent_id}</div><div className="mt-1 font-mono text-[9px] text-muted-foreground">{job.agent_revision.slice(0, 12)}</div></td><td>{job.contest_id}</td><td className="px-5 text-right font-mono text-xs text-muted-foreground">v{job.data_version}</td></tr>)}</tbody></table></ScrollArea></Card>}
+      {stage === 'review' && plan && <Card className="overflow-hidden"><div className="border-b px-5 py-4"><div className="font-mono text-[9px] uppercase tracking-wider text-primary">Revision locked</div><h2 className="mt-1 text-sm font-semibold">执行计划 · {plan.jobs.length} 个任务</h2><p className="mt-1 text-xs text-muted-foreground">{concurrency > 1 ? `${concurrency} 路受控并行` : '串行执行'} · 理论最长队列时间约 {(estimatedMs / concurrency / 3_600_000).toFixed(1)} 小时</p><div className="mt-4 flex flex-wrap items-end gap-3 border-t pt-4"><Field label="执行并发" hint="1–8" className="w-44"><Select value={String(concurrency)} onValueChange={value => setConcurrency(Number(value))}>{[1, 2, 4, 8].map(value => <SelectItem key={value} value={String(value)}>{value === 1 ? '1 · 串行' : `${value} 路并行`}</SelectItem>)}</Select></Field><div className="pb-2 text-[11px] leading-5 text-muted-foreground">同一 OJ 账号仍互斥；并行度只控制本批次的 worker 数。</div><Button type="button" variant="secondary" size="sm" loading={preflightCheck.isPending} onClick={() => preflightCheck.mutate()}><ShieldCheck className="size-3.5" />运行 Preflight</Button></div></div>
+        <ScrollArea className="max-h-[520px]"><table className="w-full min-w-[560px] text-left text-sm"><thead className="bg-muted/45 font-mono text-[9px] text-muted-foreground"><tr><th className="px-5 py-3">Lane</th><th>Agent / revision</th><th>Contest</th><th className="px-5 text-right">Data</th></tr></thead><tbody className="divide-y">{plan.jobs.map((job, index) => <tr key={`${job.agent_revision}-${job.contest_id}-${index}`}><td className="px-5 py-3.5 font-mono text-xs text-primary">{String(index + 1).padStart(2, '0')}</td><td className="py-3.5"><div>{job.agent_name ?? job.agent_id}</div><div className="mt-1 font-mono text-[9px] text-muted-foreground">{job.agent_revision.slice(0, 12)}</div></td><td>{job.contest_id}</td><td className="px-5 text-right font-mono text-xs text-muted-foreground">v{job.data_version}</td></tr>)}</tbody></table></ScrollArea></Card>}
+      {stage === 'review' && preflight && <Card className="mt-4 overflow-hidden"><div className="flex items-center gap-3 border-b px-4 py-3">{preflight.ok ? <ShieldCheck className="size-4 text-primary" /> : <AlertTriangle className="size-4 text-warning" />}<div><h2 className="text-sm font-semibold">{preflight.ok ? 'Preflight 全部通过' : 'Preflight 发现需要处理的问题'}</h2><p className="mt-1 text-[11px] text-muted-foreground">{preflight.agents.length} Agents · {preflight.contests.length} Contests · {preflight.images.length} Images · {preflight.compatibility.length} Cells</p></div></div><div className="grid gap-px bg-border sm:grid-cols-2 xl:grid-cols-4">{[
+        ...preflight.agents.map(item => ({ key: `agent-${item.path}`, title: item.id ?? item.path, ok: item.ok && item.credential_ok, detail: item.credential_ok ? '凭据就绪' : '凭据不可用', issues: item.issues })),
+        ...preflight.contests.map(item => ({ key: `contest-${item.path}`, title: item.id ?? item.path, ok: item.ok && item.oj_ready, detail: `${item.judge_kind ?? 'judge'} · ${item.oj_ready ? 'OJ 就绪' : 'OJ 未就绪'}`, issues: [...new Set([...item.issues, ...(item.pdf?.issues ?? [])])] })),
+        ...preflight.images.map(item => ({ key: `image-${item.image}`, title: item.image, ok: item.ok, detail: item.harness, issues: item.error ? [item.error] : [] })),
+        ...preflight.compatibility.filter(item => !item.compatible).map(item => ({ key: `cell-${item.agent}-${item.contest}`, title: '不兼容组合', ok: false, detail: `${item.agent} × ${item.contest}`, issues: item.reason ? [item.reason] : [] })),
+      ].map(item => <div key={item.key} className="bg-card p-4"><div className="flex items-center gap-2"><span className={item.ok ? 'size-1.5 bg-primary' : 'size-1.5 bg-warning'} /><span className="truncate text-xs font-medium" title={item.title}>{item.title}</span></div><div className="mt-1 text-[10px] text-muted-foreground">{item.detail}</div>{item.issues.length > 0 && <ul className="mt-2 space-y-1 text-[10px] leading-4 text-warning">{item.issues.map(issue => <li key={issue}>{issue}</li>)}</ul>}</div>)}</div></Card>}
     </motion.div></AnimatePresence>
-    <Card className="sticky bottom-3 z-20 mt-6 border-t-2 border-t-primary p-4 shadow-[0_8px_30px_rgba(0,0,0,.08)]"><div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between"><div className="flex items-center gap-5 text-xs"><div><div className="font-mono text-[9px] uppercase tracking-wider text-muted-foreground">{stage === 'catalog' ? 'Configurations' : stage === 'matrix' ? 'Selected cells' : 'Ready to launch'}</div><div className="mt-1 font-medium">{stage === 'catalog' ? `${selectedAgents.size} Agents · ${selectedContests.size} Contests` : `${selectedCells.size} 个任务`}</div></div>{stage === 'review' && <span className="text-muted-foreground">串行队列</span>}</div>
-      <div className="flex items-center gap-2">{stage !== 'catalog' && <Button variant="ghost" onClick={() => setStage(stage === 'review' ? 'matrix' : 'catalog')}><ArrowLeft className="size-4" />{stage === 'review' ? '返回矩阵' : '修改配置'}</Button>}{stage === 'catalog' && <Button disabled={!selectedAgents.size || !selectedContests.size} onClick={() => setStage('matrix')}>调整矩阵<ArrowRight className="size-4" /></Button>}{stage === 'matrix' && <Button disabled={!ready} loading={preview.isPending} onClick={goReview}>核对执行计划<ArrowRight className="size-4" /></Button>}{stage === 'review' && <Button disabled={!plan || batches.data?.busy} loading={start.isPending} onClick={() => plan && start.mutate(plan.token)}>确认并启动批次<ArrowRight className="size-4" /></Button>}</div></div></Card>
+    <Card className="sticky bottom-3 z-20 mt-6 border-t-2 border-t-primary p-4 shadow-[0_8px_30px_rgba(0,0,0,.08)]"><div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between"><div className="flex items-center gap-5 text-xs"><div><div className="font-mono text-[9px] uppercase tracking-wider text-muted-foreground">{stage === 'catalog' ? 'Configurations' : stage === 'matrix' ? 'Selected cells' : 'Ready to launch'}</div><div className="mt-1 font-medium">{stage === 'catalog' ? `${selectedAgents.size} Agents · ${selectedContests.size} Contests` : repeats > 1 ? `${selectedCells.size} Cells · ${totalJobs} 个任务` : `${selectedCells.size} 个任务`}</div></div>{stage === 'review' && <span className="text-muted-foreground">{concurrency > 1 ? `${concurrency} 路并行` : '串行队列'}</span>}</div>
+      <div className="flex items-center gap-2">{stage !== 'catalog' && <Button variant="ghost" onClick={() => setStage(stage === 'review' ? 'matrix' : 'catalog')}><ArrowLeft className="size-4" />{stage === 'review' ? '返回矩阵' : '修改配置'}</Button>}{stage === 'catalog' && <Button disabled={!selectedAgents.size || !selectedContests.size} onClick={() => setStage('matrix')}>调整矩阵<ArrowRight className="size-4" /></Button>}{stage === 'matrix' && <Button disabled={!ready} loading={preview.isPending} onClick={goReview}>核对执行计划<ArrowRight className="size-4" /></Button>}{stage === 'review' && <Button disabled={!plan || batches.data?.busy} loading={start.isPending} onClick={() => start.mutate()}>确认并启动批次<ArrowRight className="size-4" /></Button>}</div></div></Card>
     {batches.data?.busy && <p className="mt-2 text-right text-[11px] text-warning">已有批次正在执行，请等待完成。</p>}
     {stage === 'catalog' && <p className="mt-3 text-[11px] text-muted-foreground">配置目录仅展示元数据。选择草稿会保留在当前浏览器会话中。</p>}
   </>;

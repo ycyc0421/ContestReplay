@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Eye, EyeOff, KeyRound, Pencil, Plus, ShieldCheck, Trash2 } from 'lucide-react';
+import { Bell, Braces, KeyRound, Pencil, Plus, ShieldCheck, Trash2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { studioApi } from '@/lib/api';
 import { Button } from '@/components/ui/button';
@@ -9,14 +9,13 @@ import { Field, Input } from '@/components/ui/fields';
 import { EmptyState } from '@/components/empty-state';
 import { ConfirmDialog, Dialog, DialogContent, DialogHeader } from '@/components/ui/dialog';
 import { Tooltip } from '@/components/ui/tooltip';
+import { SecretInput } from '@/components/ui/secret-input';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { OjAccountsPanel } from './oj-accounts-panel';
+import { PushTargetsPanel } from './push-targets-panel';
 
 type Provider = Awaited<ReturnType<typeof studioApi.providers>>['providers'][number];
 type Editor = { mode: 'create' | 'edit'; provider?: Provider };
-function SecretInput({ value, onChange, label }: { value: string; onChange: (value: string) => void; label: string }) {
-  const [visible, setVisible] = useState(false);
-  return <Field label={label} hint="只写入，保存后不可查看"><div className="relative"><Input aria-label={label} type={visible ? 'text' : 'password'} autoComplete="off" value={value} onChange={event => onChange(event.target.value)} className="pr-10 font-mono" />
-    <button type="button" className="absolute right-3 top-3 text-muted-foreground hover:text-foreground" aria-label={visible ? '隐藏秘密' : '显示秘密'} onClick={() => setVisible(value => !value)}>{visible ? <EyeOff className="size-4" /> : <Eye className="size-4" />}</button></div></Field>;
-}
 function ProviderEditor({ editor, onClose }: { editor: Editor; onClose: () => void }) {
   const provider = editor.provider;
   const [id, setId] = useState('');
@@ -54,6 +53,7 @@ function RotateDialog({ provider, onClose }: { provider: Provider; onClose: () =
 }
 
 export function ProvidersPage() {
+  const [tab, setTab] = useState('providers');
   const query = useQuery({ queryKey: ['providers'], queryFn: studioApi.providers });
   const [editor, setEditor] = useState<Editor>();
   const [rotating, setRotating] = useState<Provider>();
@@ -64,18 +64,20 @@ export function ProvidersPage() {
   }, onError: (error: Error) => { toast.error('无法删除 Provider', { description: error.message }); setDeleting(undefined); } });
   const providers = query.data?.providers ?? [];
   return <>
-    <PageHeader eyebrow="04 / Provider registry" title="Providers" description="管理可复用的 API 接入配置。模型 Vendor 与 API Provider 可以独立组合。" actions={<Button onClick={() => setEditor({ mode: 'create' })}><Plus className="size-4" />新建 Provider</Button>} />
-    <div className="mb-5 flex gap-3 border-y py-4 text-xs leading-5 text-muted-foreground"><ShieldCheck className="mt-0.5 size-4 shrink-0 text-primary" /><p>秘密只通过 write-only 接口写入本机凭据库。此处显示的都是可公开元数据，修改 Provider 不会改写已有 Agent Manifest。</p></div>
+    <PageHeader eyebrow="07 / Connections & automation" title="接入与通知" description="集中管理模型 Provider、OJ 账号池与脱敏事件推送；所有秘密都只写不读。" actions={tab === 'providers' ? <Button onClick={() => setEditor({ mode: 'create' })}><Plus className="size-4" />新建 Provider</Button> : undefined} />
+    <Tabs value={tab} onValueChange={setTab}><div className="mb-5 border-b pb-4"><TabsList><TabsTrigger value="providers"><Braces className="size-3.5" />模型 Providers</TabsTrigger><TabsTrigger value="oj"><KeyRound className="size-3.5" />OJ 账号池</TabsTrigger><TabsTrigger value="push"><Bell className="size-3.5" />Push Targets</TabsTrigger></TabsList></div>
+    <TabsContent value="providers"><div className="mb-5 flex gap-3 border-y py-4 text-xs leading-5 text-muted-foreground"><ShieldCheck className="mt-0.5 size-4 shrink-0 text-primary" /><p>秘密只通过 write-only 接口写入本机凭据库。此处显示的都是可公开元数据，修改 Provider 不会改写已有 Agent Manifest。</p></div>
     {query.isLoading ? <div className="skeleton h-56 border bg-card" /> : query.isError ? <Card><EmptyState icon={KeyRound} title="无法读取 Providers" description={(query.error as Error).message} action={<Button variant="secondary" onClick={() => void query.refetch()}>重试</Button>} /></Card>
       : providers.length === 0 ? <Card><EmptyState icon={KeyRound} title="尚未登记 Provider" description="创建可复用的 API 接入配置，之后在 Agent 中直接选择，无需理解环境变量。" action={<Button onClick={() => setEditor({ mode: 'create' })}><Plus className="size-4" />创建第一个 Provider</Button>} /></Card>
       : <Card className="overflow-hidden"><div className="hidden grid-cols-[minmax(160px,1fr)_minmax(240px,1.5fr)_120px_150px] gap-4 border-b bg-muted/35 px-5 py-3 font-mono text-[9px] uppercase tracking-wider text-muted-foreground md:grid"><span>Provider</span><span>Endpoint</span><span>凭据</span><span className="text-right">操作</span></div>
         <div className="divide-y">{providers.map(provider => <div key={provider.id} className="grid gap-4 px-5 py-4 md:grid-cols-[minmax(160px,1fr)_minmax(240px,1.5fr)_120px_150px] md:items-center"><div><div className="text-sm font-medium">{provider.label}</div><div className="mt-1 font-mono text-[10px] text-muted-foreground">{provider.id} · {provider.protocol}</div></div>
           <div className="min-w-0"><div className="truncate font-mono text-[11px]">{provider.base_url}</div><div className="mt-1 text-[10px] text-muted-foreground">origin · {provider.approved_origin}</div></div>
-          <div className="text-xs text-muted-foreground">{(provider as Provider & { credential_available?: boolean }).credential_available === false ? <span className="text-warning">凭据不可用</span> : <span className="inline-flex items-center gap-1.5"><ShieldCheck className="size-3.5 text-primary" />已保管</span>}</div>
+          <div className="text-xs text-muted-foreground">{provider.credential_available === false ? <span className="text-warning">凭据不可用</span> : <span className="inline-flex items-center gap-1.5"><ShieldCheck className="size-3.5 text-primary" />已保管</span>}</div>
           <div className="flex gap-0.5 md:justify-end"><Tooltip content="编辑元数据"><Button variant="ghost" size="icon" aria-label={`编辑 ${provider.label}`} onClick={() => setEditor({ mode: 'edit', provider })}><Pencil className="size-4" /></Button></Tooltip><Tooltip content="轮换 API Key"><Button variant="ghost" size="icon" aria-label={`轮换 ${provider.label} 凭据`} onClick={() => setRotating(provider)}><KeyRound className="size-4" /></Button></Tooltip><Tooltip content="删除 Provider"><Button variant="ghost" size="icon" aria-label={`删除 ${provider.label}`} onClick={() => setDeleting(provider)}><Trash2 className="size-4" /></Button></Tooltip></div>
-        </div>)}</div></Card>}
+        </div>)}</div></Card>}</TabsContent>
+    <TabsContent value="oj"><OjAccountsPanel /></TabsContent><TabsContent value="push"><PushTargetsPanel /></TabsContent></Tabs>
     {editor && <ProviderEditor key={`${editor.mode}-${editor.provider?.id ?? 'new'}`} editor={editor} onClose={() => setEditor(undefined)} />}
-    {rotating && <RotateDialog provider={rotating} onClose={() => setRotating(undefined)} />}
+    {rotating && <RotateDialog key={rotating.id} provider={rotating} onClose={() => setRotating(undefined)} />}
     {deleting && <ConfirmDialog open onOpenChange={open => { if (!open) setDeleting(undefined); }} title={`删除 ${deleting.label}？`} description="如果仍有 Agent 引用此 Provider，后端会拒绝删除。删除不会影响已经锁定的历史运行记录。" confirmLabel="删除 Provider" loading={remove.isPending} onConfirm={() => remove.mutate(deleting.id)} />}
   </>;
 }

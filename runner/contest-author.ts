@@ -711,6 +711,97 @@ const materialInput = z.object({
   redistribution: z.enum(['allowed', 'restricted', 'unknown']).optional(),
 });
 
+export async function resolveStudioPreviewPdf(opts: {
+  root: string;
+  base: string;
+  pdfPath: string;
+  manifestPath?: string;
+  contestId?: string;
+}): Promise<{ bytes: Buffer; displayPath: string }> {
+  const { root, base, pdfPath, manifestPath, contestId } = opts;
+  if (!pdfPath || pdfPath.includes('\0')) {
+    throw new FieldError(['pdf_path'], 'PDF path is invalid');
+  }
+  const realBase = await realpath(base);
+  const realExcluded = await resolveRealPathOrAncestor(root);
+  let target = join(realBase, 'contest.json');
+  if (manifestPath !== undefined) {
+    if (!manifestPath || manifestPath.includes('\0')) {
+      throw new FieldError(['manifest_path'], 'Manifest path is invalid');
+    }
+    const candidateManifest = resolve(realBase, manifestPath);
+    const relManifest = relative(realBase, candidateManifest);
+    if (
+      !relManifest ||
+      relManifest === '..' ||
+      relManifest.startsWith(`..${sep}`) ||
+      isAbsolute(relManifest) ||
+      isForbiddenWorkspaceRelPath(relManifest) ||
+      isWithinOrEqual(candidateManifest, realExcluded)
+    ) {
+      throw new FieldError(['manifest_path'], 'Manifest path must be inside the Studio workspace');
+    }
+    const parentParts = relative(realBase, dirname(candidateManifest)).split(sep).filter(Boolean);
+    let cursor = realBase;
+    for (const part of parentParts) {
+      cursor = join(cursor, part);
+      try {
+        const info = await lstat(cursor);
+        if (info.isSymbolicLink() || !info.isDirectory()) {
+          throw new FieldError(['manifest_path'], 'Manifest path traverses a symlink or non-directory');
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') break;
+        throw error;
+      }
+    }
+    target = candidateManifest;
+  }
+
+  let verifiedPath: string;
+  let displayPath: string;
+  if (pdfPath.startsWith('managed/')) {
+    if (contestId) managedMaterial(root, pdfPath, contestId, 'entrypoint');
+    const managed = await verifyManagedMaterialFile(root, pdfPath, 'entrypoint', 'pdf_path');
+    verifiedPath = managed.fullPath;
+    displayPath = pdfPath;
+  } else {
+    const realMaterials = await verifyManagedMaterialsRoot(root);
+    const candidateFromTarget = resolve(dirname(target), pdfPath);
+    if (
+      realMaterials &&
+      isWithinOrEqual(candidateFromTarget, realMaterials) &&
+      candidateFromTarget !== realMaterials
+    ) {
+      const relInMat = relative(realMaterials, candidateFromTarget).split(sep);
+      if (relInMat.length !== 3 || relInMat[1] !== 'entrypoint' || (contestId && relInMat[0] !== contestId)) {
+        throw new FieldError(['pdf_path'], 'Invalid managed material reference');
+      }
+      const managedRef = `managed/${relInMat[0]}/${relInMat[1]}/${relInMat[2]}`;
+      const managed = await verifyManagedMaterialFile(root, managedRef, 'entrypoint', 'pdf_path');
+      verifiedPath = managed.fullPath;
+      displayPath = managedRef;
+    } else {
+      const candidate = isAbsolute(pdfPath) ? resolve(pdfPath) : resolve(dirname(target), pdfPath);
+      const relFromBase = relative(realBase, candidate);
+      if (!relFromBase || relFromBase === '..' || relFromBase.startsWith(`..${sep}`) || isAbsolute(relFromBase)) {
+        throw new FieldError(['pdf_path'], 'PDF path must be inside the Studio workspace');
+      }
+      verifiedPath = await existingWorkspaceFile(base, relFromBase, 'pdf_path', root);
+      if (isJudgeAnswerFilename(verifiedPath)) {
+        throw new FieldError(['pdf_path'], 'Answer files cannot be used as contest entrypoint');
+      }
+      displayPath = relative(realBase, verifiedPath).split(sep).join('/');
+    }
+  }
+
+  const bytes = await readWorkspaceFileNoFollow(verifiedPath, 128 * 1024 * 1024, 'pdf_path');
+  if (!bytes.subarray(0, 5).equals(Buffer.from('%PDF-'))) {
+    throw new FieldError(['pdf_path'], 'Contest entrypoint must be a valid PDF');
+  }
+  return { bytes, displayPath };
+}
+
 async function prepareContestWrite(
   root: string,
   base: string,
@@ -718,6 +809,7 @@ async function prepareContestWrite(
   document: Record<string, unknown>,
   payload: z.infer<typeof judgeSchema> | undefined,
   signal: AbortSignal,
+  existingAnswersBinding?: { fullPath: string; sha256?: string },
 ) {
   if (extname(target) !== '.json') throw new FieldError(['file'], 'Contest output must end in .json');
   if (isReservedNonManifestFilename(target)) throw new FieldError(['file'], 'Contest output filename is reserved');
@@ -749,6 +841,7 @@ async function prepareContestWrite(
   let answersRedistribution: 'allowed' | 'restricted' | 'unknown' = 'restricted';
   let judgeFileName: string | undefined;
   let sourceAnswersFullPath: string | undefined;
+  let preservedAnswersFullPath: string | undefined;
 
   if (
     judge.kind === 'local' &&
@@ -786,6 +879,23 @@ async function prepareContestWrite(
     answersBytes = verifiedAnswers.bytes;
     answersHash = verifiedAnswers.sha256;
     answersRedistribution = existingLocal.answers.redistribution ?? 'restricted';
+    const matchesStoredBinding = Boolean(
+      existingAnswersBinding &&
+      existingAnswersBinding.fullPath === verifiedAnswers.fullPath &&
+      existingAnswersBinding.sha256 &&
+      existingAnswersBinding.sha256 === verifiedAnswers.sha256,
+    );
+    if (matchesStoredBinding) {
+      preservedAnswersFullPath = verifiedAnswers.fullPath;
+      resolvedJudge = {
+        kind: 'local',
+        answers: {
+          path: verifiedAnswers.relativePath,
+          sha256: answersHash,
+          redistribution: answersRedistribution,
+        },
+      };
+    }
   } else {
     if (payload) throw new FieldError(['judge'], `${judge.kind} does not accept a local answer file`);
     if (judge.kind === 'codeforces' && !problems) {
@@ -802,7 +912,7 @@ async function prepareContestWrite(
     }
   }
 
-  if (answersBytes && answersHash) {
+  if (answersBytes && answersHash && !preservedAnswersFullPath) {
     const stem = basename(target, '.json');
     judgeFileName = `${stem}.judge.${answersHash.slice(0, 12)}.json`;
     const answersPath = join(dirname(target), judgeFileName);
@@ -894,7 +1004,11 @@ async function prepareContestWrite(
         return { path: verifiedEntrypoint.fullPath, bytes: verifiedEntrypoint.bytes, hash: verifiedEntrypoint.sha256 };
       }
       if (role === 'answers' && answersBytes && answersHash) {
-        return { path: stagedJudgePath ?? join(dirname(target), judgeFileName!), bytes: answersBytes, hash: answersHash };
+        return {
+          path: judgeFileName ? (stagedJudgePath ?? join(dirname(target), judgeFileName)) : preservedAnswersFullPath!,
+          bytes: answersBytes,
+          hash: answersHash,
+        };
       }
       const nextAtt = verifiedAttachments[attIdx++];
       if (!nextAtt) throw new FieldError(['materials', 'attachments'], 'Unexpected attachment resolution order');
@@ -908,6 +1022,7 @@ async function prepareContestWrite(
     answersHash,
     answersRedistribution,
     judgeFileName,
+    preservedAnswersFullPath,
     makeArtifactReader,
   };
 }
@@ -1011,14 +1126,46 @@ export async function updateContestDocument(root: string, base: string, raw: unk
     }
     assertContestDocument(target, existingParsed, 'path');
 
-    const { manifest, answersBytes, answersHash, answersRedistribution, judgeFileName, makeArtifactReader } =
-      await prepareContestWrite(root, base, target, document, payload, signal);
+    let existingAnswersBinding: { fullPath: string; sha256?: string } | undefined;
+    if (existingParsed && typeof existingParsed === 'object' && !Array.isArray(existingParsed)) {
+      const existingObj = existingParsed as Record<string, unknown>;
+      const existingJudge = existingObj.judge && typeof existingObj.judge === 'object' && !Array.isArray(existingObj.judge)
+        ? existingObj.judge as Record<string, unknown>
+        : undefined;
+      const existingAnswersObj = existingJudge?.kind === 'local' && existingJudge.answers && typeof existingJudge.answers === 'object' && !Array.isArray(existingJudge.answers)
+        ? existingJudge.answers as Record<string, unknown>
+        : undefined;
+      const existingAnswersRef = typeof existingAnswersObj?.path === 'string'
+        ? existingAnswersObj.path
+        : existingObj.schema_version === 1 && typeof existingJudge?.path === 'string'
+          ? existingJudge.path
+          : undefined;
+      const existingAnswersSha256 = typeof existingAnswersObj?.sha256 === 'string'
+        ? existingAnswersObj.sha256
+        : existingObj.schema_version === 1 && typeof existingJudge?.sha256 === 'string'
+          ? existingJudge.sha256
+          : undefined;
+      if (existingAnswersRef) {
+        const realBase = await realpath(base);
+        const candidate = isAbsolute(existingAnswersRef) ? resolve(existingAnswersRef) : resolve(dirname(target), existingAnswersRef);
+        const relFromBase = relative(realBase, candidate);
+        if (relFromBase && relFromBase !== '..' && !relFromBase.startsWith(`..${sep}`) && !isAbsolute(relFromBase)) {
+          const fullPath = await existingWorkspaceFile(base, relFromBase, 'path', root).catch(() => undefined);
+          if (fullPath) {
+            existingAnswersBinding = { fullPath, ...(existingAnswersSha256 ? { sha256: existingAnswersSha256 } : {}) };
+          }
+        }
+      }
+    }
+
+    const { manifest, answersBytes, answersHash, answersRedistribution, judgeFileName, preservedAnswersFullPath, makeArtifactReader } =
+      await prepareContestWrite(root, base, target, document, payload, signal, existingAnswersBinding);
 
     const temp = await mkdtemp(join(dirname(target), '.cr-contest-'));
     let createdJudgePath: string | undefined;
     try {
       const stagedJudge = join(temp, 'judge.json');
-      if (answersBytes && answersHash) {
+      if (answersBytes && answersHash && judgeFileName) {
         await writeFile(stagedJudge, answersBytes, { mode: 0o600, flag: 'wx' });
       }
       const { contest, contestRevision } = await resolveContest(manifest, target, makeArtifactReader(stagedJudge));
@@ -1052,10 +1199,11 @@ export async function updateContestDocument(root: string, base: string, raw: unk
       // Atomically replace ONLY the contest manifest; previous answer files remain intact.
       await rename(join(temp, 'contest.json'), target);
       const realBase = await realpath(base);
+      const reportedJudgePath = finalJudgePath ?? preservedAnswersFullPath;
       return {
         path: relative(realBase, target),
         revision: contestRevision,
-        ...(finalJudgePath ? { judge_path: relative(realBase, finalJudgePath) } : {}),
+        ...(reportedJudgePath ? { judge_path: relative(realBase, reportedJudgePath) } : {}),
       };
     } catch (error) {
       if (createdJudgePath) await rm(createdJudgePath, { force: true }).catch(() => {});
