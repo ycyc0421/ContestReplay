@@ -330,6 +330,7 @@ export async function dispatch(root: string, batchId: string, signal: AbortSigna
               store: options.store,
               ojAccounts,
               ojPool,
+              loadInputs: options.inputLoaders?.loadInputs,
             });
             cleanupFailed = result.reason === 'sandbox_cleanup_failed';
             if (cleanupFailed) {

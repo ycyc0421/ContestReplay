@@ -25,6 +25,10 @@ import { protocolPresets, resolveProtocolPreset } from './protocol.js';
 
 export const FORBIDDEN_WORKSPACE_DIRS = new Set(['node_modules', 'dist', 'coverage', 'runs']);
 const MANAGED_ASSET_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+// Linux O_PATH is not exposed by Node's fs constants. Directory descriptors only
+// anchor subsequent opens, so O_PATH avoids requiring read/list permission on
+// otherwise searchable (0711) ancestors while preserving O_NOFOLLOW semantics.
+const LINUX_O_PATH = 0x200000;
 
 const workspaceLocks = new Map<string, Promise<void>>();
 
@@ -382,13 +386,13 @@ export async function readWorkspaceFileNoFollow(target: string, limit = 1_000_00
   // chain, so a parent-directory rename/symlink swap cannot redirect the opened file outside
   // the workspace tree that was validated by the caller.
   const parts = resolve(target).split(sep).filter(Boolean);
-  let parent = await open('/', constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  let parent = await open('/', LINUX_O_PATH | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   const openedDirectories = [parent];
   try {
     for (const part of parts.slice(0, -1)) {
       const next = await open(
         join('/proc/self/fd', String(parent.fd), part),
-        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+        LINUX_O_PATH | constants.O_DIRECTORY | constants.O_NOFOLLOW,
       ).catch(() => {
         throw new FieldError([fieldName], 'Parent directory changed or traverses a symlink');
       });

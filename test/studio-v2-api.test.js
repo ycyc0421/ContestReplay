@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
-import { appendFile, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -2292,6 +2292,15 @@ test('Studio v2 final admission and I/O regressions: plan/execute artifact polic
     readWorkspaceFileNoFollow(join(base, 'linked-parent', 'data.json')),
     /Parent directory changed|symlink/i,
   );
+
+  // Searchable but unlistable (0711) ancestors remain usable: directory descriptors
+  // use O_PATH while the manifest leaf itself is still opened read-only.
+  const searchable = join(base, 'searchable-only');
+  await mkdir(searchable, { mode: 0o711 });
+  await writeFile(join(searchable, 'data.json'), '{"ok":true}');
+  await chmod(searchable, 0o711);
+  t.after(() => chmod(searchable, 0o700).catch(() => {}));
+  assert.equal((await readWorkspaceFileNoFollow(join(searchable, 'data.json'))).toString('utf8'), '{"ok":true}');
 
   // Two independent Node processes publishing the same manifest/answer bytes serialize on the shared
   // filesystem lock. The losing manifest link must never remove the winner's immutable answer table.
