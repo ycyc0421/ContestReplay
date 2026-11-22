@@ -22,12 +22,16 @@ const replay = {
   run_id: runA, status: 'completed', agent_id: 'agent-a', agent_name: 'Agent A', contest_id: 'demo', contest_title: 'Demo Final', data_version: 1,
   contest_revision: digest, protocol_id: 'short', protocol_version: 1, protocol_sha256: digest, scoring_mode: 'icpc', started_at: '2025-01-01T08:00:00.000Z',
   time_limit_ms: 7200000, duration_ms: 125000, problems: [{ id: 'A', max_points: 1 }, { id: 'B', max_points: 1 }],
-  submissions: [{ submission_id: 's1', problem_id: 'A', received_ms: 55000, judged_ms: 60000, verdict: 'AC', score: 1, max_points: 1, language: 'cpp17' }],
+  submissions: [
+    { submission_id: 's1', problem_id: 'A', received_ms: 55000, judged_ms: 60000, verdict: 'AC', score: 1, max_points: 1, language: 'cpp17' },
+    { submission_id: 's2', problem_id: 'A', received_ms: 80000, judged_ms: 90000, verdict: 'already_accepted', score: 0, max_points: 1, language: 'cpp17' },
+  ],
   frames: [
     { seq: 0, elapsed_ms: 0, kind: 'run_started', summary: '运行开始', cumulative_score: 0, solved_count: 0 },
     { seq: 1, elapsed_ms: 55000, kind: 'submission_received', summary: '提交 A', problem_id: 'A', submission_id: 's1', language: 'cpp17', cumulative_score: 0, solved_count: 0 },
     { seq: 2, elapsed_ms: 60000, kind: 'submission_judged', summary: 'A 判定 AC', problem_id: 'A', submission_id: 's1', verdict: 'AC', score: 1, cumulative_score: 1, solved_count: 1 },
-    { seq: 3, elapsed_ms: 125000, kind: 'run_ended', summary: '有效完赛', status: 'completed', cumulative_score: 1, solved_count: 1 },
+    { seq: 3, elapsed_ms: 90000, kind: 'submission_judged', summary: 'A 重复提交', problem_id: 'A', submission_id: 's2', verdict: 'already_accepted', score: 0, cumulative_score: 1, solved_count: 1 },
+    { seq: 4, elapsed_ms: 125000, kind: 'run_ended', summary: '有效完赛', status: 'completed', cumulative_score: 1, solved_count: 1 },
   ],
   telemetry: progress.telemetry,
   session_summaries: [{ file: 'session.jsonl', entries: [{ index: 0, role: 'assistant', summary: '分析题目 A' }], truncated: false }],
@@ -80,6 +84,7 @@ test('shows live progress, incremental logs and a scrubbable replay', async ({ p
   await page.route(`**/api/runs/${runA}/replay?*`, route => route.fulfill({ json: replay }));
   await page.goto(`/runs/${runA}`);
   await expect(page.getByText('Agent A', { exact: true }).first()).toBeVisible();
+  await expect(page.getByRole('progressbar', { name: '赛时进度' })).toBeVisible();
   await expect(page.getByText('1 / 2', { exact: true }).first()).toBeVisible();
   await expect(page.getByText('B 判定 WA')).toBeVisible();
   await page.getByRole('tab', { name: '原始日志' }).click();
@@ -87,8 +92,59 @@ test('shows live progress, incremental logs and a scrubbable replay', async ({ p
   await page.getByRole('tab', { name: '时间轴回放' }).click();
   await expect(page.getByText('帧详情')).toBeVisible();
   await page.getByRole('button', { name: '跳到终态' }).click();
-  await expect(page.getByText('A 判定 AC').last()).toBeVisible();
+  await expect(page.getByText('accepted', { exact: true })).toBeVisible();
+  await expect(page.getByText('AC 00:55')).toBeVisible();
   await expect(page.getByText('Session 留存')).toBeVisible();
+});
+
+test('keeps terminal SSE progress against slower GET and drains final logs on completion', async ({ page }) => {
+  let runStatus: 'running' | 'completed' = 'running';
+  let progressGets = 0;
+  let logPhase = 0;
+  const terminalProgress = { ...progress, status: 'completed', score: 2, solved_count: 2 };
+  await page.route('**/api/batches', route => route.fulfill({ json: {
+    busy: runStatus === 'running', error: null,
+    batches: [{ id: batchId, created_at: '2025-01-01T08:00:00.000Z', concurrency: 1, jobs: [{ status: runStatus, run_id: runA, agent_id: 'agent-a', agent_name: 'Agent A', agent_revision: digest, contest_id: 'demo', data_version: 1, harness: 'codex' }] }],
+  } }));
+  await page.route(`**/api/runs/${runA}/progress`, async route => {
+    progressGets += 1;
+    // Delay the first running GET so the terminal SSE event lands first.
+    await new Promise(resolve => setTimeout(resolve, 250));
+    return route.fulfill({ json: progress });
+  });
+  await page.route(`**/api/runs/${runA}/events`, route => route.fulfill({
+    status: 200,
+    headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
+    body: `event: progress\ndata: ${JSON.stringify(terminalProgress)}\n\n`,
+  }));
+  await page.route(`**/api/runs/${runA}/logs?*`, route => {
+    const offset = Number(new URL(route.request().url()).searchParams.get('offset'));
+    if (offset === 0) {
+      const chunk = 'live line\n';
+      return route.fulfill({ json: { stream: 'stdout', offset: 0, next_offset: chunk.length, total_bytes: chunk.length, has_more: false, chunk } });
+    }
+    if (logPhase === 0) {
+      logPhase = 1;
+      runStatus = 'completed';
+      return route.fulfill({ json: { stream: 'stdout', offset, next_offset: offset, total_bytes: offset, has_more: false, chunk: '' } });
+    }
+    if (offset === 10) {
+      const chunk = 'final line\n';
+      return route.fulfill({ json: { stream: 'stdout', offset, next_offset: offset + chunk.length, total_bytes: offset + chunk.length, has_more: false, chunk } });
+    }
+    return route.fulfill({ json: { stream: 'stdout', offset, next_offset: offset, total_bytes: offset, has_more: false, chunk: '' } });
+  });
+
+  await page.goto(`/runs/${runA}`);
+  await expect(page.getByText('运行已结束')).toBeVisible();
+  await expect(page.getByText('2 / 2', { exact: true }).first()).toBeVisible();
+  // Wait past the delayed GET to ensure it never rolls back the terminal SSE snapshot.
+  await page.waitForTimeout(450);
+  await expect(page.getByText('2 / 2', { exact: true }).first()).toBeVisible();
+  expect(progressGets).toBeLessThanOrEqual(1);
+
+  await page.getByRole('tab', { name: '原始日志' }).click();
+  await expect(page.getByText('live line final line')).toBeVisible();
 });
 
 test('ranks results, starts Ghost Racing and reads coverage', async ({ page }) => {
@@ -105,6 +161,8 @@ test('ranks results, starts Ghost Racing and reads coverage', async ({ page }) =
   await page.getByRole('button', { name: '开始 Ghost Racing' }).click();
   await expect(page.getByText('Score trajectories')).toBeVisible();
   await page.getByRole('button', { name: '竞速回到起点' }).click();
+  await expect(page.getByText('SAMPLE')).toBeVisible();
+  await expect(page.getByText('Agent A 通过 A')).toHaveCount(0);
   await page.getByRole('slider', { name: '竞速时间轴' }).focus();
   await page.getByRole('slider', { name: '竞速时间轴' }).press('End');
   await expect(page.getByText('Agent A 通过 A')).toBeVisible();
@@ -124,7 +182,11 @@ test('plans repeated cells with parallel workers and preflight', async ({ page }
     planned = route.request().postDataJSON();
     return route.fulfill({ json: { token: 'a720a849-3c7d-4f35-a4bd-51ee0baf7f15', jobs: [1, 2].map(index => ({ agent_id: 'agent-a', agent_revision: digest, contest_id: 'demo', data_version: 1, repeat_index: index, repeat_total: 2 })) } });
   });
-  await page.route('**/api/preflight', route => route.fulfill({ json: { ok: true, checked_at: '2025-01-01T08:00:00.000Z', images: [], agents: [{ path: agent.path, id: agent.id, harness: 'codex', ok: true, credential_ok: true, issues: [] }], contests: [{ path: contest.path, id: contest.id, judge_kind: 'local', ok: true, oj_ready: true, issues: [] }], compatibility: [{ agent: agent.path, contest: contest.path, compatible: true }] } }));
+  let preflightPayload: any;
+  await page.route('**/api/preflight', route => {
+    preflightPayload = route.request().postDataJSON();
+    return route.fulfill({ json: { ok: true, checked_at: '2025-01-01T08:00:00.000Z', images: [], agents: [{ path: agent.path, id: agent.id, harness: 'codex', ok: true, credential_ok: true, issues: [] }], contests: [{ path: contest.path, id: contest.id, judge_kind: 'local', ok: true, oj_ready: true, issues: [] }], compatibility: [{ agent: agent.path, contest: contest.path, compatible: true }] } });
+  });
   let launched: any;
   await page.route('**/api/batches', route => {
     if (route.request().method() === 'POST') { launched = route.request().postDataJSON(); return route.fulfill({ status: 202, json: { id: batchId } }); }
@@ -143,6 +205,7 @@ test('plans repeated cells with parallel workers and preflight', async ({ page }
   await page.getByRole('option', { name: '4 路并行' }).click();
   await page.getByRole('button', { name: '运行 Preflight' }).click();
   await expect(page.getByText('Preflight 全部通过')).toBeVisible();
+  expect(preflightPayload).toEqual({ cells: [{ agent: agent.path, contest: contest.path }] });
   await page.getByRole('button', { name: '确认并启动批次' }).click();
   expect(launched.concurrency).toBe(4);
 });

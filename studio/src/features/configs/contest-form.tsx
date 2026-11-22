@@ -9,7 +9,7 @@ import { AnimatePresence, motion } from 'motion/react';
 import { ArrowLeft, ArrowRight, Check, CloudDownload, FileUp, KeyRound, Plus, Trash2, UploadCloud } from 'lucide-react';
 import { toast } from 'sonner';
 import { studioApi } from '@/lib/api';
-import { cn, formatBytes } from '@/lib/utils';
+import { cn, formatBytes, formatDuration } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Field, Input, Textarea } from '@/components/ui/fields';
@@ -26,14 +26,29 @@ const schema = z.object({
   redistribution: z.enum(['allowed', 'restricted', 'unknown']), pdf: z.string().trim().min(1, '请上传或填写主 PDF'),
   judge: z.string().min(1), answers: z.string(), cfId: z.string(), handle: z.string(), languages: z.string(),
   accountId: z.string(), pool: z.string(), baseUrl: z.string(), domain: z.string(), gym: z.string(), problemMap: z.string(),
-  timeLimitMinutes: z.number().int().min(1).max(480), maxSubmissions: z.number().int().min(1).max(1000),
+  timeLimitMs: z.number().int().min(1000).max(8 * 60 * 60_000), maxSubmissions: z.number().int().min(1).max(1000),
 });
 type Values = z.infer<typeof schema>;
 type Material = { path: string; name: string; size: number; sha256: string; kind: 'entrypoint' | 'attachment' };
 type ProblemDraft = { id: string; maxPoints: number; answers: string };
 function stringRecord(text: string): Record<string, string> {
-  try { const value: unknown = JSON.parse(text || '{}'); return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, string> : {}; }
-  catch { return {}; }
+  try {
+    const value: unknown = JSON.parse(text || '{}');
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, String(item)]));
+  } catch { return {}; }
+}
+function parsePlainRecord(text: string): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(text);
+    return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  } catch { return null; }
+}
+function defaultLanguagesFor(kind: string, capabilities: StudioCapabilities): Record<string, string> {
+  const backend = capabilities.judge_backends.find(item => item.kind === kind);
+  const firstPreset = backend?.language_presets?.[0];
+  if (firstPreset) return { [firstPreset.id]: firstPreset.remote_id };
+  return kind === 'codeforces' ? { cpp17: '54' } : { cpp17: 'cpp17' };
 }
 const steps = [['基本信息', '身份、来源与授权'], ['比赛材料', '上传或引用完整题面'], ['判题配置', '题目、答案与提交后端'], ['赛规确认', '预算与文件摘要']] as const;
 
@@ -69,13 +84,27 @@ function ProblemEditor({ problems, setProblems }: { problems: ProblemDraft[]; se
     <p className="text-[11px] leading-5 text-muted-foreground">去除提交答案首尾空白后精确匹配，命中任一可接受答案即得分。保存时同步生成 Contest 题目表与私有答案文件。</p></div>;
 }
 
+type ArtifactDocument = { path?: string; redistribution?: 'allowed' | 'restricted' | 'unknown'; name?: string; size?: number; sha256?: string };
+type JudgeDocument = {
+  kind?: string; path?: string; sha256?: string; redistribution?: 'allowed' | 'restricted' | 'unknown';
+  answers?: { path?: string; sha256?: string; redistribution?: 'allowed' | 'restricted' | 'unknown' };
+  contest_id?: number | string; handle?: string; account_id?: string; pool?: string; base_url?: string; domain?: string; gym?: boolean;
+  languages?: Record<string, string | number>; problem_map?: Record<string, string>; points_known?: boolean; settlement_ms?: number; live_contest?: boolean;
+};
 type ContestDocument = {
   contest_id?: string; data_version?: number; title?: string; source?: { name?: string; url?: string };
-  materials?: { entrypoint?: { path?: string; redistribution?: 'allowed' | 'restricted' | 'unknown'; name?: string; size?: number; sha256?: string }; attachments?: unknown[] };
+  statement?: ArtifactDocument;
+  materials?: { entrypoint?: ArtifactDocument; attachments?: unknown[] };
   rules?: { time_limit_ms?: number; max_submissions?: number; protocol_preset?: string; scoring_mode?: string };
-  judge?: { kind?: string; answers?: { path?: string }; contest_id?: number | string; handle?: string; account_id?: string; pool?: string; base_url?: string; domain?: string; gym?: boolean; languages?: Record<string, string>; problem_map?: Record<string, string> };
+  problems?: { id: string; max_points: number }[];
+  judge?: JudgeDocument;
 };
 type LocalJudge = { problems?: { id: string; max_points?: number; accepted_answers?: string[] }[] };
+function RemoteProblemEditor({ problems, setProblems }: { problems: ProblemDraft[]; setProblems: (problems: ProblemDraft[]) => void }) {
+  const update = (index: number, patch: Partial<ProblemDraft>) => setProblems(problems.map((problem, current) => current === index ? { ...problem, ...patch } : problem));
+  return <div className="space-y-3"><div><div className="text-xs font-medium">本地题目表</div><p className="mt-1 text-[11px] leading-5 text-muted-foreground">这里定义 PDF 中的稳定题号与满分；下方的 problem_map 再把这些本地题号映射到远端。拉取预览只会生成可编辑草稿。</p></div><AnimatePresence initial={false}>{problems.map((problem, index) => <motion.div layout key={index} initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, height: 0 }} className="grid grid-cols-[1fr_100px_32px] gap-3 border-b pb-3"><Input aria-label={`远程题目 ${index + 1} 题号`} value={problem.id} onChange={event => update(index, { id: event.target.value })} /><Input aria-label={`远程题目 ${index + 1} 分值`} type="number" min="1" value={problem.maxPoints} onChange={event => update(index, { maxPoints: Number(event.target.value) })} /><Button type="button" variant="ghost" size="icon" aria-label={`删除远程题目 ${index + 1}`} disabled={problems.length === 1} onClick={() => setProblems(problems.filter((_, current) => current !== index))}><Trash2 className="size-4" /></Button></motion.div>)}</AnimatePresence><Button type="button" variant="secondary" size="sm" onClick={() => setProblems([...problems, { id: String(problems.length + 1), maxPoints: 100, answers: '' }])}><Plus className="size-3.5" />添加本地题目</Button></div>;
+}
+
 function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities: StudioCapabilities; initial?: ContestItemResponse; onSaved?: () => void }) {
   const [step, setStep] = useState(0);
   const [maxStep, setMaxStep] = useState(0);
@@ -83,25 +112,38 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
   const navigate = useNavigate();
   const intent = useRef<'save' | 'batch'>('save');
   const source = initial?.document as ContestDocument | undefined;
-  const sourceJudge = source?.judge;
+  const sourceEntrypoint = source?.materials?.entrypoint ?? source?.statement;
+  const rawJudge = source?.judge;
+  const sourceJudge: JudgeDocument | undefined = rawJudge?.kind
+    ? rawJudge
+    : rawJudge?.path
+      ? { kind: 'local', answers: { path: rawJudge.path, ...(rawJudge.sha256 ? { sha256: rawJudge.sha256 } : {}), ...(rawJudge.redistribution ? { redistribution: rawJudge.redistribution } : {}) } }
+      : undefined;
   const localJudge = initial?.judge as LocalJudge | undefined;
+  const initialTimeLimitMs = source?.rules?.time_limit_ms ?? 900000;
+  const [timeLimitText, setTimeLimitText] = useState(() => String(Number((initialTimeLimitMs / 60000).toFixed(4))));
   const [materialMode, setMaterialMode] = useState(initial ? 'path' : capabilities.features.contest_upload ? 'upload' : 'path');
-  const [uploaded, setUploaded] = useState<Material | undefined>(() => source?.materials?.entrypoint?.name && source.materials.entrypoint.path && source.materials.entrypoint.size && source.materials.entrypoint.sha256 ? {
-    path: source.materials.entrypoint.path, name: source.materials.entrypoint.name, size: source.materials.entrypoint.size,
-    sha256: source.materials.entrypoint.sha256, kind: 'entrypoint',
+  const [uploaded, setUploaded] = useState<Material | undefined>(() => sourceEntrypoint?.name && sourceEntrypoint.path && sourceEntrypoint.size && sourceEntrypoint.sha256 ? {
+    path: sourceEntrypoint.path, name: sourceEntrypoint.name, size: sourceEntrypoint.size,
+    sha256: sourceEntrypoint.sha256, kind: 'entrypoint',
   } : undefined);
-  const [problems, setProblems] = useState<ProblemDraft[]>(localJudge?.problems?.length ? localJudge.problems.map(problem => ({ id: problem.id, maxPoints: problem.max_points ?? 1, answers: (problem.accepted_answers ?? []).join('\n') })) : [{ id: '1', maxPoints: 1, answers: '' }]);
+  const initialProblemDrafts: ProblemDraft[] = source?.problems?.length ? source.problems.map(problem => ({
+    id: problem.id, maxPoints: problem.max_points,
+    answers: (localJudge?.problems?.find(item => item.id === problem.id)?.accepted_answers ?? []).join('\n'),
+  })) : localJudge?.problems?.length ? localJudge.problems.map(problem => ({ id: problem.id, maxPoints: problem.max_points ?? 1, answers: (problem.accepted_answers ?? []).join('\n') })) : [{ id: '1', maxPoints: 1, answers: '' }];
+  const [problems, setProblems] = useState<ProblemDraft[]>(initialProblemDrafts);
   const [remotePreview, setRemotePreview] = useState<ContestPreviewResponse>();
-  const { register, control, handleSubmit, watch, setValue, getValues, trigger, setError, formState: { errors, isSubmitting } } = useForm<Values>({ resolver: zodResolver(schema), defaultValues: {
+  const initialJudgeKind = sourceJudge?.kind ?? 'local';
+  const { register, control, handleSubmit, watch, setValue, getValues, trigger, setError, clearErrors, formState: { errors, isSubmitting } } = useForm<Values>({ resolver: zodResolver(schema), defaultValues: {
     file: initial?.path ?? 'contest.json', id: source?.contest_id ?? '', dataVersion: source?.data_version ?? 1,
     title: source?.title ?? '', sourceName: source?.source?.name ?? 'Local', sourceUrl: source?.source?.url ?? '',
     protocolPreset: source?.rules?.protocol_preset ?? 'auto', scoringMode: source?.rules?.scoring_mode ?? 'auto',
-    redistribution: source?.materials?.entrypoint?.redistribution ?? 'unknown', pdf: source?.materials?.entrypoint?.path ?? 'problems.pdf',
-    judge: sourceJudge?.kind ?? 'local', answers: sourceJudge?.answers?.path ?? 'judge.json', cfId: sourceJudge?.contest_id?.toString() ?? '',
-    handle: sourceJudge?.handle ?? '', languages: JSON.stringify(sourceJudge?.languages ?? { cpp17: 54 }),
+    redistribution: sourceEntrypoint?.redistribution ?? 'unknown', pdf: sourceEntrypoint?.path ?? 'problems.pdf',
+    judge: initialJudgeKind, answers: sourceJudge?.answers?.path ?? 'judge.json', cfId: sourceJudge?.contest_id?.toString() ?? '',
+    handle: sourceJudge?.handle ?? '', languages: JSON.stringify(sourceJudge?.languages ?? defaultLanguagesFor(initialJudgeKind, capabilities)),
     accountId: sourceJudge?.account_id ?? '', pool: sourceJudge?.pool ?? '', baseUrl: sourceJudge?.base_url ?? '', domain: sourceJudge?.domain ?? '',
     gym: sourceJudge?.gym ? 'gym' : 'contest', problemMap: JSON.stringify(sourceJudge?.problem_map ?? {}, null, 2),
-    timeLimitMinutes: Math.round((source?.rules?.time_limit_ms ?? 900000) / 60000), maxSubmissions: source?.rules?.max_submissions ?? 100,
+    timeLimitMs: initialTimeLimitMs, maxSubmissions: source?.rules?.max_submissions ?? 100,
   } });
   const values = watch();
   const judgeLabel = capabilities.judge_backends.find(item => item.kind === values.judge)?.label ?? values.judge;
@@ -120,6 +162,13 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
     if (!getValues('title').trim()) setValue('title', result.preview.title);
     if (result.language_presets.length) setValue('languages', JSON.stringify(Object.fromEntries(result.language_presets.map(language => [language.id, language.remote_id]))));
     if (result.problem_map_suggestion) setValue('problemMap', JSON.stringify(result.problem_map_suggestion.problem_map, null, 2));
+    const mapping = result.problem_map_suggestion?.problem_map ?? Object.fromEntries(result.preview.problems.map(problem => [problem.remote_id, problem.remote_id]));
+    const entries = Object.entries(mapping);
+    if (entries.length) setProblems(entries.map(([localId, remoteId]) => ({
+      id: localId,
+      maxPoints: result.preview.problems.find(problem => problem.remote_id === remoteId)?.max_points ?? initialProblemDrafts.find(problem => problem.id === localId)?.maxPoints ?? 1,
+      answers: initialProblemDrafts.find(problem => problem.id === localId)?.answers ?? '',
+    })));
     toast.success('赛事信息已载入', { description: `${result.preview.problems.length} 道题 · ${result.preview.status}` });
   }, onError: (error: Error) => toast.error('无法拉取赛事信息', { description: error.message }) });
   const goTo = (next: number) => { setStep(next); setMaxStep(current => Math.max(current, next)); };
@@ -129,52 +178,81 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
     if (step === 1 && !await trigger('pdf')) return;
     if (step === 2) {
       if (values.judge === 'local' && !capabilities.features.judge_authoring && !values.answers.trim()) { setError('answers', { message: '请输入答案 JSON 路径' }); return; }
-      if (values.judge === 'local' && capabilities.features.judge_authoring && problems.some(problem => !problem.id.trim() || !Number.isSafeInteger(problem.maxPoints) || problem.maxPoints < 1 || !problem.answers.trim())) {
-        toast.error('请完整填写题号、分值和至少一个答案'); return;
+      if (values.judge === 'local' && capabilities.features.judge_authoring) {
+        const trimmedIds = problems.map(problem => problem.id.trim());
+        if (!problems.length || problems.some(problem => !problem.id.trim() || !Number.isSafeInteger(problem.maxPoints) || problem.maxPoints < 1 || !problem.answers.trim()) || new Set(trimmedIds).size !== trimmedIds.length) {
+          toast.error('请完整填写不重复的题号、正整数分值和至少一个答案'); return;
+        }
       }
       if (values.judge !== 'local') {
         if (values.judge === 'codeforces' && (!Number.isSafeInteger(Number(values.cfId)) || Number(values.cfId) < 1)) { setError('cfId', { message: '请输入有效赛事 ID' }); return; }
-        if (values.judge !== 'codeforces' && values.judge !== 'vjudge' && values.judge !== 'hydro' && !values.cfId.trim()) { setError('cfId', { message: '请输入赛事 ID' }); return; }
         if (values.judge === 'codeforces' && !values.handle.trim() && !values.accountId && !values.pool.trim()) { setError('handle', { message: '请选择 OJ 账号、填写账号池或专用账号名' }); return; }
+        if (values.judge === 'hydro' && !values.baseUrl.trim()) { setError('baseUrl', { message: 'Hydro 判题必须填写 Base URL' }); return; }
         if (values.accountId && values.pool.trim()) { setError('pool', { message: '账号与账号池只能二选一' }); return; }
-        try { JSON.parse(values.languages); } catch { setError('languages', { message: '语言映射不是有效 JSON' }); return; }
-        try { JSON.parse(values.problemMap); } catch { setError('problemMap', { message: '题号映射不是有效 JSON' }); return; }
+        const trimmedIds = problems.map(problem => problem.id.trim());
+        if (!problems.length || problems.some(problem => !problem.id.trim() || !Number.isSafeInteger(problem.maxPoints) || problem.maxPoints < 1) || new Set(trimmedIds).size !== trimmedIds.length) {
+          toast.error('请完整填写不重复的本地题号与正整数满分'); return;
+        }
+        const parsedLanguages = parsePlainRecord(values.languages);
+        if (!parsedLanguages || !Object.keys(parsedLanguages).length) { setError('languages', { message: '请提供至少一项有效的语言映射 JSON 对象' }); return; }
+        const parsedProblemMap = parsePlainRecord(values.problemMap);
+        if (!parsedProblemMap) { setError('problemMap', { message: '题号映射不是有效 JSON 对象' }); return; }
+        const idSet = new Set(trimmedIds);
+        if (Object.keys(parsedProblemMap).some(key => !idSet.has(key))) { setError('problemMap', { message: '题号映射包含不在本地题目表中的题号' }); return; }
       }
     }
     goTo(step + 1);
   };
   const submit = handleSubmit(async form => {
     try {
-      const source = { name: form.sourceName, ...(form.sourceUrl.trim() ? { url: form.sourceUrl } : {}) };
-      const materials = { entrypoint: { kind: 'pdf', path: form.pdf, redistribution: form.redistribution,
+      const sourceInfo = { name: form.sourceName, ...(form.sourceUrl.trim() ? { url: form.sourceUrl } : {}) };
+      const materials = { entrypoint: {
+        ...(sourceEntrypoint?.path === form.pdf ? sourceEntrypoint : {}),
+        kind: 'pdf', path: form.pdf, redistribution: form.redistribution,
         ...(uploaded?.path === form.pdf ? { name: uploaded.name, size: uploaded.size, sha256: uploaded.sha256 } : {}) },
-        ...(initial ? { attachments: (initial.document as ContestDocument).materials?.attachments ?? [] } : {}) };
-      const rules = { time_limit_ms: form.timeLimitMinutes * 60_000, max_submissions: form.maxSubmissions,
+        ...(initial ? { attachments: source?.materials?.attachments ?? [] } : {}) };
+      const rules = { time_limit_ms: form.timeLimitMs, max_submissions: form.maxSubmissions,
         ...(form.protocolPreset !== 'auto' ? { protocol_preset: form.protocolPreset } : {}),
         ...(form.scoringMode !== 'auto' ? { scoring_mode: form.scoringMode } : {}) };
+      const normalizedLanguages = form.judge !== 'local'
+        ? Object.fromEntries(Object.entries(parsePlainRecord(form.languages) ?? {}).map(([key, value]) => [key, form.judge === 'codeforces' ? value : String(value)]))
+        : undefined;
+      const parsedProblemMap = form.judge !== 'local' ? (parsePlainRecord(form.problemMap) ?? {}) : undefined;
+      const includeProblemMap = Boolean(parsedProblemMap && (Object.keys(parsedProblemMap).length > 0 || sourceJudge?.problem_map !== undefined));
       const remote = form.judge !== 'local' ? {
         kind: form.judge, ...(form.cfId.trim() ? { contest_id: form.judge === 'codeforces' ? Number(form.cfId) : form.cfId.trim() } : {}),
         ...(form.handle.trim() ? { handle: form.handle.trim() } : {}), ...(form.accountId ? { account_id: form.accountId } : {}),
         ...(form.pool.trim() ? { pool: form.pool.trim() } : {}), ...(form.baseUrl.trim() ? { base_url: form.baseUrl.trim() } : {}),
         ...(form.judge === 'hydro' && form.domain.trim() ? { domain: form.domain.trim() } : {}),
         ...(form.judge === 'codeforces' && form.gym === 'gym' ? { gym: true } : {}),
-        languages: JSON.parse(form.languages), problem_map: JSON.parse(form.problemMap),
+        ...(form.judge === 'codeforces' && sourceJudge?.points_known !== undefined ? { points_known: sourceJudge.points_known } : {}),
+        ...(sourceJudge?.settlement_ms !== undefined ? { settlement_ms: sourceJudge.settlement_ms } : {}),
+        ...(form.judge === 'hydro' && sourceJudge?.live_contest !== undefined ? { live_contest: sourceJudge.live_contest } : {}),
+        languages: normalizedLanguages,
+        ...(includeProblemMap ? { problem_map: parsedProblemMap } : {}),
       } : undefined;
+      const explicitProblems = problems.map(problem => ({ id: problem.id.trim(), max_points: problem.maxPoints }));
       const document = remote ? {
         kind: 'contestreplay.dev/contest', schema_version: 2, contest_id: form.id, data_version: form.dataVersion, title: form.title || form.id,
-        source, materials, rules, judge: remote,
-      } : {
-        kind: 'contestreplay.dev/contest', schema_version: 2, contest_id: form.id, data_version: form.dataVersion, title: form.title || form.id, source, materials, rules,
-        problems: problems.map(problem => ({ id: problem.id, max_points: problem.maxPoints })),
-        judge: { kind: 'local', problems: problems.map(problem => ({ id: problem.id, max_points: problem.maxPoints,
-          accepted_answers: problem.answers.split(/\r?\n/).map(answer => answer.trim()).filter(Boolean) })) },
-      };
+        source: sourceInfo, materials, rules, problems: explicitProblems, judge: remote,
+      } : (() => {
+        const currentProblems = problems.map(problem => ({ id: problem.id.trim(), max_points: problem.maxPoints,
+          accepted_answers: problem.answers.split(/\r?\n/).map(answer => answer.trim()).filter(Boolean) }));
+        const originalProblems = initialProblemDrafts.map(problem => ({ id: problem.id.trim(), max_points: problem.maxPoints,
+          accepted_answers: problem.answers.split(/\r?\n/).map(answer => answer.trim()).filter(Boolean) }));
+        const unchanged = initial && sourceJudge?.kind === 'local' && JSON.stringify(currentProblems) === JSON.stringify(originalProblems);
+        return {
+          kind: 'contestreplay.dev/contest', schema_version: 2, contest_id: form.id, data_version: form.dataVersion, title: form.title || form.id, source: sourceInfo, materials, rules,
+          problems: unchanged && source?.problems ? source.problems : explicitProblems,
+          judge: unchanged ? sourceJudge : { kind: 'local', problems: currentProblems },
+        };
+      })();
       const result = initial ? await studioApi.updateContest(initial.path, document)
         : remote ? capabilities.features.contest_authoring ? await studioApi.saveContestDocument(form.file, document)
           : await studioApi.importCodeforces(form.file, { id: form.id, pdf: form.pdf, contest: Number(form.cfId), handle: form.handle, languages: JSON.parse(form.languages) })
           : capabilities.features.contest_authoring ? await studioApi.saveContestDocument(form.file, document)
             : await studioApi.saveContest(form.file, { schema_version: 2, contest_id: form.id, data_version: form.dataVersion,
-              title: form.title || form.id, source, materials, rules, judge: { kind: 'local', answers: { path: form.answers } } });
+              title: form.title || form.id, source: sourceInfo, materials, rules, judge: { kind: 'local', answers: { path: form.answers } } });
       if (intent.current === 'batch') {
         sessionStorage.setItem('cr.batch.pending', JSON.stringify({ kind: 'contest', path: result.path }));
         toast.success('Contest 已保存，正在加入批次'); void navigate({ to: '/batches/new' });
@@ -209,13 +287,22 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
         {!capabilities.features.contest_upload && <Note>当前 runner 尚未提供上传接口，因此保留本机路径模式。实现材料上传契约后，上传入口会自动启用。</Note>}
       </div>}
       {step === 2 && <div className="space-y-5"><div><h3 className="font-semibold">判题方式</h3><p className="mt-1 text-xs text-muted-foreground">判题后端写入 Contest Manifest；只有本地答案模式会生成 judge.json。</p></div>
-        <Field label="判题后端"><Controller control={control} name="judge" render={({ field }) => <Select value={field.value} onValueChange={value => { field.onChange(value); setRemotePreview(undefined); }}>{capabilities.judge_backends.map(backend => <SelectItem key={backend.kind} value={backend.kind}>{backend.label}</SelectItem>)}</Select>} /></Field>
+        <Field label="判题后端"><Controller control={control} name="judge" render={({ field }) => <Select value={field.value} onValueChange={value => {
+          field.onChange(value);
+          setRemotePreview(undefined);
+          clearErrors(['cfId', 'handle', 'pool', 'baseUrl', 'languages', 'problemMap']);
+          if (value !== 'local') {
+            const nextLanguages = sourceJudge?.kind === value && sourceJudge.languages ? sourceJudge.languages : defaultLanguagesFor(value, capabilities);
+            setValue('languages', JSON.stringify(nextLanguages));
+          }
+        }}>{capabilities.judge_backends.map(backend => <SelectItem key={backend.kind} value={backend.kind}>{backend.label}</SelectItem>)}</Select>} /></Field>
         {values.judge === 'local' ? capabilities.features.judge_authoring ? <ProblemEditor problems={problems} setProblems={setProblems} />
           : <div className="space-y-4 border-l-2 border-primary/25 bg-muted/20 p-4"><Field label="答案 JSON" hint="相对于清单" error={errors.answers?.message}><Input className="font-mono text-xs" {...register('answers')} /></Field><p className="text-xs leading-5 text-muted-foreground">当前后端读取已有 judge.json。题目表编辑器将在判题制作契约启用后开放。</p></div>
           : <div className="space-y-5 border-l-2 border-primary/25 bg-muted/20 p-4"><div className="grid gap-5 sm:grid-cols-2"><Field label={values.judge === 'codeforces' ? 'Codeforces 赛事 ID' : `${judgeLabel} 赛事 ID`} error={errors.cfId?.message}><Input type={values.judge === 'codeforces' ? 'number' : 'text'} min="1" placeholder={values.judge === 'vjudge' ? '可留空，使用上游题目映射' : 'Contest ID'} {...register('cfId')} /></Field><Field label="OJ 账号" hint="write-only 凭据引用"><Select value={values.accountId || 'manual'} onValueChange={value => setValue('accountId', value === 'manual' ? '' : value)}><SelectItem value="manual">手动 handle / 账号池</SelectItem>{accounts.data?.accounts.filter(account => account.platform === values.judge).map(account => <SelectItem key={account.id} value={account.id}>{account.label} · {account.handle}{account.ready ? '' : '（未就绪）'}</SelectItem>)}</Select></Field></div>
             <div className="flex flex-wrap items-center gap-3"><Button type="button" variant="secondary" size="sm" loading={previewContest.isPending} disabled={!values.cfId.trim()} onClick={() => previewContest.mutate()}><CloudDownload className="size-3.5" />拉取赛事信息</Button><Button type="button" variant="ghost" size="sm" asChild><Link to="/providers"><KeyRound className="size-3.5" />管理 OJ 账号</Link></Button></div>
             <div className="grid gap-5 sm:grid-cols-2"><Field label="专用账号名" hint="账号引用时可留空" error={errors.handle?.message}><Input {...register('handle')} /></Field><Field label="账号池" hint="与单账号二选一" error={errors.pool?.message}><Input placeholder="默认 default" {...register('pool')} /></Field></div>
-            <div className="grid gap-5 sm:grid-cols-2"><Field label="Base URL" hint={judgeBackend?.requires_base_url ? '必填' : '使用平台默认值'}><Input className="font-mono text-xs" placeholder="https://…" {...register('baseUrl')} /></Field>{values.judge === 'hydro' ? <Field label="Hydro Domain"><Input placeholder="system" {...register('domain')} /></Field> : values.judge === 'codeforces' ? <Field label="赛事类型"><Controller control={control} name="gym" render={({ field }) => <Select value={field.value} onValueChange={field.onChange}><SelectItem value="contest">Codeforces Round</SelectItem><SelectItem value="gym">Codeforces Gym</SelectItem></Select>} /></Field> : <div />}</div>
+            <div className="grid gap-5 sm:grid-cols-2"><Field label="Base URL" hint={judgeBackend?.requires_base_url ? '必填' : '使用平台默认值'} error={errors.baseUrl?.message}><Input className="font-mono text-xs" placeholder="https://…" {...register('baseUrl')} /></Field>{values.judge === 'hydro' ? <Field label="Hydro Domain"><Input placeholder="system" {...register('domain')} /></Field> : values.judge === 'codeforces' ? <Field label="赛事类型"><Controller control={control} name="gym" render={({ field }) => <Select value={field.value} onValueChange={field.onChange}><SelectItem value="contest">Codeforces Round</SelectItem><SelectItem value="gym">Codeforces Gym</SelectItem></Select>} /></Field> : <div />}</div>
+            <RemoteProblemEditor problems={problems} setProblems={setProblems} />
             {judgeBackend?.language_presets && judgeBackend.language_presets.length > 0 && <div><div className="mb-2 text-xs font-medium">语言预设</div><div className="flex flex-wrap gap-2">{judgeBackend.language_presets.map(language => { const enabled = Object.keys(stringRecord(values.languages)).includes(language.id); return <button key={language.id} type="button" aria-pressed={enabled} onClick={() => { const mapping = stringRecord(values.languages); if (enabled) delete mapping[language.id]; else mapping[language.id] = language.remote_id; setValue('languages', JSON.stringify(mapping)); }} className={enabled ? 'border bg-primary px-3 py-2 text-xs text-primary-foreground' : 'border bg-card px-3 py-2 text-xs text-muted-foreground hover:border-primary/40'}>{language.label}<span className="ml-1.5 font-mono text-[9px] opacity-65">{language.remote_id}</span></button>; })}</div></div>}
             <Field label="语言映射 JSON" hint="高级：本地语言 ID → 远端 ID" error={errors.languages?.message}><Input className="font-mono text-xs" {...register('languages')} /></Field>
             <Field label="题号映射 problem_map" hint="PDF 题号 → 平台题号" error={errors.problemMap?.message}><Textarea className="min-h-24" {...register('problemMap')} /></Field>
@@ -223,9 +310,14 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
             <p className="text-xs leading-5 text-muted-foreground">仅用于有权限的历史赛事提交。提交时间由本机 Supervisor 记录，上游故障不会被当作答错。</p></div>}
       </div>}
       {step === 3 && <div className="space-y-6"><div><h3 className="font-semibold">赛规与保存确认</h3><p className="mt-1 text-xs text-muted-foreground">这些预算直接约束比赛，不是界面显示偏好。</p></div>
-        <div className="grid gap-5 sm:grid-cols-2"><Field label="比赛时限" hint="分钟"><Input type="number" min="1" max="480" {...register('timeLimitMinutes', { valueAsNumber: true })} /></Field><Field label="最大提交次数"><Input type="number" min="1" max="1000" {...register('maxSubmissions', { valueAsNumber: true })} /></Field></div>
+        <div className="grid gap-5 sm:grid-cols-2"><Field label="比赛时限" hint="分钟，可精确到秒" error={errors.timeLimitMs?.message}><Input type="number" min={1000 / 60000} max={480} step="any" value={timeLimitText} onChange={event => {
+          const raw = event.target.value;
+          setTimeLimitText(raw);
+          const parsed = Number(raw);
+          setValue('timeLimitMs', raw.trim() && Number.isFinite(parsed) ? Math.round(parsed * 60000) : 0, { shouldValidate: true });
+        }} /></Field><Field label="最大提交次数" error={errors.maxSubmissions?.message}><Input type="number" min="1" max="1000" {...register('maxSubmissions', { valueAsNumber: true })} /></Field></div>
         <div className="grid gap-5 sm:grid-cols-2"><Field label="协议预设"><Controller control={control} name="protocolPreset" render={({ field }) => <Select value={field.value} onValueChange={field.onChange}><SelectItem value="auto">按赛时自动选择</SelectItem>{capabilities.protocol_presets?.map(preset => <SelectItem key={preset.id} value={preset.id}>{preset.id} · {preset.max_turns} turns</SelectItem>)}</Select>} /></Field><Field label="默认计分口径"><Controller control={control} name="scoringMode" render={({ field }) => <Select value={field.value} onValueChange={field.onChange}><SelectItem value="auto">平台默认</SelectItem>{['icpc', 'cf', 'ioi', 'last_ac'].map(mode => <SelectItem key={mode} value={mode}>{mode}</SelectItem>)}</Select>} /></Field></div>
-        <dl className="grid grid-cols-[110px_1fr] gap-x-4 gap-y-3 border-y py-5 text-xs"><dt className="text-muted-foreground">Contest</dt><dd className="font-medium">{values.id || '—'} · data v{values.dataVersion}</dd><dt className="text-muted-foreground">Manifest</dt><dd className="break-all font-mono">{values.file}</dd><dt className="text-muted-foreground">题面</dt><dd className="break-all font-mono">{values.pdf || '—'}</dd><dt className="text-muted-foreground">判题</dt><dd>{judgeLabel}</dd><dt className="text-muted-foreground">赛规</dt><dd>{values.timeLimitMinutes} 分钟 · 最多 {values.maxSubmissions} 次提交</dd></dl>
+        <dl className="grid grid-cols-[110px_1fr] gap-x-4 gap-y-3 border-y py-5 text-xs"><dt className="text-muted-foreground">Contest</dt><dd className="font-medium">{values.id || '—'} · data v{values.dataVersion}</dd><dt className="text-muted-foreground">Manifest</dt><dd className="break-all font-mono">{values.file}</dd><dt className="text-muted-foreground">题面</dt><dd className="break-all font-mono">{values.pdf || '—'}</dd><dt className="text-muted-foreground">判题</dt><dd>{judgeLabel}</dd><dt className="text-muted-foreground">赛规</dt><dd>{formatDuration(values.timeLimitMs, true)}（{values.timeLimitMs % 60000 === 0 ? `${values.timeLimitMs / 60000} 分钟` : `${Number((values.timeLimitMs / 60000).toFixed(2))} 分钟 · ${values.timeLimitMs} ms`}）· 最多 {values.maxSubmissions} 次提交</dd></dl>
         <p className="text-[11px] leading-5 text-muted-foreground">保存时将再次由服务端校验材料、题目、判题配置与摘要。前端不会把校验成功当作运行预检成功。</p>
       </div>}
     </motion.section></AnimatePresence></motion.div>

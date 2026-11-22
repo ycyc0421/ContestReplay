@@ -1,17 +1,28 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { runProgressSchema, runStatusEventSchema } from '@studio-api';
+import { runProgressSchema, runStatusEventSchema, type RunProgressContract } from '@studio-api';
 import { studioApi } from '@/lib/api';
 
 export type ProgressConnection = 'connecting' | 'live' | 'polling' | 'closed';
+const isTerminal = (progress?: RunProgressContract) => progress?.status === 'completed' || progress?.status === 'void';
 
 export function useRunProgress(runId: string) {
   const queryClient = useQueryClient();
   const [connection, setConnection] = useState<ProgressConnection>('connecting');
+  const lastSseSeq = useRef(0);
+  const queryKey = useMemo(() => ['progress', runId] as const, [runId]);
   const query = useQuery({
-    queryKey: ['progress', runId],
-    queryFn: () => studioApi.progress(runId),
-    refetchInterval: 4_000,
+    queryKey,
+    queryFn: async ({ signal }) => {
+      const seqAtStart = lastSseSeq.current;
+      const result = await studioApi.progress(runId, signal);
+      // A GET that started before a newer SSE snapshot must never roll the UI back.
+      if (lastSseSeq.current !== seqAtStart) {
+        return queryClient.getQueryData<RunProgressContract>(queryKey) ?? result;
+      }
+      return result;
+    },
+    refetchInterval: current => connection === 'live' || connection === 'closed' || isTerminal(current.state.data) ? false : 4_000,
   });
 
   useEffect(() => {
@@ -19,15 +30,21 @@ export function useRunProgress(runId: string) {
       setConnection('polling');
       return;
     }
+    let disposed = false;
+    let terminalClosed = false;
     setConnection('connecting');
-    const source = new EventSource(`/api/runs/${runId}/events`);
-    source.addEventListener('open', () => setConnection('live'));
+    const source = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
+    source.addEventListener('open', () => { if (!disposed && !terminalClosed) setConnection('live'); });
     source.addEventListener('progress', event => {
+      if (disposed || terminalClosed) return;
       try {
         const progress = runProgressSchema.parse(JSON.parse((event as MessageEvent).data));
-        queryClient.setQueryData(['progress', runId], progress);
+        lastSseSeq.current += 1;
+        void queryClient.cancelQueries({ queryKey });
+        queryClient.setQueryData(queryKey, progress);
         setConnection('live');
-        if (progress.status === 'completed' || progress.status === 'void') {
+        if (isTerminal(progress)) {
+          terminalClosed = true;
           source.close();
           setConnection('closed');
           void queryClient.invalidateQueries({ queryKey: ['batches'] });
@@ -37,18 +54,23 @@ export function useRunProgress(runId: string) {
       }
     });
     source.addEventListener('status', event => {
+      if (disposed || terminalClosed) return;
       try {
         runStatusEventSchema.parse(JSON.parse((event as MessageEvent).data));
+        terminalClosed = true;
         source.close();
         setConnection('closed');
         void queryClient.invalidateQueries({ queryKey: ['batches'] });
+        if (!isTerminal(queryClient.getQueryData<RunProgressContract>(queryKey))) {
+          void queryClient.invalidateQueries({ queryKey });
+        }
       } catch {
         setConnection('polling');
       }
     });
-    source.addEventListener('error', () => setConnection('polling'));
-    return () => source.close();
-  }, [runId, queryClient]);
+    source.addEventListener('error', () => { if (!disposed && !terminalClosed) setConnection('polling'); });
+    return () => { disposed = true; source.close(); };
+  }, [runId, queryClient, queryKey]);
 
   return { ...query, connection };
 }

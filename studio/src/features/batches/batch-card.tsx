@@ -37,7 +37,7 @@ export function BatchCard({ batch, busy, defaultOpen = false }: { batch: BatchSu
       <div className="flex shrink-0 items-center gap-0.5 border-l px-2 sm:px-3">
         {queued && !busy && <Tooltip content="继续未启动任务"><Button size="icon" variant="ghost" aria-label="继续未启动任务" loading={resume.isPending} onClick={() => resume.mutate()}><Play className="size-4" /></Button></Tooltip>}
         {(queued || active) && <Tooltip content="停止整个批次"><Button size="icon" variant="ghost" aria-label="停止整个批次" onClick={() => setConfirmStop(true)}><CircleStop className="size-4" /></Button></Tooltip>}
-        {completed > 0 && <Tooltip content="导出已完赛结果"><a className="rounded-[2px] p-2.5 text-muted-foreground transition hover:bg-muted hover:text-primary" href={`/api/batches/${batch.id}/results`} download aria-label="导出已完赛结果"><Download className="size-4" /></a></Tooltip>}
+        {completed > 0 && <Tooltip content="导出已完赛结果"><a className="rounded-[2px] p-2.5 text-muted-foreground transition hover:bg-muted hover:text-primary" href={`/api/batches/${encodeURIComponent(batch.id)}/results`} download aria-label="导出已完赛结果"><Download className="size-4" /></a></Tooltip>}
       </div>
     </div>
     <AnimatePresence initial={false}>{open && <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: .2, ease: [0.22, 1, 0.36, 1] }} className="overflow-hidden"><div className="border-t">

@@ -40,7 +40,7 @@ export function RunLive({ progress, connection }: { progress: RunProgressContrac
         <div className="flex items-center gap-1.5 font-mono text-[9px] uppercase tracking-wider text-muted-foreground"><Icon className="size-3" />{label}</div>
         <div className="mt-2 font-mono text-lg font-semibold tabular-nums tracking-tight">{value}</div>
       </div>)}</div>
-      <div className="border-t px-4 py-3"><div className="mb-2 flex justify-between font-mono text-[9px] text-muted-foreground"><span>CONTEST CLOCK</span><span>{Math.round(timeRatio)}%</span></div><Progress value={timeRatio} aria-label="赛时进度" /></div>
+      <div className="border-t px-4 py-3"><div className="mb-2 flex justify-between font-mono text-[9px] text-muted-foreground"><span>CONTEST CLOCK</span><span>{Math.round(timeRatio)}%</span></div><Progress value={timeRatio} label="赛时进度" /></div>
     </Card>
 
     <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">

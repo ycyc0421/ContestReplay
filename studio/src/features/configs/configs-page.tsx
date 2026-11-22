@@ -16,12 +16,23 @@ export function ConfigsPage() {
   const [agent, setAgent] = useState<AgentItemResponse>();
   const [contest, setContest] = useState<ContestItemResponse>();
   const client = useQueryClient();
-  const refresh = () => { void client.invalidateQueries({ queryKey: ['catalog'] }); };
+  const refresh = () => {
+    void Promise.all([
+      client.invalidateQueries({ queryKey: ['catalog'] }),
+      client.invalidateQueries({ queryKey: ['matrix'] }),
+      client.invalidateQueries({ queryKey: ['preflight'] }),
+      client.invalidateQueries({ queryKey: ['coverage'] }),
+      client.invalidateQueries({ queryKey: ['agent-item'] }),
+      client.invalidateQueries({ queryKey: ['contest-item'] }),
+    ]);
+  };
   const editAgent = (item: AgentItemResponse) => { setAgent(item); setTab('agent'); document.getElementById('config-editor')?.scrollIntoView({ block: 'start' }); };
   const editContest = (item: ContestItemResponse) => { setContest(item); setTab('contest'); document.getElementById('config-editor')?.scrollIntoView({ block: 'start' }); };
+  const deletedAgent = (path: string) => { setAgent(current => current?.path === path ? undefined : current); refresh(); };
+  const deletedContest = (path: string) => { setContest(current => current?.path === path ? undefined : current); refresh(); };
   return <>
     <PageHeader eyebrow="06 / Configuration library" title="配置库" description="检索、编辑、克隆并派生可复现的比赛输入；不再需要手工查找 Manifest 文件。" actions={<div className="flex gap-2"><Button variant="secondary" onClick={() => { setAgent(undefined); setTab('agent'); }}><Bot className="size-4" />新建 Agent</Button><Button onClick={() => { setContest(undefined); setTab('contest'); }}><FilePlus2 className="size-4" />新建 Contest</Button></div>} />
-    <div className="mb-8"><ConfigLibrary onEditAgent={editAgent} onEditContest={editContest} /></div>
+    <div className="mb-8"><ConfigLibrary onEditAgent={editAgent} onEditContest={editContest} onDeletedAgent={deletedAgent} onDeletedContest={deletedContest} /></div>
     <div id="config-editor" className="grid scroll-mt-24 items-start gap-6 xl:grid-cols-[minmax(0,800px)_minmax(260px,1fr)]">
       <motion.div layout="size" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}><Card className="overflow-hidden">
         <Tabs value={tab} onValueChange={setTab}><div className="flex items-center justify-between border-b bg-muted/25 px-4 py-3"><TabsList className="w-full sm:w-auto"><TabsTrigger value="agent" className="flex-1 sm:flex-none"><Bot className="size-4" />{agent ? '编辑 Agent' : '新建 Agent'}</TabsTrigger><TabsTrigger value="contest" className="flex-1 sm:flex-none"><FileCheck2 className="size-4" />{contest ? '编辑 Contest' : '新建 Contest'}</TabsTrigger></TabsList>{(tab === 'agent' ? agent : contest) && <Button variant="ghost" size="sm" onClick={() => tab === 'agent' ? setAgent(undefined) : setContest(undefined)}><X className="size-3.5" />结束编辑</Button>}</div>

@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Code2, History, Pause, Play, RotateCcw, SkipBack } from 'lucide-react';
 import { motion } from 'motion/react';
-import type { RunReplayContract } from '@studio-api';
 import { studioApi } from '@/lib/api';
 import { cn, formatDuration, formatNumber } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
@@ -10,31 +9,7 @@ import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Select, SelectItem } from '@/components/ui/select';
 import { EmptyState } from '@/components/empty-state';
-
-function projectProblems(replay: RunReplayContract, cursor: number) {
-  const states = new Map(replay.problems.map(problem => [problem.id, {
-    ...problem, status: 'unattempted' as 'unattempted' | 'pending' | 'accepted' | 'partial' | 'wrong',
-    attempts: 0, score: 0, first_ac_ms: undefined as number | undefined, last_verdict: undefined as string | undefined,
-  }]));
-  for (const frame of replay.frames) {
-    if (frame.elapsed_ms > cursor || !frame.problem_id) continue;
-    const problem = states.get(frame.problem_id);
-    if (!problem) continue;
-    if (frame.kind === 'submission_received') {
-      problem.attempts += 1;
-      problem.status = 'pending';
-    }
-    if (frame.kind === 'submission_judged') {
-      const score = frame.score ?? frame.points_awarded ?? 0;
-      problem.score = Math.max(problem.score, score);
-      problem.last_verdict = frame.verdict;
-      const accepted = frame.verdict === 'AC' || frame.verdict === 'OK' || (problem.max_points > 0 && score >= problem.max_points);
-      problem.status = accepted ? 'accepted' : score > 0 ? 'partial' : 'wrong';
-      if (accepted && problem.first_ac_ms === undefined) problem.first_ac_ms = frame.elapsed_ms;
-    }
-  }
-  return [...states.values()];
-}
+import { projectReplayAt } from './replay-projection';
 
 export function RunReplay({ runId }: { runId: string }) {
   const [includeSources, setIncludeSources] = useState(false);
@@ -61,7 +36,8 @@ export function RunReplay({ runId }: { runId: string }) {
     return replay.data.frames.filter(frame => frame.elapsed_ms <= cursor).at(-1);
   }, [replay.data, cursor, pinnedSeq]);
   const recentFrames = useMemo(() => replay.data?.frames.filter(frame => frame.elapsed_ms <= cursor).slice(-10).reverse() ?? [], [replay.data, cursor]);
-  const problems = useMemo(() => replay.data ? projectProblems(replay.data, cursor) : [], [replay.data, cursor]);
+  const projection = useMemo(() => replay.data ? projectReplayAt(replay.data, cursor) : undefined, [replay.data, cursor]);
+  const problems = projection?.problems ?? [];
 
   if (replay.isLoading) return <div className="skeleton h-[520px] border bg-card" />;
   if (replay.isError || !replay.data) return <Card><EmptyState icon={History} title="无法构建时间轴" description={(replay.error as Error)?.message ?? '没有可回放的数据'} action={<Button variant="secondary" onClick={() => void replay.refetch()}>重试</Button>} /></Card>;
@@ -85,8 +61,8 @@ export function RunReplay({ runId }: { runId: string }) {
           <div className="absolute inset-x-0 bottom-0 flex justify-between font-mono text-[9px] text-muted-foreground"><span>00:00</span><span>事件标记</span><span>{formatDuration(duration, true)}</span></div>
         </div>
       </div>
-      <div className="grid border-t md:grid-cols-3"><div className="p-4 md:border-r"><div className="font-mono text-[9px] text-muted-foreground">CUMULATIVE SCORE</div><div className="mt-1 font-mono text-lg">{formatNumber(currentFrame?.cumulative_score ?? 0)}</div></div>
-        <div className="p-4 max-md:border-t md:border-r"><div className="font-mono text-[9px] text-muted-foreground">SOLVED</div><div className="mt-1 font-mono text-lg">{currentFrame?.solved_count ?? 0} / {data.problems.length}</div></div>
+      <div className="grid border-t md:grid-cols-3"><div className="p-4 md:border-r"><div className="font-mono text-[9px] text-muted-foreground">CUMULATIVE SCORE</div><div className="mt-1 font-mono text-lg">{formatNumber(projection?.score ?? 0)}</div></div>
+        <div className="p-4 max-md:border-t md:border-r"><div className="font-mono text-[9px] text-muted-foreground">SOLVED</div><div className="mt-1 font-mono text-lg">{projection?.solved_count ?? 0} / {data.problems.length}</div></div>
         <div className="p-4 max-md:border-t"><div className="font-mono text-[9px] text-muted-foreground">CURRENT FRAME</div><div className="mt-1 font-mono text-xs">{currentFrame ? `#${currentFrame.seq} · ${currentFrame.kind}` : '等待开始'}</div></div></div>
     </Card>
 
