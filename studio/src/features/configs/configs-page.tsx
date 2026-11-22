@@ -19,6 +19,10 @@ export function ConfigsPage() {
   const [contest, setContest] = useState<ContestItemResponse>();
   const agentReloadSeq = useRef(0);
   const contestReloadSeq = useRef(0);
+  const openAgentPath = useRef<string | undefined>(undefined);
+  const openContestPath = useRef<string | undefined>(undefined);
+  openAgentPath.current = agent?.path;
+  openContestPath.current = contest?.path;
   const client = useQueryClient();
   const refresh = () => {
     void Promise.all([
@@ -66,8 +70,20 @@ export function ConfigsPage() {
   };
   const editAgent = (item: AgentItemResponse) => { agentReloadSeq.current += 1; setAgent(item); setTab('agent'); document.getElementById('config-editor')?.scrollIntoView({ block: 'start' }); };
   const editContest = (item: ContestItemResponse) => { contestReloadSeq.current += 1; setContest(item); setTab('contest'); document.getElementById('config-editor')?.scrollIntoView({ block: 'start' }); };
-  const deletedAgent = (path: string) => { agentReloadSeq.current += 1; setAgent(current => current?.path === path ? undefined : current); refresh(); };
-  const deletedContest = (path: string) => { contestReloadSeq.current += 1; setContest(current => current?.path === path ? undefined : current); refresh(); };
+  const deletedAgent = (path: string) => {
+    if (openAgentPath.current === path) {
+      agentReloadSeq.current += 1;
+      setAgent(undefined);
+    }
+    refresh();
+  };
+  const deletedContest = (path: string) => {
+    if (openContestPath.current === path) {
+      contestReloadSeq.current += 1;
+      setContest(undefined);
+    }
+    refresh();
+  };
   return <>
     <PageHeader eyebrow="06 / Configuration library" title="配置库" description="检索、编辑、克隆并派生可复现的比赛输入；不再需要手工查找 Manifest 文件。" actions={<div className="flex gap-2"><Button variant="secondary" onClick={() => { setAgent(undefined); setTab('agent'); }}><Bot className="size-4" />新建 Agent</Button><Button onClick={() => { setContest(undefined); setTab('contest'); }}><FilePlus2 className="size-4" />新建 Contest</Button></div>} />
     <div className="mb-8"><ConfigLibrary onEditAgent={editAgent} onEditContest={editContest} onDeletedAgent={deletedAgent} onDeletedContest={deletedContest} /></div>

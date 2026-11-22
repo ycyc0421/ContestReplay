@@ -138,12 +138,15 @@ test('preserves external native_config, shows legacy Agent read-only, and clears
   expect(updates[0].document.harness.native_config).toEqual(nativeOverride);
   expect(updates[0].document.model_family_id).toBeUndefined();
 
-  // Removing external native_config awaits delayed baseline reload (keeping Save disabled) so subsequent edits never resurrect it
+  // Removing external native_config awaits delayed baseline reload (keeping Save disabled)
+  // Deleting an unrelated Agent (demo-codex) while agent-base reload is pending must NOT cancel agent-base's reload
   delayNextAgentReload = true;
   await page.getByRole('tab', { name: '原生覆盖' }).click();
   await page.getByLabel('移除已绑定的外部原生覆盖文件').check();
   await page.getByRole('button', { name: '保存修改', exact: true }).click();
   await expect(page.getByRole('button', { name: '保存修改', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: '删除 demo-codex', exact: true }).click();
+  await page.getByRole('button', { name: '删除配置', exact: true }).click();
   await expect(page.getByRole('button', { name: '保存修改', exact: true })).toBeEnabled();
   expect(updates[1].document.harness.native_config).toBeUndefined();
   await page.getByLabel(/TOML 参数覆盖/).fill('model_verbosity = "high"');
@@ -188,6 +191,22 @@ test('save-and-add-to-batch waits for catalog refetch and disables batch add on 
   await page.getByRole('button', { name: '保存并加入批次', exact: true }).click();
   await expect(page.getByRole('heading', { name: '新建评测批次' })).toBeVisible();
   await expect(page.getByRole('checkbox', { name: /Fresh Agent/ })).toHaveAttribute('aria-checked', 'true');
+
+  // If the fresh catalog refetch marks a previously cached valid Agent invalid, pending must NOT select it
+  let refetchCount = 0;
+  await page.route('**/api/catalog/agents', async route => {
+    refetchCount += 1;
+    if (refetchCount >= 2) {
+      await new Promise(resolve => setTimeout(resolve, 120));
+      return route.fulfill({ json: { agents: [{ ...baseAgent, valid: false, issues: ['now invalid'] }] } });
+    }
+    return route.fulfill({ json: { agents: [baseAgent] } });
+  });
+  await page.goto('/configs');
+  await expect(page.getByRole('button', { name: '将 agent-base 加入批次', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: '将 agent-base 加入批次', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '新建评测批次' })).toBeVisible();
+  await expect(page.getByText('0 Agents · 0 Contests')).toBeVisible();
 });
 
 test('merges partial remote preview mappings, carries points_known=false for incomplete CF weights, and renders Push Target load errors', async ({ page }) => {
@@ -251,6 +270,39 @@ test('merges partial remote preview mappings, carries points_known=false for inc
   expect(savedCf.document.problems).toEqual([{ id: 'A', max_points: 1 }, { id: 'B', max_points: 1000 }]);
   expect(savedCf.document.judge.problem_map).toEqual({ A: 'C' });
   expect(savedCf.document.judge.points_known).toBe(false);
+
+  // Creating a fresh CF contest: preview verifies A=500, but editing A to 1 MUST drop points_known to false;
+  // manual confirmation only binds the confirmed weights and invalidates on subsequent edits.
+  let createdCf: any;
+  await page.route('**/api/contests', route => { createdCf = route.request().postDataJSON(); return route.fulfill({ status: 201, json: { path: 'contests/cf-new.json' } }); });
+  await page.route('**/api/contests/preview', route => route.fulfill({ json: {
+    preview: { platform: 'codeforces', contest_ref: '2000', title: 'Codeforces 2000', status: 'finished', problems: [{ remote_id: 'A', title: 'Alpha', max_points: 500 }], suggested_languages: [] },
+    language_presets: [{ id: 'cpp17', label: 'C++17', remote_id: '54' }],
+  } }));
+  await page.getByRole('button', { name: '新建 Contest', exact: true }).click();
+  await page.getByLabel('Contest ID').fill('cf-new');
+  await page.getByRole('button', { name: '继续', exact: true }).click();
+  await page.getByRole('tab', { name: '引用本机路径' }).click();
+  await page.getByLabel('题面 PDF').fill('contests/cf-new/problems.pdf');
+  await page.getByRole('button', { name: '继续', exact: true }).click();
+  await page.getByRole('combobox', { name: '判题后端' }).click();
+  await page.getByRole('option', { name: 'Codeforces', exact: true }).click();
+  await page.getByLabel('Codeforces 赛事 ID').fill('2000');
+  await page.getByLabel('专用账号名').fill('cf_bot');
+  await page.getByRole('button', { name: '拉取赛事信息' }).click();
+  await expect(page.getByLabel('远程题目 1 分值')).toHaveValue('500');
+  // Override verified 500 with unverified 1 -> notice appears, points_known becomes false
+  await page.getByLabel('远程题目 1 分值').fill('1');
+  await expect(page.getByText(/points_known = false/)).toBeVisible();
+  // Confirming binds to weight=1, then changing weight to 2 invalidates confirmation back to false
+  await page.getByLabel(/我已手工核对并确认当前全部题目真实满分/).check();
+  await expect(page.getByText(/如再修改题号或分值需重新确认/)).toBeVisible();
+  await page.getByLabel('远程题目 1 分值').fill('2');
+  await expect(page.getByText(/points_known = false/)).toBeVisible();
+  await page.getByRole('button', { name: '继续', exact: true }).click();
+  await page.getByRole('button', { name: '仅保存', exact: true }).click();
+  expect(createdCf.document.problems).toEqual([{ id: 'A', max_points: 2 }]);
+  expect(createdCf.document.judge.points_known).toBe(false);
 
   // PushTargetsPanel surfaces load errors cleanly instead of empty state
   await page.route('**/api/push-targets', route => route.fulfill({ status: 500, json: { error: 'push store unavailable' } }));

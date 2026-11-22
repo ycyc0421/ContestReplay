@@ -882,7 +882,8 @@ async function prepareContestWrite(
     const matchesStoredBinding = Boolean(
       existingAnswersBinding &&
       existingAnswersBinding.fullPath === verifiedAnswers.fullPath &&
-      (!existingAnswersBinding.sha256 || existingAnswersBinding.sha256 === verifiedAnswers.sha256),
+      existingAnswersBinding.sha256 &&
+      existingAnswersBinding.sha256 === verifiedAnswers.sha256,
     );
     if (matchesStoredBinding) {
       preservedAnswersFullPath = verifiedAnswers.fullPath;

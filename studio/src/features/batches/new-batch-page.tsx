@@ -114,12 +114,11 @@ export function NewBatchPage() {
     if (!raw) return;
     try {
       const pending = JSON.parse(raw) as { kind: 'agent' | 'contest'; path: string };
-      if ((pending.kind === 'agent' && !agentsQuery.data) || (pending.kind === 'contest' && !contestsQuery.data)) return;
+      const targetQuery = pending.kind === 'agent' ? agentsQuery : contestsQuery;
+      // Always wait for any in-flight catalog refetch and only consume after a successful response.
+      if (targetQuery.isFetching || targetQuery.isError || !targetQuery.data) return;
       const entries = pending.kind === 'agent' ? agents : contests;
       const entry = entries.find(item => pending.path === item.path || pending.path.endsWith(`/${item.path}`));
-      const fetching = pending.kind === 'agent' ? agentsQuery.isFetching : contestsQuery.isFetching;
-      // Wait for an in-flight catalog refetch before consuming a newly saved pending config.
-      if ((!entry || !entry.valid) && fetching) return;
       if (entry?.valid) {
         if ('harness' in entry) {
           const validContests = contestsQuery.data ? new Set(contests.filter(item => item.valid).map(item => item.path)) : undefined;
@@ -141,7 +140,7 @@ export function NewBatchPage() {
       }
       setPlan(null); setStage('catalog'); sessionStorage.removeItem('cr.batch.pending');
     } catch { sessionStorage.removeItem('cr.batch.pending'); }
-  }, [agentsQuery.data, contestsQuery.data, agentsQuery.isFetching, contestsQuery.isFetching]);
+  }, [agentsQuery.data, contestsQuery.data, agentsQuery.isFetching, contestsQuery.isFetching, agentsQuery.isError, contestsQuery.isError]);
   const invalidate = () => { setPlan(null); if (stage === 'review') setStage('matrix'); };
   const toggleAgent = (path: string) => {
     invalidate();

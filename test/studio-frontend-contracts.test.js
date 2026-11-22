@@ -330,6 +330,41 @@ test('Studio frontend contracts against real backend: preflight, remote contests
   assert.match(handAfterMutated.document.judge.answers.path, /^hand-demo\.judge\.[a-f0-9]{12}\.json$/);
   assert.notEqual(handAfterMutated.contest_revision, handReloaded.contest_revision);
 
+  // 4b-iii. A manifest omitting stored judge.answers.sha256 must also publish an immutable copy (never reuse mutable path)
+  const unpinnedAnswers = JSON.stringify({ schema_version: 1, problems: [{ id: 'A', max_points: 10, accepted_answers: ['7'] }] }, null, 2) + '\n';
+  const unpinnedAnswersSha = createHash('sha256').update(unpinnedAnswers).digest('hex');
+  await writeFile(join(base, 'contests', 'unpinned-answers.json'), unpinnedAnswers, 'utf8');
+  await writeFile(join(base, 'contests', 'unpinned-demo.json'), JSON.stringify({
+    schema_version: 2,
+    contest_id: 'unpinned-demo',
+    data_version: 1,
+    title: 'Unpinned Demo',
+    source: { name: 'Local' },
+    materials: { entrypoint: { kind: 'pdf', path: 'problems.pdf', sha256: pdfSha, redistribution: 'restricted' } },
+    problems: [{ id: 'A', max_points: 10 }],
+    rules: { time_limit_ms: 90_000, max_submissions: 50 },
+    judge: { kind: 'local', answers: { path: 'unpinned-answers.json', redistribution: 'restricted' } },
+  }, null, 2) + '\n', 'utf8');
+  const unpinnedPut = await req('/api/contests/item', {
+    method: 'PUT',
+    body: {
+      path: 'contests/unpinned-demo.json',
+      document: {
+        schema_version: 2,
+        contest_id: 'unpinned-demo',
+        data_version: 1,
+        title: 'Unpinned Demo Updated',
+        source: { name: 'Local' },
+        materials: { entrypoint: { kind: 'pdf', path: 'problems.pdf', sha256: pdfSha, redistribution: 'restricted' } },
+        problems: [{ id: 'A', max_points: 10 }],
+        rules: { time_limit_ms: 90_000, max_submissions: 50 },
+        judge: { kind: 'local', answers: { path: 'unpinned-answers.json', sha256: unpinnedAnswersSha, redistribution: 'restricted' } },
+      },
+    },
+  });
+  assert.equal(unpinnedPut.status, 200, unpinnedPut.text);
+  assert.match(unpinnedPut.value.judge_path, /^contests\/unpinned-demo\.judge\.[a-f0-9]{12}\.json$/);
+
   // 4c. Remote Contest preview resolves manifest-relative pdf_path (contests/problems.pdf) and saved relative managed upload path
   const remotePreviewRel = await req('/api/contests/preview', {
     body: {
