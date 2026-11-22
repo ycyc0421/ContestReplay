@@ -37,7 +37,12 @@ test('edits an Agent and dry-runs then applies a variant matrix', async ({ page 
   });
   const variant = { id: 'agent-base-high', path: 'agents/agent-base-high.toml', format: 'toml', manifest: document, revision: digest, digests: { profile_sha256: digest, effective_sha256: digest }, warnings: [] };
   const variantCalls: any[] = [];
-  await page.route('**/api/agents/variants', route => { const body = route.request().postDataJSON(); variantCalls.push(body); return route.fulfill({ status: body.dry_run ? 200 : 201, json: { dry_run: body.dry_run, variants: [variant] } }); });
+  await page.route('**/api/agents/variants', async route => {
+    const body = route.request().postDataJSON();
+    variantCalls.push(body);
+    if (body.dry_run) await new Promise(resolve => setTimeout(resolve, 150));
+    return route.fulfill({ status: body.dry_run ? 200 : 201, json: { dry_run: body.dry_run, variants: [variant] } });
+  });
   await page.goto('/configs');
   await page.getByRole('button', { name: '编辑 agent-base', exact: true }).click();
   await expect(page.getByLabel('Agent ID')).toBeDisabled();
@@ -55,10 +60,14 @@ test('edits an Agent and dry-runs then applies a variant matrix', async ({ page 
   await expect(page.getByRole('button', { name: 'Dry-run 预览' })).toBeDisabled();
   await page.getByRole('checkbox', { name: 'effort default', exact: true }).click();
   await page.getByRole('button', { name: 'Dry-run 预览' }).click();
+  // Choices are locked while Dry-run is in flight so Create can never submit a drifted matrix
+  await expect(page.getByRole('checkbox', { name: 'effort high', exact: true })).toBeDisabled();
   await expect(page.getByText('agent-base-high', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: /创建 1 个变体/ }).click();
   expect(variantCalls.map(call => call.dry_run)).toEqual([true, false]);
   expect(variantCalls[0].reasoning_efforts).toEqual(['high']);
+  expect(variantCalls[1].reasoning_efforts).toEqual(variantCalls[0].reasoning_efforts);
+  expect(variantCalls[1].speed_tiers).toEqual(variantCalls[0].speed_tiers);
 });
 
 test('preserves external native_config, shows legacy Agent read-only, and clears editor on delete', async ({ page }) => {
@@ -68,7 +77,7 @@ test('preserves external native_config, shows legacy Agent read-only, and clears
   await page.route('**/api/catalog/agents', route => route.fulfill({ json: { agents: agentCatalog } }));
   await page.route('**/api/catalog/contests', route => route.fulfill({ json: { contests: [] } }));
   const nativeOverride = { format: 'toml', path: 'override.toml', sha256: digest };
-  const extDoc = {
+  let currentExtDoc: any = {
     kind: 'contestreplay.dev/agent', schema_version: 1, id: 'agent-base', name: 'Base Agent', vendor: 'openai', provider: 'demo', model: 'gpt-test',
     harness: { kind: 'codex', version: '0.170.0', options: { reasoning_effort: 'high' }, native_config: nativeOverride },
   };
@@ -82,11 +91,21 @@ test('preserves external native_config, shows legacy Agent read-only, and clears
     if (path === legacyAgent.path) {
       return route.fulfill({ json: { path: legacyAgent.path, format: 'toml', document: legacyDoc, valid: true, issues: [], id: 'demo-codex', model: 'gpt-5.3-codex', harness: 'codex' } });
     }
-    return route.fulfill({ json: { path: baseAgent.path, format: 'toml', document: extDoc, valid: true, issues: [], id: 'agent-base', name: 'Base Agent', model: 'gpt-test', vendor: 'openai', harness: 'codex', provider: 'demo', speed_tier: 'standard' } });
+    return route.fulfill({ json: { path: baseAgent.path, format: 'toml', document: currentExtDoc, valid: true, issues: [], id: 'agent-base', name: currentExtDoc.name, model: 'gpt-test', vendor: 'openai', harness: 'codex', provider: 'demo', speed_tier: 'standard' } });
   });
-  let updated: any;
+  let previewReq: any;
+  await page.route('**/api/agents/preview', route => {
+    previewReq = route.request().postDataJSON();
+    return route.fulfill({ json: { format: 'toml', content: 'model_verbosity = "low"\n' } });
+  });
+  const updates: any[] = [];
   await page.route('**/api/agents/item', route => {
-    if (route.request().method() === 'PUT') { updated = route.request().postDataJSON(); return route.fulfill({ json: { path: baseAgent.path } }); }
+    if (route.request().method() === 'PUT') {
+      const payload = route.request().postDataJSON();
+      updates.push(payload);
+      currentExtDoc = payload.document;
+      return route.fulfill({ json: { path: baseAgent.path } });
+    }
     return route.continue();
   });
 
@@ -97,17 +116,101 @@ test('preserves external native_config, shows legacy Agent read-only, and clears
   await expect(page.getByText('OPENAI_API_KEY', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: '保存修改' })).toHaveCount(0);
 
-  // External native_config { path, sha256, format } is preserved on name-only save
+  // External native_config { path, sha256, format } is preserved on name-only save and preview sends file: initial.path
   await page.getByRole('button', { name: '编辑 agent-base', exact: true }).click();
+  await page.getByRole('tab', { name: '最终预览' }).click();
+  await page.getByRole('button', { name: '生成脱敏预览' }).click();
+  await expect(page.getByText('model_verbosity = "low"')).toBeVisible();
+  expect(previewReq.file).toBe(baseAgent.path);
+
   await page.getByLabel('展示名称').fill('Base Renamed');
   await page.getByRole('button', { name: '保存修改', exact: true }).click();
-  expect(updated.document.harness.native_config).toEqual(nativeOverride);
-  expect(updated.document.model_family_id).toBeUndefined();
+  expect(updates[0].document.harness.native_config).toEqual(nativeOverride);
+  expect(updates[0].document.model_family_id).toBeUndefined();
+
+  // Removing external native_config and saving reloads initial so subsequent edits never resurrect it
+  await page.getByRole('tab', { name: '原生覆盖' }).click();
+  await page.getByLabel('移除已绑定的外部原生覆盖文件').check();
+  await page.getByRole('button', { name: '保存修改', exact: true }).click();
+  expect(updates[1].document.harness.native_config).toBeUndefined();
+  await page.getByLabel(/TOML 参数覆盖/).fill('model_verbosity = "high"');
+  await page.getByLabel(/TOML 参数覆盖/).fill('');
+  await page.getByRole('button', { name: '保存修改', exact: true }).click();
+  expect(updates[2].document.harness.native_config).toBeUndefined();
 
   // Deleting the currently open Agent clears edit state back to "新建 Agent"
   await page.getByRole('button', { name: '删除 agent-base', exact: true }).click();
   await page.getByRole('button', { name: '删除配置', exact: true }).click();
   await expect(page.getByRole('tab', { name: '新建 Agent' })).toBeVisible();
+});
+
+test('merges partial remote preview mappings, carries points_known=false for incomplete CF weights, and renders Push Target load errors', async ({ page }) => {
+  await mockShell(page);
+  const existingCf = { id: 'cf-partial', path: 'contests/cf-partial.json', title: 'CF Partial', data_version: 1, judge_kind: 'codeforces', problem_count: 2, time_limit_ms: 900000, valid: true, issues: [] };
+  await page.route('**/api/catalog/agents', route => route.fulfill({ json: { agents: [] } }));
+  await page.route('**/api/catalog/contests', route => route.fulfill({ json: { contests: [existingCf] } }));
+  const cfDoc = {
+    kind: 'contestreplay.dev/contest', schema_version: 2, contest_id: 'cf-partial', data_version: 1, title: 'CF Partial', source: { name: 'CF' },
+    materials: { entrypoint: { kind: 'pdf', path: 'paper.pdf', sha256: digest, redistribution: 'restricted' }, attachments: [] },
+    problems: [{ id: 'A', max_points: 500 }, { id: 'B', max_points: 1000 }],
+    rules: { time_limit_ms: 7_200_000, max_submissions: 100 },
+    judge: { kind: 'codeforces', contest_id: 1999, handle: 'cf_bot', languages: { cpp17: '54' }, problem_map: { A: 'A' } },
+  };
+  await page.route('**/api/contests/item?*', route => route.fulfill({ json: { path: existingCf.path, document: cfDoc, valid: true, issues: [], contest_id: 'cf-partial', contest_revision: digest, judge_kind: 'codeforces' } }));
+  let previewReq: any;
+  await page.route('**/api/contests/preview', route => {
+    previewReq = route.request().postDataJSON();
+    return route.fulfill({ json: {
+      preview: {
+        platform: 'codeforces', contest_ref: '1999', title: 'Codeforces 1999', status: 'finished',
+        problems: [{ remote_id: 'A', title: 'Alpha', max_points: 0 }, { remote_id: 'C', title: 'Gamma' }],
+        suggested_languages: [],
+      },
+      language_presets: [{ id: 'cpp17', label: 'C++17', remote_id: '54' }],
+      pdf_info: {
+        path: 'contests/paper.pdf', size_bytes: 1024, sha256: digest, page_count: 2,
+        problems: [{ id: 'A', title: 'Alpha' }, { id: 'B', title: 'Beta' }],
+        problem_ids: ['A', 'B'], text_length: 100, text_truncated: false, extractor: 'fallback',
+      },
+      problem_map_suggestion: {
+        problem_map: { A: 'A' }, confirmed_map: { A: 'A' }, suggested_map: {},
+        matches: [{ local_id: 'A', remote_id: 'A', strategy: 'exact', confidence: 'exact' }],
+        unmapped_local: ['B'], unmapped_remote: ['C'],
+      },
+    } });
+  });
+  let savedCf: any;
+  await page.route('**/api/contests/item', route => {
+    if (route.request().method() === 'PUT') { savedCf = route.request().postDataJSON(); return route.fulfill({ json: { path: existingCf.path } }); }
+    return route.continue();
+  });
+
+  await page.goto('/configs');
+  await page.getByRole('tab', { name: /Contests/ }).click();
+  await page.getByRole('button', { name: '编辑 cf-partial', exact: true }).click();
+  await page.getByRole('button', { name: '继续', exact: true }).click();
+  await page.getByRole('button', { name: '继续', exact: true }).click();
+  await page.getByRole('button', { name: '拉取赛事信息' }).click();
+  await expect(page.getByText(/未自动映射的本地题号/)).toBeVisible();
+  await expect(page.getByText(/points_known = false/)).toBeVisible();
+  expect(previewReq.manifest_path).toBe('contests/cf-partial.json');
+  expect(previewReq.manifest_contest_id).toBe('cf-partial');
+  expect(previewReq.pdf_path).toBe('paper.pdf');
+  // Existing problem B must NOT be silently dropped by partial mapping A->A
+  await expect(page.getByLabel('远程题目 1 题号')).toHaveValue('A');
+  await expect(page.getByLabel('远程题目 2 题号')).toHaveValue('B');
+  await page.getByRole('button', { name: '继续', exact: true }).click();
+  await page.getByRole('button', { name: '保存修改', exact: true }).click();
+  expect(savedCf.document.problems).toEqual([{ id: 'A', max_points: 500 }, { id: 'B', max_points: 1000 }]);
+  expect(savedCf.document.judge.points_known).toBe(false);
+
+  // PushTargetsPanel surfaces load errors cleanly instead of empty state
+  await page.route('**/api/push-targets', route => route.fulfill({ status: 500, json: { error: 'push store unavailable' } }));
+  await page.route('**/api/push-deliveries?*', route => route.fulfill({ json: { deliveries: [] } }));
+  await page.goto('/providers');
+  await page.getByRole('tab', { name: 'Push Targets' }).click();
+  await expect(page.getByText('无法读取 Push Targets')).toBeVisible();
+  await expect(page.getByText('push store unavailable')).toBeVisible();
 });
 
 test('preserves sub-minute time limit, PDF digest and local judge binding on metadata-only Contest edit and saves QOJ explicit problems', async ({ page }) => {

@@ -94,17 +94,67 @@ test('shows live progress, incremental logs and a scrubbable replay', async ({ p
   await page.getByRole('button', { name: '跳到终态' }).click();
   await expect(page.getByText('accepted', { exact: true })).toBeVisible();
   await expect(page.getByText('AC 00:55')).toBeVisible();
+  // Clicking an earlier event in 事件序列 syncs cursor and projected status/score
+  await page.getByRole('button', { name: /#1 · submission received/ }).click();
+  await expect(page.getByText('pending', { exact: true })).toBeVisible();
   await expect(page.getByText('Session 留存')).toBeVisible();
 });
 
-test('keeps terminal SSE progress against slower GET and drains final logs on completion', async ({ page }) => {
-  let runStatus: 'running' | 'completed' = 'running';
+test('treats terminal SSE status as authoritative when progress GET still says running and resets log offsets on stream switch', async ({ page }) => {
+  const stderrOffsets: number[] = [];
+  let stdoutPhase = 0;
+  await page.route('**/api/batches', route => route.fulfill({ json: {
+    busy: true, error: null,
+    batches: [{ id: batchId, created_at: '2025-01-01T08:00:00.000Z', concurrency: 1, jobs: [{ status: 'running', run_id: runA, agent_id: 'agent-a', agent_name: 'Agent A', agent_revision: digest, contest_id: 'demo', data_version: 1, harness: 'codex' }] }],
+  } }));
+  // Follow-up GET still reports status: 'running' even after SSE sends terminal status: 'interrupted'
+  await page.route(`**/api/runs/${runA}/progress`, route => route.fulfill({ json: progress }));
+  await page.route(`**/api/runs/${runA}/events`, route => route.fulfill({
+    status: 200,
+    headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
+    body: `event: progress\ndata: ${JSON.stringify(progress)}\n\nevent: status\ndata: ${JSON.stringify({ run_id: runA, status: 'interrupted', reason: 'cancelled' })}\n\n`,
+  }));
+  await page.route(`**/api/runs/${runA}/logs?*`, route => {
+    const url = new URL(route.request().url());
+    const stream = url.searchParams.get('stream');
+    const offset = Number(url.searchParams.get('offset'));
+    if (stream === 'stderr') {
+      stderrOffsets.push(offset);
+      const chunk = offset === 0 ? 'err start\n' : '';
+      return route.fulfill({ json: { stream: 'stderr', offset, next_offset: offset + chunk.length, total_bytes: 10, has_more: false, chunk } });
+    }
+    if (offset === 0) {
+      const chunk = 'stdout-0123456789\n';
+      return route.fulfill({ json: { stream: 'stdout', offset: 0, next_offset: chunk.length, total_bytes: chunk.length, has_more: false, chunk } });
+    }
+    if (stdoutPhase === 0) {
+      stdoutPhase = 1;
+      const chunk = 'tail-after-interrupt\n';
+      return route.fulfill({ json: { stream: 'stdout', offset, next_offset: offset + chunk.length, total_bytes: offset + chunk.length, has_more: false, chunk } });
+    }
+    return route.fulfill({ json: { stream: 'stdout', offset, next_offset: offset, total_bytes: offset, has_more: false, chunk: '' } });
+  });
+
+  await page.goto(`/runs/${runA}`);
+  await expect(page.getByText('已中断', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '停止任务' })).toHaveCount(0);
+
+  await page.getByRole('tab', { name: '原始日志' }).click();
+  await expect(page.getByText('stdout-0123456789 tail-after-interrupt')).toBeVisible();
+  await page.getByRole('tab', { name: 'stderr' }).click();
+  await expect(page.getByText('err start')).toBeVisible();
+  // Switching from stdout (offset > 0) to stderr must start stderr from offset 0, never stdout's offset
+  expect(stderrOffsets[0]).toBe(0);
+  await page.getByRole('tab', { name: 'stdout' }).click();
+  await expect(page.getByText('stdout-0123456789')).toBeVisible();
+});
+
+test('keeps terminal SSE progress against slower GET and stops polling', async ({ page }) => {
   let progressGets = 0;
-  let logPhase = 0;
   const terminalProgress = { ...progress, status: 'completed', score: 2, solved_count: 2 };
   await page.route('**/api/batches', route => route.fulfill({ json: {
-    busy: runStatus === 'running', error: null,
-    batches: [{ id: batchId, created_at: '2025-01-01T08:00:00.000Z', concurrency: 1, jobs: [{ status: runStatus, run_id: runA, agent_id: 'agent-a', agent_name: 'Agent A', agent_revision: digest, contest_id: 'demo', data_version: 1, harness: 'codex' }] }],
+    busy: true, error: null,
+    batches: [{ id: batchId, created_at: '2025-01-01T08:00:00.000Z', concurrency: 1, jobs: [{ status: 'running', run_id: runA, agent_id: 'agent-a', agent_name: 'Agent A', agent_revision: digest, contest_id: 'demo', data_version: 1, harness: 'codex' }] }],
   } }));
   await page.route(`**/api/runs/${runA}/progress`, async route => {
     progressGets += 1;
@@ -117,14 +167,33 @@ test('keeps terminal SSE progress against slower GET and drains final logs on co
     headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
     body: `event: progress\ndata: ${JSON.stringify(terminalProgress)}\n\n`,
   }));
+
+  await page.goto(`/runs/${runA}`);
+  await expect(page.getByText('运行已结束')).toBeVisible();
+  await expect(page.getByText('2 / 2', { exact: true }).first()).toBeVisible();
+  // Wait past the delayed GET to ensure it never rolls back the terminal SSE snapshot.
+  await page.waitForTimeout(450);
+  await expect(page.getByText('2 / 2', { exact: true }).first()).toBeVisible();
+  expect(progressGets).toBeLessThanOrEqual(1);
+});
+
+test('drains final log bytes appended between last live poll and completion', async ({ page }) => {
+  let runStatus: 'running' | 'completed' = 'running';
+  let sawEmptyLiveSlice = false;
+  await page.route('**/api/batches', route => route.fulfill({ json: {
+    busy: runStatus === 'running', error: null,
+    batches: [{ id: batchId, created_at: '2025-01-01T08:00:00.000Z', concurrency: 1, jobs: [{ status: runStatus, run_id: runA, agent_id: 'agent-a', agent_name: 'Agent A', agent_revision: digest, contest_id: 'demo', data_version: 1, harness: 'codex' }] }],
+  } }));
+  await page.route(`**/api/runs/${runA}/progress`, route => route.fulfill({ json: runStatus === 'completed' ? { ...progress, status: 'completed' } : progress }));
+  await page.route(`**/api/runs/${runA}/events`, route => route.abort());
   await page.route(`**/api/runs/${runA}/logs?*`, route => {
     const offset = Number(new URL(route.request().url()).searchParams.get('offset'));
     if (offset === 0) {
       const chunk = 'live line\n';
       return route.fulfill({ json: { stream: 'stdout', offset: 0, next_offset: chunk.length, total_bytes: chunk.length, has_more: false, chunk } });
     }
-    if (logPhase === 0) {
-      logPhase = 1;
+    if (!sawEmptyLiveSlice) {
+      sawEmptyLiveSlice = true;
       runStatus = 'completed';
       return route.fulfill({ json: { stream: 'stdout', offset, next_offset: offset, total_bytes: offset, has_more: false, chunk: '' } });
     }
@@ -136,13 +205,6 @@ test('keeps terminal SSE progress against slower GET and drains final logs on co
   });
 
   await page.goto(`/runs/${runA}`);
-  await expect(page.getByText('运行已结束')).toBeVisible();
-  await expect(page.getByText('2 / 2', { exact: true }).first()).toBeVisible();
-  // Wait past the delayed GET to ensure it never rolls back the terminal SSE snapshot.
-  await page.waitForTimeout(450);
-  await expect(page.getByText('2 / 2', { exact: true }).first()).toBeVisible();
-  expect(progressGets).toBeLessThanOrEqual(1);
-
   await page.getByRole('tab', { name: '原始日志' }).click();
   await expect(page.getByText('live line final line')).toBeVisible();
 });
@@ -208,4 +270,32 @@ test('plans repeated cells with parallel workers and preflight', async ({ page }
   expect(preflightPayload).toEqual({ cells: [{ agent: agent.path, contest: contest.path }] });
   await page.getByRole('button', { name: '确认并启动批次' }).click();
   expect(launched.concurrency).toBe(4);
+});
+
+test('prunes deleted and invalid configs from sessionStorage batch draft before calling matrix', async ({ page }) => {
+  const validAgent = { id: 'agent-live', path: 'agents/agent-live.toml', model: 'gpt-test', harness: 'codex', provider_available: true, valid: true, issues: [] };
+  const invalidAgent = { id: 'agent-broken', path: 'agents/agent-broken.toml', model: 'gpt-test', harness: 'codex', provider_available: false, valid: false, issues: ['broken'] };
+  const validContest = { id: 'demo', path: 'contests/demo.json', title: 'Demo Final', data_version: 1, judge_kind: 'local', problem_count: 2, time_limit_ms: 900000, valid: true, issues: [] };
+  await page.route('**/api/catalog/agents', route => route.fulfill({ json: { agents: [validAgent, invalidAgent] } }));
+  await page.route('**/api/catalog/contests', route => route.fulfill({ json: { contests: [validContest] } }));
+  let matrixReq: any;
+  await page.route('**/api/matrix', route => {
+    matrixReq = route.request().postDataJSON();
+    return route.fulfill({ json: { cells: [{ agent: validAgent.path, contest: validContest.path, compatible: true }] } });
+  });
+  await page.addInitScript(() => {
+    sessionStorage.setItem('cr.batch.draft', JSON.stringify({
+      agents: ['agents/deleted.toml', 'agents/agent-broken.toml', 'agents/agent-live.toml'],
+      contests: ['contests/deleted.json', 'contests/demo.json'],
+      cells: [
+        JSON.stringify(['agents/deleted.toml', 'contests/deleted.json']),
+        JSON.stringify(['agents/agent-live.toml', 'contests/demo.json']),
+      ],
+    }));
+  });
+  await page.goto('/batches/new');
+  await expect(page.getByText('1 Agents · 1 Contests')).toBeVisible();
+  await page.getByRole('button', { name: '调整矩阵', exact: true }).click();
+  await expect(page.getByText('1 个任务', { exact: true })).toBeVisible();
+  expect(matrixReq).toEqual({ agents: ['agents/agent-live.toml'], contests: ['contests/demo.json'] });
 });

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Connections } from '../dist/connections.js';
@@ -74,7 +74,20 @@ test('Studio frontend contracts against real backend: preflight, remote contests
   const overrideSha = createHash('sha256').update(overrideText).digest('hex');
   await writeFile(join(base, 'agents', 'override.toml'), overrideText, 'utf8');
 
-  const studio = await startStudio(root, 0, { base, store, ojAccounts, getImage });
+  const studio = await startStudio(root, 0, {
+    base,
+    store,
+    ojAccounts,
+    getImage,
+    previewContest: async (platform, contestId) => ({
+      platform,
+      contest_ref: String(contestId),
+      title: `Preview ${contestId}`,
+      status: 'finished',
+      problems: [{ remote_id: 'A', title: 'Alpha', max_points: 500 }],
+      suggested_languages: [],
+    }),
+  });
   t.after(() => studio.close());
   const req = makeRequester(studio.url);
 
@@ -117,6 +130,13 @@ test('Studio frontend contracts against real backend: preflight, remote contests
     path: 'override.toml',
     sha256: overrideSha,
   });
+
+  // 1b. Agent effective-config preview succeeds with file: parsedAgent.path for external native_config
+  const previewedAgent = await req('/api/agents/preview', {
+    body: { file: parsedAgent.path, document: updatedAgent.value.manifest },
+  });
+  assert.equal(previewedAgent.status, 200, previewedAgent.text);
+  assert.match(previewedAgent.value.content, /model_verbosity\s*=\s*"low"/);
 
   // 2. Variant matrix default non-colliding selection succeeds on dry-run AND real write
   const dryVariants = await req('/api/agents/variants', {
@@ -253,6 +273,69 @@ test('Studio frontend contracts against real backend: preflight, remote contests
   assert.equal(localReloaded.contest_revision, localLoaded.contest_revision);
   assert.equal(localReloaded.document.rules.time_limit_ms, 10_000);
   assert.equal(localReloaded.document.materials.entrypoint.sha256, pdfSha);
+
+  // 4b. Pre-existing hand-authored manifest referencing answers.json preserves exact binding without generating a new .judge.<hash>.json file
+  const handAnswers = JSON.stringify({ schema_version: 1, problems: [{ id: 'A', max_points: 10, accepted_answers: ['42'] }] }, null, 2) + '\n';
+  const handAnswersSha = createHash('sha256').update(handAnswers).digest('hex');
+  await writeFile(join(base, 'contests', 'answers.json'), handAnswers, 'utf8');
+  await writeFile(join(base, 'contests', 'hand-demo.json'), JSON.stringify({
+    schema_version: 2,
+    contest_id: 'hand-demo',
+    data_version: 1,
+    title: 'Hand Authored',
+    source: { name: 'Local' },
+    materials: { entrypoint: { kind: 'pdf', path: 'problems.pdf', sha256: pdfSha, redistribution: 'restricted' } },
+    problems: [{ id: 'A', max_points: 10 }],
+    rules: { time_limit_ms: 90_000, max_submissions: 50 },
+    judge: { kind: 'local', answers: { path: 'answers.json', sha256: handAnswersSha, redistribution: 'restricted' } },
+  }, null, 2) + '\n', 'utf8');
+  const handLoaded = contestItemResponseSchema.parse(
+    (await req(`/api/contests/item?path=${encodeURIComponent('contests/hand-demo.json')}&include_judge=1`)).value,
+  );
+  const handUpdated = await req('/api/contests/item', {
+    method: 'PUT',
+    body: {
+      path: handLoaded.path,
+      document: { ...handLoaded.document, title: 'Hand Authored Renamed' },
+    },
+  });
+  assert.equal(handUpdated.status, 200, handUpdated.text);
+  const handReloaded = contestItemResponseSchema.parse(
+    (await req(`/api/contests/item?path=${encodeURIComponent('contests/hand-demo.json')}&include_judge=1`)).value,
+  );
+  assert.equal(handReloaded.contest_revision, handLoaded.contest_revision);
+  assert.equal(handReloaded.document.judge.answers.path, 'answers.json');
+  const contestFiles = await readdir(join(base, 'contests'));
+  assert.ok(!contestFiles.some(name => name.startsWith('hand-demo.judge.')), `Unexpected generated judge copy: ${contestFiles.join(', ')}`);
+
+  // 4c. Remote Contest preview resolves manifest-relative pdf_path (contests/problems.pdf) and saved relative managed upload path
+  const remotePreviewRel = await req('/api/contests/preview', {
+    body: {
+      platform: 'codeforces',
+      contest_id: 1999,
+      manifest_path: 'contests/cf-demo.json',
+      manifest_contest_id: 'cf-demo',
+      pdf_path: 'problems.pdf',
+    },
+  });
+  assert.equal(remotePreviewRel.status, 200, remotePreviewRel.text);
+  assert.equal(remotePreviewRel.value.pdf_info.path, 'contests/problems.pdf');
+  assert.ok(remotePreviewRel.value.pdf_info.page_count >= 1);
+
+  const managedDir = join(root, '.materials', 'cf-demo', 'entrypoint');
+  await mkdir(managedDir, { recursive: true });
+  await writeFile(join(managedDir, 'uploaded.pdf'), pdfBytes);
+  const remotePreviewManagedRel = await req('/api/contests/preview', {
+    body: {
+      platform: 'codeforces',
+      contest_id: 1999,
+      manifest_path: 'contests/cf-demo.json',
+      manifest_contest_id: 'cf-demo',
+      pdf_path: '../../runs/.materials/cf-demo/entrypoint/uploaded.pdf',
+    },
+  });
+  assert.equal(remotePreviewManagedRel.status, 200, remotePreviewManagedRel.text);
+  assert.equal(remotePreviewManagedRel.value.pdf_info.path, 'managed/cf-demo/entrypoint/uploaded.pdf');
 
   // 5. Preflight accepts exact frontend payload { cells } (no schema_version)
   const preflight = await req('/api/preflight', {

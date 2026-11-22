@@ -4,11 +4,13 @@ import { runProgressSchema, runStatusEventSchema, type RunProgressContract } fro
 import { studioApi } from '@/lib/api';
 
 export type ProgressConnection = 'connecting' | 'live' | 'polling' | 'closed';
+export type TerminalQueueStatus = { status: ReturnType<typeof runStatusEventSchema.parse>['status']; reason?: string };
 const isTerminal = (progress?: RunProgressContract) => progress?.status === 'completed' || progress?.status === 'void';
 
 export function useRunProgress(runId: string) {
   const queryClient = useQueryClient();
   const [connection, setConnection] = useState<ProgressConnection>('connecting');
+  const [terminalStatus, setTerminalStatus] = useState<TerminalQueueStatus>();
   const lastSseSeq = useRef(0);
   const queryKey = useMemo(() => ['progress', runId] as const, [runId]);
   const query = useQuery({
@@ -22,10 +24,11 @@ export function useRunProgress(runId: string) {
       }
       return result;
     },
-    refetchInterval: current => connection === 'live' || connection === 'closed' || isTerminal(current.state.data) ? false : 4_000,
+    refetchInterval: current => connection === 'live' || connection === 'closed' || Boolean(terminalStatus) || isTerminal(current.state.data) ? false : 4_000,
   });
 
   useEffect(() => {
+    setTerminalStatus(undefined);
     if (typeof EventSource === 'undefined') {
       setConnection('polling');
       return;
@@ -56,8 +59,9 @@ export function useRunProgress(runId: string) {
     source.addEventListener('status', event => {
       if (disposed || terminalClosed) return;
       try {
-        runStatusEventSchema.parse(JSON.parse((event as MessageEvent).data));
+        const parsed = runStatusEventSchema.parse(JSON.parse((event as MessageEvent).data));
         terminalClosed = true;
+        setTerminalStatus({ status: parsed.status, ...(parsed.reason ? { reason: parsed.reason } : {}) });
         source.close();
         setConnection('closed');
         void queryClient.invalidateQueries({ queryKey: ['batches'] });
@@ -72,5 +76,5 @@ export function useRunProgress(runId: string) {
     return () => { disposed = true; source.close(); };
   }, [runId, queryClient, queryKey]);
 
-  return { ...query, connection };
+  return { ...query, connection, terminalStatus };
 }

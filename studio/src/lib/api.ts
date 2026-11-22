@@ -80,11 +80,11 @@ export const studioApi = {
   deleteAgent: (path: string) => api(`/api/agents/item?path=${encodeURIComponent(path)}`, deletedResponseSchema, undefined, 'DELETE'),
   cloneAgent: (input: { source_path: string; id: string; name?: string; overrides?: Record<string, unknown> }) => api('/api/agents/clone', documentPathSchema, input),
   agentVariants: (input: { base_document: Record<string, unknown>; reasoning_efforts?: string[]; speed_tiers?: string[]; service_tiers?: string[]; dry_run: boolean }) => api('/api/agents/variants', agentVariantsResponseSchema, input),
-  previewAgent: (document: unknown) => api('/api/agents/preview', effectiveConfigSchema, { document }),
+  previewAgent: (document: unknown, file?: string) => api('/api/agents/preview', effectiveConfigSchema, { document, ...(file ? { file } : {}) }),
   saveContestDocument: (file: string, document: unknown) => api('/api/contests', documentPathSchema, { file, document }),
   contestItem: (path: string) => api(`/api/contests/item?path=${encodeURIComponent(path)}&include_judge=1`, contestItemResponseSchema),
   updateContest: (path: string, document: unknown) => api('/api/contests/item', documentPathSchema, { path, document }, 'PUT'),
-  previewContest: (input: { platform: 'codeforces' | 'qoj' | 'vjudge' | 'hydro'; contest_id: number | string; gym?: boolean; base_url?: string; domain?: string; account_id?: string; local_problems?: string[]; pdf_path?: string }) => api('/api/contests/preview', contestPreviewResponseSchema, input),
+  previewContest: (input: { platform: 'codeforces' | 'qoj' | 'vjudge' | 'hydro'; contest_id: number | string; gym?: boolean; base_url?: string; domain?: string; account_id?: string; local_problems?: string[]; pdf_path?: string; manifest_path?: string; manifest_contest_id?: string }) => api('/api/contests/preview', contestPreviewResponseSchema, input),
   deleteContest: (path: string) => api(`/api/contests/item?path=${encodeURIComponent(path)}`, deletedResponseSchema, undefined, 'DELETE'),
   connections: () => api('/api/connections', z.strictObject({ connections: z.array(connectionSchema) })),
   providers: async () => {

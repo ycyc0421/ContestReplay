@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
 import { Bot, Copy, FileCheck2, Pencil, Plus, Search, Sparkles, Trash2 } from 'lucide-react';
@@ -44,26 +44,38 @@ function CloneAgentDialog({ agent, onClose }: { agent: CatalogAgent; onClose: ()
 const effortOptions = ['default', 'low', 'medium', 'high', 'xhigh', 'max'];
 const speedOptions = ['standard', 'fast', 'ultrafast'];
 function toggleValue(values: string[], value: string) { return values.includes(value) ? values.filter(item => item !== value) : [...values, value]; }
-function Choice({ label, checked, onToggle }: { label: string; checked: boolean; onToggle: () => void }) {
-  return <button type="button" role="checkbox" aria-checked={checked} aria-label={label} onClick={onToggle} className={checked ? 'border bg-primary px-3 py-2 font-mono text-xs text-primary-foreground' : 'border bg-card px-3 py-2 font-mono text-xs text-muted-foreground hover:border-primary/40'}>{label}</button>;
+function Choice({ label, checked, disabled, onToggle }: { label: string; checked: boolean; disabled?: boolean; onToggle: () => void }) {
+  return <button type="button" role="checkbox" aria-checked={checked} aria-label={label} disabled={disabled} onClick={onToggle} className={checked ? 'border bg-primary px-3 py-2 font-mono text-xs text-primary-foreground disabled:opacity-50' : 'border bg-card px-3 py-2 font-mono text-xs text-muted-foreground hover:border-primary/40 disabled:opacity-50'}>{label}</button>;
 }
+type VariantSelection = { efforts: string[]; speeds: string[] };
 function VariantDialog({ agent, existingPaths, onClose }: { agent: CatalogAgent; existingPaths: Set<string>; onClose: () => void }) {
   const item = useQuery({ queryKey: ['agent-item', agent.path], queryFn: () => studioApi.agentItem(agent.path) });
   const supportsEffort = agent.harness === 'codex';
   const [efforts, setEfforts] = useState(supportsEffort ? ['high'] : ['default']);
   const [speeds, setSpeeds] = useState(supportsEffort ? ['standard'] : ['fast']);
-  const [preview, setPreview] = useState<AgentVariantsResponse>();
+  const [previewState, setPreviewState] = useState<{ selectionKey: string; selection: VariantSelection; response: AgentVariantsResponse }>();
   const client = useQueryClient();
+  const selectionKey = JSON.stringify({ efforts, speeds });
+  const latestSelectionKey = useRef(selectionKey);
+  latestSelectionKey.current = selectionKey;
   const rawDocument = item.data?.document && typeof item.data.document === 'object' && !Array.isArray(item.data.document)
     ? item.data.document as Record<string, unknown>
     : undefined;
   const isLegacy = Boolean(rawDocument && rawDocument.kind !== 'contestreplay.dev/agent');
-  const generate = useMutation({ mutationFn: (dryRun: boolean) => {
+  const generate = useMutation({ mutationFn: (vars: { dryRun: boolean; selection: VariantSelection; selectionKey: string }) => {
     if (!rawDocument) return Promise.reject(new Error('Agent 文档尚未就绪'));
-    return studioApi.agentVariants({ base_document: rawDocument, reasoning_efforts: efforts, speed_tiers: speeds, dry_run: dryRun });
-  }, onSuccess: async result => {
-    setPreview(result);
-    if (!result.dry_run) { await invalidateConfigQueries(client); toast.success(`已创建 ${result.variants.length} 个 Agent 变体`); onClose(); }
+    return studioApi.agentVariants({ base_document: rawDocument, reasoning_efforts: vars.selection.efforts, speed_tiers: vars.selection.speeds, dry_run: vars.dryRun });
+  }, onSuccess: async (result, vars) => {
+    if (vars.dryRun) {
+      // Ignore stale dry-run responses if selection changed while pending.
+      if (latestSelectionKey.current === vars.selectionKey) {
+        setPreviewState({ selectionKey: vars.selectionKey, selection: vars.selection, response: result });
+      }
+      return;
+    }
+    await invalidateConfigQueries(client);
+    toast.success(`已创建 ${result.variants.length} 个 Agent 变体`);
+    onClose();
   }, onError: (error: Error) => toast.error('变体生成失败', { description: error.message }) });
   const plannedIds = efforts.flatMap(effort => speeds.map(speed => {
     const slugParts = [agent.id];
@@ -75,12 +87,13 @@ function VariantDialog({ agent, existingPaths, onClose }: { agent: CatalogAgent;
   const hasCollision = collidingIds.length > 0;
   const count = efforts.length * speeds.length;
   const availableEfforts = supportsEffort ? effortOptions : ['default'];
+  const matchingPreview = previewState?.selectionKey === selectionKey ? previewState : undefined;
   return <Dialog open onOpenChange={open => { if (!open) onClose(); }}><DialogContent className="max-w-3xl"><DialogHeader title={`派生 ${agent.name ?? agent.id}`} description="按 effort × speed tier 生成独立配置。先 Dry-run 校验全部变体，再一次性写入；失败不会留下半批文件。" />
-    {item.isLoading ? <div className="skeleton h-48 border" /> : isLegacy ? <Note>此配置使用旧版 Agent 格式（未包含 contestreplay.dev/agent Manifest），无法直接派生变体矩阵。请先基于 Saved Provider 创建新版 Manifest Agent。</Note> : <div className="space-y-5"><div><div className="mb-2 text-xs font-medium">推理强度</div><div className="flex flex-wrap gap-2">{availableEfforts.map(value => <Choice key={value} label={`effort ${value}`} checked={efforts.includes(value)} onToggle={() => { setEfforts(current => toggleValue(current, value)); setPreview(undefined); }} />)}</div></div>
-      <div><div className="mb-2 text-xs font-medium">速度档位</div><div className="flex flex-wrap gap-2">{speedOptions.map(value => <Choice key={value} label={`speed ${value}`} checked={speeds.includes(value)} onToggle={() => { setSpeeds(current => toggleValue(current, value)); setPreview(undefined); }} />)}</div></div>
-      {preview && <div className="max-h-64 overflow-auto border scrollbar-thin"><div className="border-b bg-muted/40 px-3 py-2 font-mono text-[9px] uppercase text-muted-foreground">{preview.dry_run ? 'Dry-run preview' : 'Created variants'}</div>{preview.variants.map(variant => <div key={variant.id} className="flex items-center gap-3 border-b px-3 py-2 last:border-b-0"><div className="min-w-0 flex-1"><div className="text-xs font-medium">{variant.id}</div><div className="mt-1 font-mono text-[9px] text-muted-foreground">{variant.revision?.slice(0, 12) ?? variant.digests.effective_sha256.slice(0, 12)}</div></div>{variant.warnings.length > 0 && <Badge>{variant.warnings.length} warnings</Badge>}</div>)}</div>}
+    {item.isLoading ? <div className="skeleton h-48 border" /> : isLegacy ? <Note>此配置使用旧版 Agent 格式（未包含 contestreplay.dev/agent Manifest），无法直接派生变体矩阵。请先基于 Saved Provider 创建新版 Manifest Agent。</Note> : <div className="space-y-5"><div><div className="mb-2 text-xs font-medium">推理强度</div><div className="flex flex-wrap gap-2">{availableEfforts.map(value => <Choice key={value} label={`effort ${value}`} checked={efforts.includes(value)} disabled={generate.isPending} onToggle={() => { setEfforts(current => toggleValue(current, value)); setPreviewState(undefined); }} />)}</div></div>
+      <div><div className="mb-2 text-xs font-medium">速度档位</div><div className="flex flex-wrap gap-2">{speedOptions.map(value => <Choice key={value} label={`speed ${value}`} checked={speeds.includes(value)} disabled={generate.isPending} onToggle={() => { setSpeeds(current => toggleValue(current, value)); setPreviewState(undefined); }} />)}</div></div>
+      {matchingPreview && <div className="max-h-64 overflow-auto border scrollbar-thin"><div className="border-b bg-muted/40 px-3 py-2 font-mono text-[9px] uppercase text-muted-foreground">{matchingPreview.response.dry_run ? 'Dry-run preview' : 'Created variants'}</div>{matchingPreview.response.variants.map(variant => <div key={variant.id} className="flex items-center gap-3 border-b px-3 py-2 last:border-b-0"><div className="min-w-0 flex-1"><div className="text-xs font-medium">{variant.id}</div><div className="mt-1 font-mono text-[9px] text-muted-foreground">{variant.revision?.slice(0, 12) ?? variant.digests.effective_sha256.slice(0, 12)}</div></div>{variant.warnings.length > 0 && <Badge>{variant.warnings.length} warnings</Badge>}</div>)}</div>}
       {hasCollision && <p className="border-l-2 border-warning pl-3 text-xs text-warning">输出 ID 与源配置或已有文件冲突（{collidingIds.join('、')}）。请调整组合，避免 Dry-run 后创建失败。</p>}
-      <div className="flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between"><span className="text-xs text-muted-foreground">{efforts.length} efforts × {speeds.length} speeds = {count} variants</span><div className="flex gap-2"><Button variant="secondary" disabled={!item.data || count === 0 || hasCollision} loading={generate.isPending && generate.variables === true} onClick={() => generate.mutate(true)}>Dry-run 预览</Button><Button disabled={!preview?.dry_run || hasCollision || generate.isPending} loading={generate.isPending && generate.variables === false} onClick={() => generate.mutate(false)}><Sparkles className="size-4" />创建 {preview?.variants.length ?? count} 个变体</Button></div></div>
+      <div className="flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between"><span className="text-xs text-muted-foreground">{efforts.length} efforts × {speeds.length} speeds = {count} variants</span><div className="flex gap-2"><Button variant="secondary" disabled={!item.data || count === 0 || hasCollision || generate.isPending} loading={generate.isPending && generate.variables?.dryRun === true} onClick={() => generate.mutate({ dryRun: true, selection: { efforts: [...efforts], speeds: [...speeds] }, selectionKey })}>Dry-run 预览</Button><Button disabled={!matchingPreview?.response.dry_run || hasCollision || generate.isPending} loading={generate.isPending && generate.variables?.dryRun === false} onClick={() => { if (!matchingPreview) return; generate.mutate({ dryRun: false, selection: matchingPreview.selection, selectionKey: matchingPreview.selectionKey }); }}><Sparkles className="size-4" />创建 {matchingPreview?.response.variants.length ?? count} 个变体</Button></div></div>
     </div>}
   </DialogContent></Dialog>;
 }

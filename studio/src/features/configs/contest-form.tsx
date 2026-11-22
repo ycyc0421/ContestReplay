@@ -50,6 +50,9 @@ function defaultLanguagesFor(kind: string, capabilities: StudioCapabilities): Re
   if (firstPreset) return { [firstPreset.id]: firstPreset.remote_id };
   return kind === 'codeforces' ? { cpp17: '54' } : { cpp17: 'cpp17' };
 }
+function validMaxPoints(points?: number): number | undefined {
+  return typeof points === 'number' && Number.isFinite(points) && points >= 1 ? Math.round(points) : undefined;
+}
 const steps = [['基本信息', '身份、来源与授权'], ['比赛材料', '上传或引用完整题面'], ['判题配置', '题目、答案与提交后端'], ['赛规确认', '预算与文件摘要']] as const;
 
 function MaterialUpload({ contestId, onUploaded }: { contestId: string; onUploaded: (material: Material) => void }) {
@@ -134,6 +137,8 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
   const [problems, setProblems] = useState<ProblemDraft[]>(initialProblemDrafts);
   const [remotePreview, setRemotePreview] = useState<ContestPreviewResponse>();
   const initialJudgeKind = sourceJudge?.kind ?? 'local';
+  const [pointsKnown, setPointsKnown] = useState<boolean | undefined>(initialJudgeKind === 'codeforces' ? sourceJudge?.points_known : undefined);
+  const [pointsIncompleteFromPreview, setPointsIncompleteFromPreview] = useState(initialJudgeKind === 'codeforces' && sourceJudge?.points_known === false);
   const { register, control, handleSubmit, watch, setValue, getValues, trigger, setError, clearErrors, formState: { errors, isSubmitting } } = useForm<Values>({ resolver: zodResolver(schema), defaultValues: {
     file: initial?.path ?? 'contest.json', id: source?.contest_id ?? '', dataVersion: source?.data_version ?? 1,
     title: source?.title ?? '', sourceName: source?.source?.name ?? 'Local', sourceUrl: source?.source?.url ?? '',
@@ -157,18 +162,48 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
     ...(values.domain.trim() ? { domain: values.domain.trim() } : {}),
     ...(values.accountId ? { account_id: values.accountId } : {}),
     ...(values.pdf.trim() ? { pdf_path: values.pdf.trim() } : {}),
+    ...(values.file.trim() ? { manifest_path: values.file.trim() } : {}),
+    ...(values.id.trim() ? { manifest_contest_id: values.id.trim() } : {}),
   }), onSuccess: result => {
     setRemotePreview(result);
     if (!getValues('title').trim()) setValue('title', result.preview.title);
     if (result.language_presets.length) setValue('languages', JSON.stringify(Object.fromEntries(result.language_presets.map(language => [language.id, language.remote_id]))));
-    if (result.problem_map_suggestion) setValue('problemMap', JSON.stringify(result.problem_map_suggestion.problem_map, null, 2));
-    const mapping = result.problem_map_suggestion?.problem_map ?? Object.fromEntries(result.preview.problems.map(problem => [problem.remote_id, problem.remote_id]));
-    const entries = Object.entries(mapping);
-    if (entries.length) setProblems(entries.map(([localId, remoteId]) => ({
-      id: localId,
-      maxPoints: result.preview.problems.find(problem => problem.remote_id === remoteId)?.max_points ?? initialProblemDrafts.find(problem => problem.id === localId)?.maxPoints ?? 1,
-      answers: initialProblemDrafts.find(problem => problem.id === localId)?.answers ?? '',
-    })));
+    const existingMap = parsePlainRecord(getValues('problemMap')) ?? {};
+    const suggestedMap = result.problem_map_suggestion?.problem_map ?? {};
+    const mergedMap = Object.keys(suggestedMap).length ? { ...existingMap, ...suggestedMap } : existingMap;
+    if (result.problem_map_suggestion && Object.keys(mergedMap).length) {
+      setValue('problemMap', JSON.stringify(mergedMap, null, 2));
+    }
+    if (values.judge === 'codeforces') {
+      const allKnown = result.preview.problems.length > 0 && result.preview.problems.every(problem => validMaxPoints(problem.max_points) !== undefined);
+      setPointsKnown(allKnown);
+      setPointsIncompleteFromPreview(!allKnown);
+    } else {
+      setPointsKnown(undefined);
+      setPointsIncompleteFromPreview(false);
+    }
+    setProblems(currentProblems => {
+      const isUntouchedDefault = !initial && currentProblems.length === 1 && currentProblems[0]!.id === '1' && currentProblems[0]!.maxPoints === 1 && !currentProblems[0]!.answers.trim();
+      const orderedIds: string[] = [];
+      const addId = (candidate: string) => { const trimmed = candidate.trim(); if (trimmed && !orderedIds.includes(trimmed)) orderedIds.push(trimmed); };
+      if (!isUntouchedDefault) currentProblems.forEach(problem => addId(problem.id));
+      (result.pdf_info?.problem_ids ?? []).forEach(addId);
+      Object.keys(suggestedMap).forEach(addId);
+      (result.problem_map_suggestion?.unmapped_local ?? []).forEach(addId);
+      if (!orderedIds.length) result.preview.problems.forEach(problem => addId(problem.remote_id));
+      if (!orderedIds.length) return currentProblems;
+      return orderedIds.map(localId => {
+        const existing = isUntouchedDefault ? undefined : currentProblems.find(problem => problem.id.trim() === localId);
+        const mappedRemoteId = suggestedMap[localId] ?? (typeof mergedMap[localId] === 'string' ? mergedMap[localId] : localId);
+        const remoteProblem = result.preview.problems.find(problem => problem.remote_id === mappedRemoteId);
+        const remotePoints = validMaxPoints(remoteProblem?.max_points);
+        return {
+          id: localId,
+          maxPoints: existing ? existing.maxPoints : remotePoints ?? initialProblemDrafts.find(problem => problem.id === localId)?.maxPoints ?? 1,
+          answers: existing?.answers ?? initialProblemDrafts.find(problem => problem.id === localId)?.answers ?? '',
+        };
+      });
+    });
     toast.success('赛事信息已载入', { description: `${result.preview.problems.length} 道题 · ${result.preview.status}` });
   }, onError: (error: Error) => toast.error('无法拉取赛事信息', { description: error.message }) });
   const goTo = (next: number) => { setStep(next); setMaxStep(current => Math.max(current, next)); };
@@ -225,7 +260,7 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
         ...(form.pool.trim() ? { pool: form.pool.trim() } : {}), ...(form.baseUrl.trim() ? { base_url: form.baseUrl.trim() } : {}),
         ...(form.judge === 'hydro' && form.domain.trim() ? { domain: form.domain.trim() } : {}),
         ...(form.judge === 'codeforces' && form.gym === 'gym' ? { gym: true } : {}),
-        ...(form.judge === 'codeforces' && sourceJudge?.points_known !== undefined ? { points_known: sourceJudge.points_known } : {}),
+        ...(form.judge === 'codeforces' && pointsKnown !== undefined ? { points_known: pointsKnown } : {}),
         ...(sourceJudge?.settlement_ms !== undefined ? { settlement_ms: sourceJudge.settlement_ms } : {}),
         ...(form.judge === 'hydro' && sourceJudge?.live_contest !== undefined ? { live_contest: sourceJudge.live_contest } : {}),
         languages: normalizedLanguages,
@@ -290,6 +325,8 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
         <Field label="判题后端"><Controller control={control} name="judge" render={({ field }) => <Select value={field.value} onValueChange={value => {
           field.onChange(value);
           setRemotePreview(undefined);
+          setPointsKnown(value === 'codeforces' && sourceJudge?.kind === 'codeforces' ? sourceJudge.points_known : undefined);
+          setPointsIncompleteFromPreview(value === 'codeforces' && sourceJudge?.kind === 'codeforces' && sourceJudge.points_known === false);
           clearErrors(['cfId', 'handle', 'pool', 'baseUrl', 'languages', 'problemMap']);
           if (value !== 'local') {
             const nextLanguages = sourceJudge?.kind === value && sourceJudge.languages ? sourceJudge.languages : defaultLanguagesFor(value, capabilities);
@@ -303,10 +340,11 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
             <div className="grid gap-5 sm:grid-cols-2"><Field label="专用账号名" hint="账号引用时可留空" error={errors.handle?.message}><Input {...register('handle')} /></Field><Field label="账号池" hint="与单账号二选一" error={errors.pool?.message}><Input placeholder="默认 default" {...register('pool')} /></Field></div>
             <div className="grid gap-5 sm:grid-cols-2"><Field label="Base URL" hint={judgeBackend?.requires_base_url ? '必填' : '使用平台默认值'} error={errors.baseUrl?.message}><Input className="font-mono text-xs" placeholder="https://…" {...register('baseUrl')} /></Field>{values.judge === 'hydro' ? <Field label="Hydro Domain"><Input placeholder="system" {...register('domain')} /></Field> : values.judge === 'codeforces' ? <Field label="赛事类型"><Controller control={control} name="gym" render={({ field }) => <Select value={field.value} onValueChange={field.onChange}><SelectItem value="contest">Codeforces Round</SelectItem><SelectItem value="gym">Codeforces Gym</SelectItem></Select>} /></Field> : <div />}</div>
             <RemoteProblemEditor problems={problems} setProblems={setProblems} />
+            {values.judge === 'codeforces' && pointsIncompleteFromPreview && <div className="space-y-2 border-l-2 border-warning bg-warning/5 px-3 py-2.5 text-xs text-warning"><p>{pointsKnown ? '已手工确认全部题目满分（保存时标记 points_known = true）。' : <>上游预览未提供完整题目分值，当前占位分值将标记为 <span className="font-mono">points_known = false</span>（避免把占位分当作真实加权排名）。</>}</p><label className="flex items-center gap-2 text-foreground"><input type="checkbox" checked={pointsKnown === true} onChange={event => setPointsKnown(event.target.checked)} />我已手工核对并填写全部题目真实满分（标记 points_known = true）</label></div>}
             {judgeBackend?.language_presets && judgeBackend.language_presets.length > 0 && <div><div className="mb-2 text-xs font-medium">语言预设</div><div className="flex flex-wrap gap-2">{judgeBackend.language_presets.map(language => { const enabled = Object.keys(stringRecord(values.languages)).includes(language.id); return <button key={language.id} type="button" aria-pressed={enabled} onClick={() => { const mapping = stringRecord(values.languages); if (enabled) delete mapping[language.id]; else mapping[language.id] = language.remote_id; setValue('languages', JSON.stringify(mapping)); }} className={enabled ? 'border bg-primary px-3 py-2 text-xs text-primary-foreground' : 'border bg-card px-3 py-2 text-xs text-muted-foreground hover:border-primary/40'}>{language.label}<span className="ml-1.5 font-mono text-[9px] opacity-65">{language.remote_id}</span></button>; })}</div></div>}
             <Field label="语言映射 JSON" hint="高级：本地语言 ID → 远端 ID" error={errors.languages?.message}><Input className="font-mono text-xs" {...register('languages')} /></Field>
             <Field label="题号映射 problem_map" hint="PDF 题号 → 平台题号" error={errors.problemMap?.message}><Textarea className="min-h-24" {...register('problemMap')} /></Field>
-            {remotePreview && <div className="border bg-card p-4"><div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">{remotePreview.preview.title}</span><Badge>{remotePreview.preview.status}</Badge><Badge>{remotePreview.preview.contest_ref}</Badge></div><div className="mt-3 flex flex-wrap gap-1.5">{remotePreview.preview.problems.map(problem => <span key={problem.remote_id} className="border px-2 py-1 font-mono text-[10px]" title={problem.title}>{problem.remote_id}{problem.max_points !== undefined ? ` · ${problem.max_points}` : ''}</span>)}</div>{remotePreview.pdf_info && <p className="mt-3 font-mono text-[10px] text-muted-foreground">PDF {remotePreview.pdf_info.page_count} 页 · 识别 {remotePreview.pdf_info.problem_ids.join(' / ') || '—'}</p>}{remotePreview.problem_map_suggestion && <p className="mt-2 text-[11px] text-muted-foreground">已应用 {Object.keys(remotePreview.problem_map_suggestion.problem_map).length} 条题号映射建议；保存前请核对。</p>}</div>}
+            {remotePreview && <div className="border bg-card p-4"><div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">{remotePreview.preview.title}</span><Badge>{remotePreview.preview.status}</Badge><Badge>{remotePreview.preview.contest_ref}</Badge></div><div className="mt-3 flex flex-wrap gap-1.5">{remotePreview.preview.problems.map(problem => <span key={problem.remote_id} className="border px-2 py-1 font-mono text-[10px]" title={problem.title}>{problem.remote_id}{problem.max_points !== undefined ? ` · ${problem.max_points}` : ''}</span>)}</div>{remotePreview.pdf_info && <p className="mt-3 font-mono text-[10px] text-muted-foreground">PDF {remotePreview.pdf_info.page_count} 页 · 识别 {remotePreview.pdf_info.problem_ids.join(' / ') || '—'}</p>}{remotePreview.problem_map_suggestion && <p className="mt-2 text-[11px] text-muted-foreground">已应用 {Object.keys(remotePreview.problem_map_suggestion.problem_map).length} 条题号映射建议；保存前请核对。</p>}{remotePreview.problem_map_suggestion && remotePreview.problem_map_suggestion.unmapped_local.length > 0 && <p className="mt-2 border-l-2 border-warning pl-2.5 text-xs text-warning">未自动映射的本地题号（已保留在题目表中，请手工补充 problem_map）：<span className="font-mono">{remotePreview.problem_map_suggestion.unmapped_local.join(', ')}</span></p>}{remotePreview.problem_map_suggestion && remotePreview.problem_map_suggestion.unmapped_remote.length > 0 && <p className="mt-1 text-[11px] text-muted-foreground">未使用的远端题号：<span className="font-mono">{remotePreview.problem_map_suggestion.unmapped_remote.join(', ')}</span></p>}</div>}
             <p className="text-xs leading-5 text-muted-foreground">仅用于有权限的历史赛事提交。提交时间由本机 Supervisor 记录，上游故障不会被当作答错。</p></div>}
       </div>}
       {step === 3 && <div className="space-y-6"><div><h3 className="font-semibold">赛规与保存确认</h3><p className="mt-1 text-xs text-muted-foreground">这些预算直接约束比赛，不是界面显示偏好。</p></div>

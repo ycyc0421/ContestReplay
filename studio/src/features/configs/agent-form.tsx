@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { Controller, useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
@@ -102,6 +102,7 @@ function AgentManifestForm({ capabilities, initial, onSaved }: { capabilities: S
   const values = watch();
   const sameHarness = values.harness === sourceHarness?.kind;
   const hasExternalNative = Boolean(sameHarness && sourceHarness?.native_config?.path);
+  useEffect(() => { if (!hasExternalNative) setRemoveNative(false); }, [hasExternalNative]);
   const document = useMemo(() => {
     const identity = { id: values.id, ...(values.name.trim() ? { name: values.name.trim() } : {}),
       ...(values.speedTier !== 'standard' ? { speed_tier: values.speedTier } : {}),
@@ -176,7 +177,7 @@ function AgentManifestForm({ capabilities, initial, onSaved }: { capabilities: S
           {hasExternalNative && <label className="flex items-center gap-2 text-xs text-muted-foreground"><input type="checkbox" checked={removeNative} onChange={event => { setRemoveNative(event.target.checked); setPreview(undefined); }} />移除已绑定的外部原生覆盖文件</label>}
         </div> : <Note>当前后端尚未开放原生配置覆盖。新契约启用后，此处将接受 {formatLabel(harness.native_format)} patch，并由服务端校验。</Note>}</TabsContent>
         <TabsContent value="preview" className="data-[state=active]:animate-panel-in">{capabilities.features.native_overrides ? <div className="space-y-3"><Button type="button" variant="secondary" size="sm" onClick={async () => {
-          try { setPreview(await studioApi.previewAgent(document)); } catch (error) { toast.error('预览失败', { description: (error as Error).message }); }
+          try { setPreview(await studioApi.previewAgent(document, initial?.path)); } catch (error) { toast.error('预览失败', { description: (error as Error).message }); }
         }}><Braces className="size-3.5" />生成脱敏预览</Button>{preview && <pre className="max-h-96 overflow-auto border bg-[#141516] p-4 font-mono text-xs leading-6 text-[#e7e7e3]">{preview.content}</pre>}</div>
           : <Note>Effective Config 需要由 runner 合并并脱敏，前端不会伪造最终配置。</Note>}</TabsContent></div>
       </Tabs>

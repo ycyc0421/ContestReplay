@@ -77,6 +77,30 @@ export function NewBatchPage() {
   const contests = contestsQuery.data?.contests ?? [];
   const selectedAgentEntries = agents.filter(agent => selectedAgents.has(agent.path));
   const selectedContestEntries = contests.filter(contest => selectedContests.has(contest.path));
+  useEffect(() => {
+    if (!agentsQuery.data) return;
+    const validAgents = new Set(agentsQuery.data.agents.filter(agent => agent.valid).map(agent => agent.path));
+    setSelectedAgents(previous => {
+      const next = new Set([...previous].filter(path => validAgents.has(path)));
+      return next.size === previous.size ? previous : next;
+    });
+    setSelectedCells(previous => {
+      const next = new Set([...previous].filter(key => validAgents.has(parseCell(key)[0])));
+      return next.size === previous.size ? previous : next;
+    });
+  }, [agentsQuery.data]);
+  useEffect(() => {
+    if (!contestsQuery.data) return;
+    const validContests = new Set(contestsQuery.data.contests.filter(contest => contest.valid).map(contest => contest.path));
+    setSelectedContests(previous => {
+      const next = new Set([...previous].filter(path => validContests.has(path)));
+      return next.size === previous.size ? previous : next;
+    });
+    setSelectedCells(previous => {
+      const next = new Set([...previous].filter(key => validContests.has(parseCell(key)[1])));
+      return next.size === previous.size ? previous : next;
+    });
+  }, [contestsQuery.data]);
   useEffect(() => { sessionStorage.setItem(draftKey, JSON.stringify({ agents: [...selectedAgents], contests: [...selectedContests], cells: [...selectedCells] })); }, [selectedAgents, selectedContests, selectedCells]);
   useEffect(() => {
     if (!matrix.data) return;
@@ -182,7 +206,7 @@ export function NewBatchPage() {
         <ScrollArea className="max-h-[520px]"><table className="w-full min-w-[560px] text-left text-sm"><thead className="bg-muted/45 font-mono text-[9px] text-muted-foreground"><tr><th className="px-5 py-3">Lane</th><th>Agent / revision</th><th>Contest</th><th className="px-5 text-right">Data</th></tr></thead><tbody className="divide-y">{plan.jobs.map((job, index) => <tr key={`${job.agent_revision}-${job.contest_id}-${index}`}><td className="px-5 py-3.5 font-mono text-xs text-primary">{String(index + 1).padStart(2, '0')}</td><td className="py-3.5"><div>{job.agent_name ?? job.agent_id}</div><div className="mt-1 font-mono text-[9px] text-muted-foreground">{job.agent_revision.slice(0, 12)}</div></td><td>{job.contest_id}</td><td className="px-5 text-right font-mono text-xs text-muted-foreground">v{job.data_version}</td></tr>)}</tbody></table></ScrollArea></Card>}
       {stage === 'review' && preflight && <Card className="mt-4 overflow-hidden"><div className="flex items-center gap-3 border-b px-4 py-3">{preflight.ok ? <ShieldCheck className="size-4 text-primary" /> : <AlertTriangle className="size-4 text-warning" />}<div><h2 className="text-sm font-semibold">{preflight.ok ? 'Preflight 全部通过' : 'Preflight 发现需要处理的问题'}</h2><p className="mt-1 text-[11px] text-muted-foreground">{preflight.agents.length} Agents · {preflight.contests.length} Contests · {preflight.images.length} Images · {preflight.compatibility.length} Cells</p></div></div><div className="grid gap-px bg-border sm:grid-cols-2 xl:grid-cols-4">{[
         ...preflight.agents.map(item => ({ key: `agent-${item.path}`, title: item.id ?? item.path, ok: item.ok && item.credential_ok, detail: item.credential_ok ? '凭据就绪' : '凭据不可用', issues: item.issues })),
-        ...preflight.contests.map(item => ({ key: `contest-${item.path}`, title: item.id ?? item.path, ok: item.ok && item.oj_ready, detail: `${item.judge_kind ?? 'judge'} · ${item.oj_ready ? 'OJ 就绪' : 'OJ 未就绪'}`, issues: [...item.issues, ...(item.pdf?.issues ?? [])] })),
+        ...preflight.contests.map(item => ({ key: `contest-${item.path}`, title: item.id ?? item.path, ok: item.ok && item.oj_ready, detail: `${item.judge_kind ?? 'judge'} · ${item.oj_ready ? 'OJ 就绪' : 'OJ 未就绪'}`, issues: [...new Set([...item.issues, ...(item.pdf?.issues ?? [])])] })),
         ...preflight.images.map(item => ({ key: `image-${item.image}`, title: item.image, ok: item.ok, detail: item.harness, issues: item.error ? [item.error] : [] })),
         ...preflight.compatibility.filter(item => !item.compatible).map(item => ({ key: `cell-${item.agent}-${item.contest}`, title: '不兼容组合', ok: false, detail: `${item.agent} × ${item.contest}`, issues: item.reason ? [item.reason] : [] })),
       ].map(item => <div key={item.key} className="bg-card p-4"><div className="flex items-center gap-2"><span className={item.ok ? 'size-1.5 bg-primary' : 'size-1.5 bg-warning'} /><span className="truncate text-xs font-medium" title={item.title}>{item.title}</span></div><div className="mt-1 text-[10px] text-muted-foreground">{item.detail}</div>{item.issues.length > 0 && <ul className="mt-2 space-y-1 text-[10px] leading-4 text-warning">{item.issues.map(issue => <li key={issue}>{issue}</li>)}</ul>}</div>)}</div></Card>}
