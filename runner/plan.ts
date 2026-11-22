@@ -272,15 +272,23 @@ export async function verifyJob(plan: Plan, job: PlanJob, store?: Connections, l
   assertCompatible(job.harness, inputs.contest, job.agent_id);
   return inputs;
 }
-export async function verifyPlan(plan: Plan, runtime = false, store?: Connections, ojAccounts?: OjAccounts) {
+export async function verifyPlan(
+  plan: Plan,
+  runtime = false,
+  store?: Connections,
+  ojAccounts?: OjAccounts,
+  loaders: Partial<PlanInputLoaders> = {},
+) {
+  const loadAgentImpl = loaders.loadAgent ?? loadAgent;
+  const loadContestImpl = loaders.loadContest ?? loadContest;
   const agents = new Map<string, AgentInput>();
   const contests = new Map<string, ContestInput>();
   for (const job of plan.jobs) {
     let agent = agents.get(job.agent_path);
-    if (!agent) { agent = await loadAgent(job.agent_path, store); agents.set(job.agent_path, agent); }
+    if (!agent) { agent = await loadAgentImpl(job.agent_path, store); agents.set(job.agent_path, agent); }
     let contest = contests.get(job.contest_path);
     if (!contest) {
-      const { pdf: _pdf, judge: _judge, attachments: _attachments, ...meta } = await loadContest(job.contest_path);
+      const { pdf: _pdf, judge: _judge, attachments: _attachments, ...meta } = await loadContestImpl(job.contest_path);
       contest = meta;
       contests.set(job.contest_path, contest);
     }

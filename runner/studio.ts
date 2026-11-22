@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { realpath } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { z } from 'zod';
 import { codeforcesContest, saveAgent, saveContest } from './author.js';
@@ -217,7 +218,10 @@ export interface StartStudioOptions {
 }
 
 export async function startStudio(root: string, port = 0, opts: StartStudioOptions = {}) {
-  const base = resolve(opts.base ?? process.cwd());
+  const requestedBase = resolve(opts.base ?? process.cwd());
+  // Canonicalize once before makePlan resolves relative entries, so a symlinked workspace
+  // never turns a valid relative manifest into an absolute alias the Studio loader rejects.
+  const base = await realpath(requestedBase).catch(() => requestedBase);
   const store = opts.store ?? new Connections();
   const ojAccounts = opts.ojAccounts ?? opts.queue?.ojAccounts ?? new OjAccounts();
   const pushTargets = opts.pushTargets ?? new PushTargets();
@@ -240,11 +244,18 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
       ...await loadStudioContest(root, base, contestFile),
       ...((await loadStudioAgent(base, root, agentFile, inputStore ?? store)).loaded),
     });
+    const inputLoaders = {
+      loadAgent: async (file: string, inputStore?: Connections) =>
+        (await loadStudioAgent(base, root, file, inputStore ?? store)).loaded,
+      loadContest: (file: string) => loadStudioContest(root, base, file),
+      loadInputs: loadStudioInputs,
+    };
     const task = id.then(batchId => dispatch(root, batchId, control.signal, {
       ...opts.queue,
       store,
       ojAccounts,
       pushDispatcher,
+      inputLoaders,
       execute: opts.queue?.execute ?? ((plan, job, jobOpts) => executeJob(plan, job, { ...jobOpts, loadInputs: loadStudioInputs })),
       ...(concurrency !== undefined ? { concurrency } : {}),
     }));

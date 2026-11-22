@@ -11,8 +11,9 @@ import { pathToFileURL } from 'node:url';
 import { Connections } from '../dist/connections.js';
 import { OjAccounts } from '../dist/judges/index.js';
 import { synthesizeTextContestPdf } from '../dist/pdf-synth.js';
-import { makePlan } from '../dist/plan.js';
-import { readWorkspaceFileNoFollow } from '../dist/contest-author.js';
+import { makePlan, verifyPlan } from '../dist/plan.js';
+import { loadStudioContest, readWorkspaceFileNoFollow } from '../dist/contest-author.js';
+import { loadStudioAgent } from '../dist/studio-config-api.js';
 import { PushDispatcher, PushTargets } from '../dist/push.js';
 import { createSseWriter, startStudio } from '../dist/studio.js';
 import {
@@ -2252,6 +2253,13 @@ test('Studio v2 final admission and I/O regressions: plan/execute artifact polic
   // A plan produced through the unrestricted CLI loader must also be rejected at Studio execution,
   // before any run directory is created, rather than allowing an invalid contest into the sandbox.
   const cliPlan = await makePlan(spec, base, getImage, store);
+  await assert.rejects(
+    verifyPlan(cliPlan, false, store, undefined, {
+      loadAgent: async (file, inputStore) => (await loadStudioAgent(base, root, file, inputStore ?? store)).loaded,
+      loadContest: file => loadStudioContest(root, base, file),
+    }),
+    /Answer files cannot be attached/i,
+  );
   const batchId = randomUUID();
   await writeFile(
     join(root, '.batches', `${batchId}.json`),
@@ -2311,8 +2319,8 @@ test('Studio v2 final admission and I/O regressions: plan/execute artifact polic
       process.exit(1);
     }
   `;
-  const runPublisher = () => new Promise((resolveExit, rejectExit) => {
-    const child = spawn(process.execPath, ['--input-type=module', '-e', childSource, childPayload, root, base], {
+  const runPublisher = (publishRoot = root) => new Promise((resolveExit, rejectExit) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', childSource, childPayload, publishRoot, base], {
       stdio: ['ignore', 'ignore', 'pipe'],
     });
     let stderr = '';
@@ -2320,9 +2328,29 @@ test('Studio v2 final admission and I/O regressions: plan/execute artifact polic
     child.once('error', rejectExit);
     child.once('close', code => resolveExit({ code, stderr }));
   });
-  const publishers = await Promise.all([runPublisher(), runPublisher()]);
+  const otherRoot = join(dir, 'runs-other');
+  await mkdir(otherRoot, { recursive: true, mode: 0o700 });
+  const publishers = await Promise.all([runPublisher(), runPublisher(otherRoot)]);
   assert.deepEqual(publishers.map(p => p.code).sort(), [0, 1], publishers.map(p => p.stderr).join('\n'));
   const publishedManifest = JSON.parse(await readFile(join(base, 'contests', 'race.json'), 'utf8'));
   const immutableAnswerPath = join(base, 'contests', publishedManifest.judge.answers.path);
   assert.deepEqual(JSON.parse(await readFile(immutableAnswerPath, 'utf8')), answerTable);
+
+  // A relative plan entry remains valid when Studio itself was opened through a symlinked workspace alias.
+  await writeFile(
+    join(base, 'contests', 'safe.json'),
+    JSON.stringify({ ...unsafeManifest, materials: { entrypoint: { kind: 'pdf', path: '../paper.pdf' }, attachments: [] } }),
+  );
+  const alias = join(dir, 'workspace-alias');
+  await symlink(base, alias);
+  const aliasStudio = await startStudio(root, 0, { base: alias, store, getImage });
+  t.after(() => aliasStudio.close());
+  const aliasReq = makeRequester(aliasStudio.url);
+  const aliasPlan = await aliasReq('/api/plan', {
+    body: {
+      schema_version: 2,
+      cells: [{ agent: 'agents/admission-agent.toml', contest: 'contests/safe.json' }],
+    },
+  });
+  assert.equal(aliasPlan.status, 200, aliasPlan.text);
 });

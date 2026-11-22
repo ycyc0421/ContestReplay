@@ -62,8 +62,9 @@ export async function withWorkspaceLock<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   const realBase = await resolveRealPathOrAncestor(base);
-  const realRoot = await resolveRealPathOrAncestor(root);
-  const key = `${realBase}\0${realRoot}`;
+  // Publication identity is the canonical workspace, not the run root: two Studio processes
+  // using different run roots must still serialize writes to the same manifest and answer table.
+  const key = realBase;
   const prev = workspaceLocks.get(key) ?? Promise.resolve();
   let release!: () => void;
   const current = new Promise<void>(resolveLock => {
@@ -376,47 +377,49 @@ export async function existingWorkspaceFile(base: string, relPath: string, field
 }
 
 export async function readWorkspaceFileNoFollow(target: string, limit = 1_000_000, fieldName = 'path'): Promise<Buffer> {
-  // Snapshot ancestor identities before opening, then verify them and the leaf again
-  // from the already-open descriptor. This prevents a parent directory being replaced
-  // by a symlink between workspace validation and the O_NOFOLLOW open.
-  const ancestors: Array<{ path: string; dev: number; ino: number }> = [];
-  for (let current = dirname(resolve(target)); ; current = dirname(current)) {
-    const info = await lstat(current);
-    if (info.isSymbolicLink() || !info.isDirectory()) {
-      throw new FieldError([fieldName], 'Parent directory changed or traverses a symlink');
-    }
-    ancestors.push({ path: current, dev: info.dev, ino: info.ino });
-    if (dirname(current) === current) break;
-  }
-  const handle = await open(target, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+  // Resolve every component relative to the already-open parent directory descriptor.
+  // On Linux, /proc/self/fd/<dirfd>/<component> with O_NOFOLLOW pins the actual directory
+  // chain, so a parent-directory rename/symlink swap cannot redirect the opened file outside
+  // the workspace tree that was validated by the caller.
+  const parts = resolve(target).split(sep).filter(Boolean);
+  let parent = await open('/', constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  const openedDirectories = [parent];
   try {
-    const info = await handle.stat();
-    if (!info.isFile() || info.size > limit) throw new FieldError([fieldName], 'File is invalid or too large');
-    const parentReal = await realpath(dirname(resolve(target)));
-    if (parentReal !== dirname(resolve(target))) {
-      throw new FieldError([fieldName], 'Parent directory changed during file read');
+    for (const part of parts.slice(0, -1)) {
+      const next = await open(
+        join('/proc/self/fd', String(parent.fd), part),
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      ).catch(() => {
+        throw new FieldError([fieldName], 'Parent directory changed or traverses a symlink');
+      });
+      openedDirectories.push(next);
+      parent = next;
     }
-    for (const ancestor of ancestors) {
-      const after = await lstat(ancestor.path);
-      if (after.isSymbolicLink() || !after.isDirectory() || after.dev !== ancestor.dev || after.ino !== ancestor.ino) {
-        throw new FieldError([fieldName], 'Parent directory changed during file read');
+    const leaf = parts.at(-1);
+    if (!leaf) throw new FieldError([fieldName], 'File is invalid');
+    const handle = await open(
+      join('/proc/self/fd', String(parent.fd), leaf),
+      constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
+    );
+    try {
+      const info = await handle.stat();
+      if (!info.isFile() || info.size > limit) throw new FieldError([fieldName], 'File is invalid or too large');
+      const bytes = Buffer.alloc(info.size + 1);
+      let read = 0;
+      while (read < bytes.length) {
+        const res = await handle.read(bytes, read, bytes.length - read, read);
+        if (!res.bytesRead) break;
+        read += res.bytesRead;
       }
+      if (read !== info.size) throw new FieldError([fieldName], 'File changed while reading');
+      return bytes.subarray(0, read);
+    } finally {
+      await handle.close();
     }
-    const leafAfter = await lstat(target);
-    if (leafAfter.isSymbolicLink() || !leafAfter.isFile() || leafAfter.dev !== info.dev || leafAfter.ino !== info.ino) {
-      throw new FieldError([fieldName], 'File changed during file read');
-    }
-    const bytes = Buffer.alloc(info.size + 1);
-    let read = 0;
-    while (read < bytes.length) {
-      const res = await handle.read(bytes, read, bytes.length - read, read);
-      if (!res.bytesRead) break;
-      read += res.bytesRead;
-    }
-    if (read !== info.size) throw new FieldError([fieldName], 'File changed while reading');
-    return bytes.subarray(0, read);
   } finally {
-    await handle.close();
+    for (const directory of openedDirectories.reverse()) {
+      await directory.close().catch(() => {});
+    }
   }
 }
 

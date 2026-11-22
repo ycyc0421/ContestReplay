@@ -7,7 +7,7 @@ import { z } from 'zod';
 import type { Connections } from './connections.js';
 import { removeContainer } from './docker.js';
 import { OjAccountPool, OjAccounts } from './oj-accounts.js';
-import { checkRuntime, executeJob, planSchema, readJson, verifyPlan, type Plan, type PlanJob } from './plan.js';
+import { checkRuntime, executeJob, planSchema, readJson, verifyPlan, type Plan, type PlanInputLoaders, type PlanJob } from './plan.js';
 import { readRunProgress } from './progress.js';
 import type { PushDispatcher } from './push.js';
 
@@ -38,6 +38,7 @@ export type QueueOptions = {
   pushDispatcher?: PushDispatcher;
   pushDrainTimeoutMs?: number;
   execute?: Execute;
+  inputLoaders?: Partial<PlanInputLoaders>;
   preflight?: (plan: Plan) => Promise<unknown>;
   recover?: (id: string) => Promise<void>;
   onJobStart?: (id: string, directory: string) => void;
@@ -208,7 +209,7 @@ export async function dispatch(root: string, batchId: string, signal: AbortSigna
 
     const preflight = options.preflight ?? (async (plan: Plan) => {
       await checkRuntime(plan);
-      await verifyPlan(plan, true, options.store, ojAccounts);
+      await verifyPlan(plan, true, options.store, ojAccounts, options.inputLoaders);
     });
     const cancelPending = async () => {
       if (!await exists(batchStop(root, batchId))) return false;
