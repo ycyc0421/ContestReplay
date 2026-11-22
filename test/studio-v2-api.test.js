@@ -2293,14 +2293,21 @@ test('Studio v2 final admission and I/O regressions: plan/execute artifact polic
     /Parent directory changed|symlink/i,
   );
 
-  // Searchable but unlistable (0711) ancestors remain usable: directory descriptors
-  // use O_PATH while the manifest leaf itself is still opened read-only.
+  // Searchable but unlistable (0100) ancestors remain usable: directory descriptors
+  // use O_PATH while the manifest leaf itself is still opened read-only. Unlike 0711,
+  // mode 0100 removes read permission from the current (non-root) test user too.
   const searchable = join(base, 'searchable-only');
-  await mkdir(searchable, { mode: 0o711 });
+  await mkdir(searchable, { mode: 0o700 });
   await writeFile(join(searchable, 'data.json'), '{"ok":true}');
-  await chmod(searchable, 0o711);
-  t.after(() => chmod(searchable, 0o700).catch(() => {}));
-  assert.equal((await readWorkspaceFileNoFollow(join(searchable, 'data.json'))).toString('utf8'), '{"ok":true}');
+  await chmod(searchable, 0o100);
+  try {
+    if (process.getuid?.() !== 0) {
+      await assert.rejects(readdir(searchable), { code: 'EACCES' });
+    }
+    assert.equal((await readWorkspaceFileNoFollow(join(searchable, 'data.json'))).toString('utf8'), '{"ok":true}');
+  } finally {
+    await chmod(searchable, 0o700);
+  }
 
   // Two independent Node processes publishing the same manifest/answer bytes serialize on the shared
   // filesystem lock. The losing manifest link must never remove the winner's immutable answer table.
