@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { Controller, useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
@@ -18,6 +18,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Note } from '@/components/ui/dialog';
 import { SavedPath } from './saved-path';
 import { useCapabilities, type StudioCapabilities } from './capabilities';
+import { codeforcesWeightSignature, computeCodeforcesPointsKnown, validMaxPoints } from './cf-points';
 
 const schema = z.object({
   file: z.string().trim().min(1, '请输入保存路径'), id: z.string().trim().min(1, '请输入 Contest ID'), dataVersion: z.number().int().min(1),
@@ -49,9 +50,6 @@ function defaultLanguagesFor(kind: string, capabilities: StudioCapabilities): Re
   const firstPreset = backend?.language_presets?.[0];
   if (firstPreset) return { [firstPreset.id]: firstPreset.remote_id };
   return kind === 'codeforces' ? { cpp17: '54' } : { cpp17: 'cpp17' };
-}
-function validMaxPoints(points?: number): number | undefined {
-  return typeof points === 'number' && Number.isFinite(points) && points >= 1 ? Math.round(points) : undefined;
 }
 const steps = [['基本信息', '身份、来源与授权'], ['比赛材料', '上传或引用完整题面'], ['判题配置', '题目、答案与提交后端'], ['赛规确认', '预算与文件摘要']] as const;
 
@@ -138,7 +136,7 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
   const [remotePreview, setRemotePreview] = useState<ContestPreviewResponse>();
   const initialJudgeKind = sourceJudge?.kind ?? 'local';
   const [confirmedWeightsSig, setConfirmedWeightsSig] = useState<string>();
-  const [hasIncompletePreview, setHasIncompletePreview] = useState(initialJudgeKind === 'codeforces' && sourceJudge?.points_known === false);
+  const [cfNoticeSticky, setCfNoticeSticky] = useState(initialJudgeKind === 'codeforces' && sourceJudge?.points_known === false);
   const { register, control, handleSubmit, watch, setValue, getValues, trigger, setError, clearErrors, formState: { errors, isSubmitting } } = useForm<Values>({ resolver: zodResolver(schema), defaultValues: {
     file: initial?.path ?? 'contest.json', id: source?.contest_id ?? '', dataVersion: source?.data_version ?? 1,
     title: source?.title ?? '', sourceName: source?.source?.name ?? 'Local', sourceUrl: source?.source?.url ?? '',
@@ -156,48 +154,38 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
   const accounts = useQuery({ queryKey: ['oj-accounts'], queryFn: studioApi.ojAccounts, enabled: values.judge !== 'local' });
 
   const normalizedProblemRows = (drafts: ProblemDraft[]) => drafts.map(problem => ({ id: problem.id.trim(), max_points: problem.maxPoints }));
-  const computeCfWeightSignature = (cfId: string, drafts: ProblemDraft[], problemMapText: string) => {
-    const map = parsePlainRecord(problemMapText) ?? {};
-    return JSON.stringify({ cfId: cfId.trim(), problems: normalizedProblemRows(drafts), problemMap: map });
-  };
   const computeCfPointsKnown = (
     cfId: string,
+    gym: string,
     drafts: ProblemDraft[],
     problemMapText: string,
     previewSnapshot: ContestPreviewResponse | undefined,
     confirmedSig: string | undefined,
-  ): boolean | undefined => {
-    const rows = normalizedProblemRows(drafts);
-    const map = parsePlainRecord(problemMapText) ?? {};
-    const sig = JSON.stringify({ cfId: cfId.trim(), problems: rows, problemMap: map });
-    if (confirmedSig && confirmedSig === sig) return true;
-    if (previewSnapshot && previewSnapshot.preview.platform === 'codeforces' && previewSnapshot.preview.contest_ref === cfId.trim()) {
-      return rows.length > 0 && rows.every(problem => {
-        const mappedVal = map[problem.id];
-        const mapped = typeof mappedVal === 'string' && mappedVal.trim() ? mappedVal.trim() : problem.id;
-        const remote = previewSnapshot.preview.problems.find(item => item.remote_id === mapped);
-        const remotePoints = validMaxPoints(remote?.max_points);
-        return remotePoints !== undefined && problem.max_points === remotePoints;
-      });
-    }
-    const sourceMap = sourceJudge?.problem_map ?? {};
-    const sourceRows = source?.problems ?? [];
-    const unchangedFromSource = Boolean(
-      initial &&
-      sourceJudge?.kind === 'codeforces' &&
-      String(sourceJudge.contest_id ?? '') === cfId.trim() &&
-      JSON.stringify(rows) === JSON.stringify(sourceRows) &&
-      JSON.stringify(map) === JSON.stringify(sourceMap),
-    );
-    if (unchangedFromSource) return sourceJudge?.points_known;
-    if (previewSnapshot || sourceJudge?.points_known === false) return false;
-    return undefined;
-  };
-  const currentCfWeightSig = values.judge === 'codeforces' ? computeCfWeightSignature(values.cfId, problems, values.problemMap) : undefined;
-  const effectiveCfPointsKnown = values.judge === 'codeforces'
-    ? computeCfPointsKnown(values.cfId, problems, values.problemMap, remotePreview, confirmedWeightsSig)
+  ) => computeCodeforcesPointsKnown({
+    cfId,
+    gym: gym === 'gym',
+    problems: normalizedProblemRows(drafts),
+    problemMap: parsePlainRecord(problemMapText) ?? {},
+    preview: previewSnapshot,
+    confirmedSignature: confirmedSig,
+    isEdit: Boolean(initial),
+    sourceJudge,
+    sourceProblems: source?.problems,
+  });
+  const currentCfWeightSig = values.judge === 'codeforces'
+    ? codeforcesWeightSignature(values.cfId, values.gym === 'gym', normalizedProblemRows(problems), parsePlainRecord(values.problemMap) ?? {})
     : undefined;
-  const showCfPointsNotice = values.judge === 'codeforces' && (effectiveCfPointsKnown === false || hasIncompletePreview || Boolean(confirmedWeightsSig));
+  useEffect(() => {
+    // Once the user edits any confirmed field, permanently clear the old confirmation so restoring the value requires re-confirming.
+    if (confirmedWeightsSig && currentCfWeightSig !== confirmedWeightsSig) {
+      setConfirmedWeightsSig(undefined);
+      setCfNoticeSticky(true);
+    }
+  }, [confirmedWeightsSig, currentCfWeightSig]);
+  const effectiveCfPointsKnown = values.judge === 'codeforces'
+    ? computeCfPointsKnown(values.cfId, values.gym, problems, values.problemMap, remotePreview, confirmedWeightsSig)
+    : undefined;
+  const showCfPointsNotice = values.judge === 'codeforces' && (effectiveCfPointsKnown === false || cfNoticeSticky || Boolean(confirmedWeightsSig));
   const previewContest = useMutation({ mutationFn: () => studioApi.previewContest({
     platform: values.judge as 'codeforces' | 'qoj' | 'vjudge' | 'hydro',
     contest_id: values.judge === 'codeforces' ? Number(values.cfId) : values.cfId,
@@ -247,10 +235,10 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
     setProblems(nextProblems);
     setConfirmedWeightsSig(undefined);
     if (values.judge === 'codeforces') {
-      const verified = computeCfPointsKnown(getValues('cfId'), nextProblems, mergedMapText, result, undefined);
-      setHasIncompletePreview(verified === false);
+      const verified = computeCfPointsKnown(getValues('cfId'), getValues('gym'), nextProblems, mergedMapText, result, undefined);
+      setCfNoticeSticky(verified === false);
     } else {
-      setHasIncompletePreview(false);
+      setCfNoticeSticky(false);
     }
     toast.success('赛事信息已载入', { description: `${result.preview.problems.length} 道题 · ${result.preview.status}` });
   }, onError: (error: Error) => toast.error('无法拉取赛事信息', { description: error.message }) });
@@ -303,7 +291,7 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
       const parsedProblemMap = form.judge !== 'local' ? (parsePlainRecord(form.problemMap) ?? {}) : undefined;
       const includeProblemMap = Boolean(parsedProblemMap && (Object.keys(parsedProblemMap).length > 0 || sourceJudge?.problem_map !== undefined));
       const submittedCfPointsKnown = form.judge === 'codeforces'
-        ? computeCfPointsKnown(form.cfId, problems, form.problemMap, remotePreview, confirmedWeightsSig)
+        ? computeCfPointsKnown(form.cfId, form.gym, problems, form.problemMap, remotePreview, confirmedWeightsSig)
         : undefined;
       const remote = form.judge !== 'local' ? {
         kind: form.judge, ...(form.cfId.trim() ? { contest_id: form.judge === 'codeforces' ? Number(form.cfId) : form.cfId.trim() } : {}),
@@ -378,7 +366,7 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
           field.onChange(value);
           setRemotePreview(undefined);
           setConfirmedWeightsSig(undefined);
-          setHasIncompletePreview(value === 'codeforces' && sourceJudge?.kind === 'codeforces' && sourceJudge.points_known === false);
+          setCfNoticeSticky(value === 'codeforces' && sourceJudge?.kind === 'codeforces' && sourceJudge.points_known === false);
           clearErrors(['cfId', 'handle', 'pool', 'baseUrl', 'languages', 'problemMap']);
           if (value !== 'local') {
             const nextLanguages = sourceJudge?.kind === value && sourceJudge.languages ? sourceJudge.languages : defaultLanguagesFor(value, capabilities);
@@ -392,7 +380,7 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
             <div className="grid gap-5 sm:grid-cols-2"><Field label="专用账号名" hint="账号引用时可留空" error={errors.handle?.message}><Input {...register('handle')} /></Field><Field label="账号池" hint="与单账号二选一" error={errors.pool?.message}><Input placeholder="默认 default" {...register('pool')} /></Field></div>
             <div className="grid gap-5 sm:grid-cols-2"><Field label="Base URL" hint={judgeBackend?.requires_base_url ? '必填' : '使用平台默认值'} error={errors.baseUrl?.message}><Input className="font-mono text-xs" placeholder="https://…" {...register('baseUrl')} /></Field>{values.judge === 'hydro' ? <Field label="Hydro Domain"><Input placeholder="system" {...register('domain')} /></Field> : values.judge === 'codeforces' ? <Field label="赛事类型"><Controller control={control} name="gym" render={({ field }) => <Select value={field.value} onValueChange={field.onChange}><SelectItem value="contest">Codeforces Round</SelectItem><SelectItem value="gym">Codeforces Gym</SelectItem></Select>} /></Field> : <div />}</div>
             <RemoteProblemEditor problems={problems} setProblems={setProblems} />
-            {showCfPointsNotice && <div className="space-y-2 border-l-2 border-warning bg-warning/5 px-3 py-2.5 text-xs text-warning"><p>{effectiveCfPointsKnown === true ? '已手工确认当前题目满分（保存时标记 points_known = true；如再修改题号或分值需重新确认）。' : <>当前本地题目满分尚未全部与上游预览分值匹配，保存时将标记为 <span className="font-mono">points_known = false</span>（避免把占位或未核对分值当作真实加权排名）。</>}</p><label className="flex items-center gap-2 text-foreground"><input type="checkbox" checked={Boolean(currentCfWeightSig && confirmedWeightsSig === currentCfWeightSig)} onChange={event => setConfirmedWeightsSig(event.target.checked ? currentCfWeightSig : undefined)} />我已手工核对并确认当前全部题目真实满分（标记 points_known = true）</label></div>}
+            {showCfPointsNotice && <div className="space-y-2 border-l-2 border-warning bg-warning/5 px-3 py-2.5 text-xs text-warning"><p>{effectiveCfPointsKnown === true ? '已手工确认当前题目满分（保存时标记 points_known = true；如再修改题号或分值需重新确认）。' : <>当前本地题目满分尚未全部与上游预览分值匹配，保存时将标记为 <span className="font-mono">points_known = false</span>（避免把占位或未核对分值当作真实加权排名）。</>}</p><label className="flex items-center gap-2 text-foreground"><input type="checkbox" checked={Boolean(currentCfWeightSig && confirmedWeightsSig === currentCfWeightSig)} onChange={event => { if (event.target.checked) { setConfirmedWeightsSig(currentCfWeightSig); setCfNoticeSticky(true); } else { setConfirmedWeightsSig(undefined); } }} />我已手工核对并确认当前全部题目真实满分（标记 points_known = true）</label></div>}
             {judgeBackend?.language_presets && judgeBackend.language_presets.length > 0 && <div><div className="mb-2 text-xs font-medium">语言预设</div><div className="flex flex-wrap gap-2">{judgeBackend.language_presets.map(language => { const enabled = Object.keys(stringRecord(values.languages)).includes(language.id); return <button key={language.id} type="button" aria-pressed={enabled} onClick={() => { const mapping = stringRecord(values.languages); if (enabled) delete mapping[language.id]; else mapping[language.id] = language.remote_id; setValue('languages', JSON.stringify(mapping)); }} className={enabled ? 'border bg-primary px-3 py-2 text-xs text-primary-foreground' : 'border bg-card px-3 py-2 text-xs text-muted-foreground hover:border-primary/40'}>{language.label}<span className="ml-1.5 font-mono text-[9px] opacity-65">{language.remote_id}</span></button>; })}</div></div>}
             <Field label="语言映射 JSON" hint="高级：本地语言 ID → 远端 ID" error={errors.languages?.message}><Input className="font-mono text-xs" {...register('languages')} /></Field>
             <Field label="题号映射 problem_map" hint="PDF 题号 → 平台题号" error={errors.problemMap?.message}><Textarea className="min-h-24" {...register('problemMap')} /></Field>

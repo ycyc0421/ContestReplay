@@ -294,14 +294,17 @@ test('merges partial remote preview mappings, carries points_known=false for inc
   // Override verified 500 with unverified 1 -> notice appears, points_known becomes false
   await page.getByLabel('远程题目 1 分值').fill('1');
   await expect(page.getByText(/points_known = false/)).toBeVisible();
-  // Confirming binds to weight=1, then changing weight to 2 invalidates confirmation back to false
+  // Confirming binds to weight=1, then changing weight to 2 clears confirmation so restoring 1 does NOT silently reactivate it
   await page.getByLabel(/我已手工核对并确认当前全部题目真实满分/).check();
   await expect(page.getByText(/如再修改题号或分值需重新确认/)).toBeVisible();
   await page.getByLabel('远程题目 1 分值').fill('2');
   await expect(page.getByText(/points_known = false/)).toBeVisible();
+  await page.getByLabel('远程题目 1 分值').fill('1');
+  await expect(page.getByLabel(/我已手工核对并确认当前全部题目真实满分/)).not.toBeChecked();
+  await expect(page.getByText(/points_known = false/)).toBeVisible();
   await page.getByRole('button', { name: '继续', exact: true }).click();
   await page.getByRole('button', { name: '仅保存', exact: true }).click();
-  expect(createdCf.document.problems).toEqual([{ id: 'A', max_points: 2 }]);
+  expect(createdCf.document.problems).toEqual([{ id: 'A', max_points: 1 }]);
   expect(createdCf.document.judge.points_known).toBe(false);
 
   // PushTargetsPanel surfaces load errors cleanly instead of empty state
