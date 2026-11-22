@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { codeforcesContest, saveAgent, saveContest } from './author.js';
 import { Connections } from './connections.js';
 import { OjAccounts, type previewContest as defaultPreviewContest } from './judges/index.js';
-import { makePlan, type Plan } from './plan.js';
+import { executeJob, makePlan, type Plan } from './plan.js';
 import {
   buildGhostRace,
   buildRunReplay,
@@ -37,7 +37,8 @@ import {
   type QueueOptions,
 } from './queue.js';
 import { exportBatch, exportRun, rankResults, resultBundle, type Result } from './results.js';
-import { configError, configRoute, isConfigRoute } from './studio-config-api.js';
+import { loadStudioContest } from './contest-author.js';
+import { configError, configRoute, isConfigRoute, loadStudioAgent } from './studio-config-api.js';
 import { coverageResponseSchema, type CoverageCell } from './studio-contract.js';
 import { serveStudioStatic, studioCsp } from './studio-static.js';
 
@@ -235,11 +236,16 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
     if (worker || control.signal.aborted) throw new HttpError(409, 'Studio is already running a batch or shutting down');
     lastError = null;
     const id = start();
+    const loadStudioInputs = async (contestFile: string, agentFile: string, inputStore?: Connections) => ({
+      ...await loadStudioContest(root, base, contestFile),
+      ...((await loadStudioAgent(base, root, agentFile, inputStore ?? store)).loaded),
+    });
     const task = id.then(batchId => dispatch(root, batchId, control.signal, {
       ...opts.queue,
       store,
       ojAccounts,
       pushDispatcher,
+      execute: opts.queue?.execute ?? ((plan, job, jobOpts) => executeJob(plan, job, { ...jobOpts, loadInputs: loadStudioInputs })),
       ...(concurrency !== undefined ? { concurrency } : {}),
     }));
     worker = task.catch(error => { lastError = error instanceof Error ? error.message : 'Batch failed'; })
@@ -390,7 +396,12 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
       }
 
       if (req.method === 'POST' && path === '/api/plan') {
-        const plan = await makePlan(await body(req), base, opts.getImage, store);
+        const loadAgentForStudio = async (file: string, inputStore?: Connections) =>
+          (await loadStudioAgent(base, root, file, inputStore ?? store)).loaded;
+        const plan = await makePlan(await body(req), base, opts.getImage, store, {
+          loadAgent: loadAgentForStudio,
+          loadContest: (file: string) => loadStudioContest(root, base, file),
+        });
         while (plans.size >= 8) plans.delete(plans.keys().next().value!);
         const token = randomUUID();
         plans.set(token, plan);

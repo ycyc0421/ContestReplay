@@ -25,6 +25,7 @@ import {
   FORBIDDEN_WORKSPACE_DIRS,
   isForbiddenWorkspaceRelPath,
   isReservedNonManifestFilename,
+  inspectStudioPdfBytes,
   loadStudioContest,
   outputPath,
   readWorkspaceFileNoFollow,
@@ -57,13 +58,16 @@ import {
   type OjPlatform,
 } from './judges/index.js';
 import { uploadMaterial } from './materials.js';
-import { checkPdfLimits, inspectPdf } from './pdf-synth.js';
+import { checkPdfLimits } from './pdf-synth.js';
 import { assertCompatible, assertHarnessProtocolCompatible, checkOjReadiness } from './plan.js';
 import { protocolDigest, protocolPresetNames, protocolPresets, resolveProtocolPreset, resolveScoringMode } from './protocol.js';
 import { listBatches } from './queue.js';
 import { documentFormat, formatSchema, parseDocumentText, serializeDocument } from './serialization.js';
 import {
   capabilitiesSchema,
+  contestPreviewResponseSchema,
+  contestPreviewSchema,
+  coverageResponseSchema,
   effectiveConfigSchema,
   preflightReportSchema,
   providerResponseSchema,
@@ -268,7 +272,7 @@ async function readStudioAgentFile(base: string, root: string, relPath: string, 
   return { target, format, bytes, parsed };
 }
 
-async function loadStudioAgent(base: string, root: string, relPath: string, store: Connections, fieldName = 'path') {
+export async function loadStudioAgent(base: string, root: string, relPath: string, store: Connections, fieldName = 'path') {
   const { target, format, bytes, parsed } = await readStudioAgentFile(base, root, relPath, fieldName);
   const loaded = await resolveLoadedAgent(
     parsed,
@@ -696,20 +700,6 @@ function redactSecretText(text: string, rules: CookieRedactionRules): string {
     out = out.replace(re, '$1[REDACTED]');
   }
   return out;
-}
-
-function redactSecretsDeep<T>(value: T, rules: CookieRedactionRules): T {
-  if (!rules.exact.length && !rules.wordBoundary.length) return value;
-  if (typeof value === 'string') return redactSecretText(value, rules) as T;
-  if (Array.isArray(value)) return value.map(item => redactSecretsDeep(item, rules)) as T;
-  if (value && typeof value === 'object') {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value)) {
-      out[k] = redactSecretsDeep(v, rules);
-    }
-    return out as T;
-  }
-  return value;
 }
 
 async function validateVariantDirectory(base: string, root: string, dirRel: string): Promise<string> {
@@ -1303,29 +1293,52 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
       }
       throw error;
     }
-    const preview = redactSecretsDeep(rawPreview, cookieSecrets);
-    let pdfInfo: Awaited<ReturnType<typeof inspectPdf>> | undefined;
+    const preview = contestPreviewSchema.parse({
+      ...rawPreview,
+      // Platform/status/language preset enum identities are trusted structure, not free text.
+      platform: rawPreview.platform,
+      status: rawPreview.status,
+      contest_ref: redactSecretText(rawPreview.contest_ref, cookieSecrets),
+      title: redactSecretText(rawPreview.title, cookieSecrets),
+      problems: rawPreview.problems.map(problem => ({
+        ...problem,
+        remote_id: redactSecretText(problem.remote_id, cookieSecrets),
+        ...(problem.title !== undefined ? { title: redactSecretText(problem.title, cookieSecrets) } : {}),
+        ...(problem.upstream_oj !== undefined ? { upstream_oj: redactSecretText(problem.upstream_oj, cookieSecrets) } : {}),
+        ...(problem.upstream_problem !== undefined ? { upstream_problem: redactSecretText(problem.upstream_problem, cookieSecrets) } : {}),
+      })),
+      suggested_languages: rawPreview.suggested_languages,
+      ...(rawPreview.statement_pdf_url !== undefined
+        ? { statement_pdf_url: redactSecretText(rawPreview.statement_pdf_url, cookieSecrets) }
+        : {}),
+    });
+    let pdfInfo: Awaited<ReturnType<typeof inspectStudioPdfBytes>> | undefined;
+    let displayPdfPath: string | undefined;
     if (input.pdf_path) {
-      let pdfFile: string;
+      let pdfBytes: Buffer;
       if (input.pdf_path.startsWith('managed/')) {
         const managed = await verifyManagedMaterialFile(root, input.pdf_path, undefined, 'pdf_path');
-        pdfFile = managed.fullPath;
+        pdfBytes = await readWorkspaceFileNoFollow(managed.fullPath, 128 * 1024 * 1024, 'pdf_path');
+        displayPdfPath = input.pdf_path;
       } else {
-        pdfFile = await existingWorkspaceFile(base, input.pdf_path, 'pdf_path', root);
+        const pdfFile = await existingWorkspaceFile(base, input.pdf_path, 'pdf_path', root);
+        pdfBytes = await readWorkspaceFileNoFollow(pdfFile, 128 * 1024 * 1024, 'pdf_path');
+        displayPdfPath = relative(await realpath(base), pdfFile).split(sep).join('/');
       }
-      pdfInfo = await inspectPdf(pdfFile);
+      pdfInfo = await inspectStudioPdfBytes(pdfBytes, displayPdfPath!);
     }
-    const localProblems = input.local_problems ?? pdfInfo?.problem_ids ?? [];
+    const localProblems = (input.local_problems ?? pdfInfo?.problem_ids ?? [])
+      .map(problem => redactSecretText(problem, cookieSecrets));
     const problemMapSuggestion = localProblems.length > 0
-      ? redactSecretsDeep(inferProblemMap(localProblems, preview.problems), cookieSecrets)
+      ? inferProblemMap(localProblems, preview.problems)
       : undefined;
     return {
-      data: {
+      data: contestPreviewResponseSchema.parse({
         preview,
         language_presets: languagePresetsFor(input.platform),
         ...(problemMapSuggestion ? { problem_map_suggestion: problemMapSuggestion } : {}),
-        ...(pdfInfo ? { pdf_info: { ...pdfInfo, path: input.pdf_path! } } : {}),
-      },
+        ...(pdfInfo ? { pdf_info: { ...pdfInfo, path: displayPdfPath! } } : {}),
+      }),
     };
   }
 
@@ -1437,7 +1450,7 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
         const preset = protocolPresets[presetName];
 
         try {
-          const pdfInfo = await inspectPdf(loaded.pdfPath);
+          const pdfInfo = await inspectStudioPdfBytes(loaded.pdf, loaded.pdfPath);
           const limits = checkPdfLimits(pdfInfo, { maxPages: preset.pdfMaxPages, maxBytes: preset.pdfMaxBytes });
           const cleanPdfIssues = limits.issues.map(msg =>
             sanitizeStudioIssue(new Error(msg), [...baseSensitive, resolvedPath, loaded.pdfPath], 'PDF limit exceeded'),

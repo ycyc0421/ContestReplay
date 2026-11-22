@@ -127,7 +127,21 @@ export async function readJson(path: string, limit = 16 * 1024 * 1024) {
   return JSON.parse((await readBoundedFile(path, limit)).toString('utf8')) as unknown;
 }
 
-export async function makePlan(raw: unknown, base: string, getImage = inspectImage, store?: Connections): Promise<Plan> {
+export type PlanInputLoaders = {
+  loadAgent: typeof loadAgent;
+  loadContest: typeof loadContest;
+  loadInputs: typeof loadInputs;
+};
+
+export async function makePlan(
+  raw: unknown,
+  base: string,
+  getImage = inspectImage,
+  store?: Connections,
+  loaders: Partial<PlanInputLoaders> = {},
+): Promise<Plan> {
+  const loadAgentImpl = loaders.loadAgent ?? loadAgent;
+  const loadContestImpl = loaders.loadContest ?? loadContest;
   const spec = specSchema.parse(raw);
   const axes = 'cells' in spec ? { agents: [...new Set(spec.cells.map(cell => cell.agent))],
     contests: [...new Set(spec.cells.map(cell => cell.contest))] } : spec;
@@ -143,7 +157,7 @@ export async function makePlan(raw: unknown, base: string, getImage = inspectIma
     baseRevision: string;
   }[] = [];
   for (const file of paths(axes.agents)) {
-    const input = await loadAgent(file, store);
+    const input = await loadAgentImpl(file, store);
     assertHarnessProtocolCompatible(input.profile);
     const { harness, model_family_id } = input.profile;
     let image: string | undefined = images.get(harness);
@@ -165,7 +179,7 @@ export async function makePlan(raw: unknown, base: string, getImage = inspectIma
   const contests: Pick<PlanJob, 'contest_path' | 'contest_id' | 'data_version' | 'contest_sha256' | 'protocol_preset'>[] = [];
   const compatibility = new Map<string, Inputs['contest']>();
   for (const file of paths(axes.contests)) {
-    const input = await loadContest(file);
+    const input = await loadContestImpl(file);
     compatibility.set(file, input.contest);
     contests.push({
       contest_path: file, contest_id: input.contest.contest_id, data_version: input.contest.data_version,
@@ -250,9 +264,9 @@ function verifyContest(job: PlanJob, input: ContestInput) {
   if (input.contestDigest !== job.contest_sha256 || input.contest.contest_id !== job.contest_id ||
       input.contest.data_version !== job.data_version) throw new Error('Contest inputs changed; regenerate the plan');
 }
-export async function verifyJob(plan: Plan, job: PlanJob, store?: Connections) {
+export async function verifyJob(plan: Plan, job: PlanJob, store?: Connections, loadInputsImpl = loadInputs) {
   if (plan.protocol_sha256 !== protocolDigest) throw new Error('Evaluation protocol changed; regenerate the plan');
-  const inputs = await loadInputs(job.contest_path, job.agent_path, store);
+  const inputs = await loadInputsImpl(job.contest_path, job.agent_path, store);
   verifyContest(job, inputs);
   verifyAgent(job, inputs, inputs.contest);
   assertCompatible(job.harness, inputs.contest, job.agent_id);
@@ -293,9 +307,10 @@ export async function executeJob(
     store?: Connections;
     ojAccounts?: OjAccounts;
     ojPool?: OjAccountPool;
+    loadInputs?: PlanInputLoaders['loadInputs'];
   },
 ) {
-  const inputs = await verifyJob(plan, job, opts.store);
+  const inputs = await verifyJob(plan, job, opts.store, opts.loadInputs ?? loadInputs);
   const key = await modelKey(inputs, opts.store);
   opts.signal.throwIfAborted();
   const preset = protocolForPreset(resolveProtocolPreset(inputs.contest.rules));

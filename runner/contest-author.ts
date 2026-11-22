@@ -1,6 +1,8 @@
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { link, lstat, mkdir, mkdtemp, open, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, link, lstat, mkdir, mkdtemp, open, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { z } from 'zod';
 import {
@@ -18,12 +20,41 @@ import {
 import { managedMaterial } from './materials.js';
 import { FieldError, manifestSchema } from './agent-manifest.js';
 import { importCodeforces } from './codeforces.js';
+import { inspectPdf } from './pdf-synth.js';
 import { protocolPresets, resolveProtocolPreset } from './protocol.js';
 
 export const FORBIDDEN_WORKSPACE_DIRS = new Set(['node_modules', 'dist', 'coverage', 'runs']);
 const MANAGED_ASSET_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 const workspaceLocks = new Map<string, Promise<void>>();
+
+async function acquireWorkspaceFlock(key: string) {
+  const uid = process.getuid?.();
+  const lockDir = join(homedir(), '.config', 'contestreplay', 'workspace-locks');
+  await mkdir(lockDir, { recursive: true, mode: 0o700 });
+  const dirInfo = await lstat(lockDir);
+  if (dirInfo.isSymbolicLink() || !dirInfo.isDirectory() || (uid !== undefined && dirInfo.uid !== uid)) {
+    throw new Error('Workspace lock directory is invalid');
+  }
+  if ((dirInfo.mode & 0o077) !== 0) await chmod(lockDir, 0o700);
+  const lockPath = join(lockDir, `${sha256(key).slice(0, 32)}.lock`);
+  const handle = await open(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || (uid !== undefined && info.uid !== uid)) throw new Error('Workspace lock file is invalid');
+    if ((info.mode & 0o077) !== 0) await handle.chmod(0o600);
+    const result = await new Promise<number | null>((resolveExit, rejectExit) => {
+      const child = spawn('flock', ['-x', '-w', '10', '3'], { stdio: ['ignore', 'ignore', 'ignore', handle.fd] });
+      child.once('error', rejectExit);
+      child.once('close', resolveExit);
+    }).catch(() => { throw new Error('Workspace lock unavailable'); });
+    if (result !== 0) throw new Error('Workspace is busy with another Studio write; retry shortly');
+    return handle;
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
 
 export async function withWorkspaceLock<T>(
   base: string,
@@ -41,9 +72,14 @@ export async function withWorkspaceLock<T>(
   const tail = prev.then(() => current);
   workspaceLocks.set(key, tail);
   await prev;
+  let flockHandle: Awaited<ReturnType<typeof open>> | undefined;
   try {
+    // Serialize all contest publication/material deletion across both this process and
+    // other CLI/Studio processes, covering answer-file creation through manifest publication/rollback.
+    flockHandle = await acquireWorkspaceFlock(key);
     return await fn();
   } finally {
+    if (flockHandle) await flockHandle.close().catch(() => {});
     release();
     if (workspaceLocks.get(key) === tail) {
       workspaceLocks.delete(key);
@@ -340,10 +376,36 @@ export async function existingWorkspaceFile(base: string, relPath: string, field
 }
 
 export async function readWorkspaceFileNoFollow(target: string, limit = 1_000_000, fieldName = 'path'): Promise<Buffer> {
+  // Snapshot ancestor identities before opening, then verify them and the leaf again
+  // from the already-open descriptor. This prevents a parent directory being replaced
+  // by a symlink between workspace validation and the O_NOFOLLOW open.
+  const ancestors: Array<{ path: string; dev: number; ino: number }> = [];
+  for (let current = dirname(resolve(target)); ; current = dirname(current)) {
+    const info = await lstat(current);
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new FieldError([fieldName], 'Parent directory changed or traverses a symlink');
+    }
+    ancestors.push({ path: current, dev: info.dev, ino: info.ino });
+    if (dirname(current) === current) break;
+  }
   const handle = await open(target, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
   try {
     const info = await handle.stat();
     if (!info.isFile() || info.size > limit) throw new FieldError([fieldName], 'File is invalid or too large');
+    const parentReal = await realpath(dirname(resolve(target)));
+    if (parentReal !== dirname(resolve(target))) {
+      throw new FieldError([fieldName], 'Parent directory changed during file read');
+    }
+    for (const ancestor of ancestors) {
+      const after = await lstat(ancestor.path);
+      if (after.isSymbolicLink() || !after.isDirectory() || after.dev !== ancestor.dev || after.ino !== ancestor.ino) {
+        throw new FieldError([fieldName], 'Parent directory changed during file read');
+      }
+    }
+    const leafAfter = await lstat(target);
+    if (leafAfter.isSymbolicLink() || !leafAfter.isFile() || leafAfter.dev !== info.dev || leafAfter.ino !== info.ino) {
+      throw new FieldError([fieldName], 'File changed during file read');
+    }
     const bytes = Buffer.alloc(info.size + 1);
     let read = 0;
     while (read < bytes.length) {
@@ -355,6 +417,19 @@ export async function readWorkspaceFileNoFollow(target: string, limit = 1_000_00
     return bytes.subarray(0, read);
   } finally {
     await handle.close();
+  }
+}
+
+export async function inspectStudioPdfBytes(bytes: Buffer, displayPath: string) {
+  const temp = await mkdtemp(join(tmpdir(), 'cr-studio-pdf-'));
+  await chmod(temp, 0o700);
+  try {
+    const snapshot = join(temp, 'input.pdf');
+    await writeFile(snapshot, bytes, { mode: 0o600, flag: 'wx' });
+    const info = await inspectPdf(snapshot);
+    return { ...info, path: displayPath };
+  } finally {
+    await rm(temp, { recursive: true, force: true });
   }
 }
 

@@ -1,14 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { appendFile, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { Connections } from '../dist/connections.js';
 import { OjAccounts } from '../dist/judges/index.js';
 import { synthesizeTextContestPdf } from '../dist/pdf-synth.js';
+import { makePlan } from '../dist/plan.js';
+import { readWorkspaceFileNoFollow } from '../dist/contest-author.js';
 import { PushDispatcher, PushTargets } from '../dist/push.js';
 import { createSseWriter, startStudio } from '../dist/studio.js';
 import {
@@ -528,7 +532,11 @@ test('Studio v2 API: live progress, SSE stream, sliced logs, replay, ghost race,
   };
   const agentLow = await makeAgent('gpt-low', 'low');
   const agentHigh = await makeAgent('gpt-high', 'high');
-  const contestFile = resolve('examples/demo/contest.json');
+  // Studio admission deliberately requires contest manifests and artifacts inside its workspace.
+  const contestFile = join(base, 'contest.json');
+  for (const name of ['contest.json', 'judge.json', 'problems.pdf']) {
+    await writeFile(join(base, name), await readFile(resolve('examples/demo', name)));
+  }
 
   // Gate run completion so we can inspect live_summary, /progress, and SSE /events mid-run!
   let releaseRuns;
@@ -2141,4 +2149,180 @@ test('Studio v2 final polish regressions: preflight safety & protocol/path sanit
   const remainingRefs = await readdir(join(dir, 'connections', 'references')).catch(() => []);
   assert.equal(remainingRefs.filter(n => n.startsWith('resp-prov~')).length, 0, 'Agent DELETE must retire provider refs');
   assert.equal((await req('/api/providers/resp-prov', { method: 'DELETE' })).status, 200, 'Provider delete succeeds once agent deleted');
+});
+
+test('Studio v2 final admission and I/O regressions: plan/execute artifact policy, preview enum safety, verified PDF bytes, cross-process immutable answers, and parent-symlink rejection', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-studio-v2-admission-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const base = join(dir, 'workspace');
+  const root = join(dir, 'runs');
+  await mkdir(join(base, 'agents'), { recursive: true });
+  await mkdir(join(base, 'contests'), { recursive: true });
+  await mkdir(join(root, '.batches'), { recursive: true, mode: 0o700 });
+
+  const store = new Connections(join(dir, 'connections'));
+  await store.create({
+    id: 'admission-provider',
+    label: 'Admission Provider',
+    protocol: 'responses',
+    base_url: 'http://127.0.0.1:19993/v1',
+    secret: 'sk-admission-secret',
+  });
+  const ojAccounts = new OjAccounts(join(dir, 'oj-accounts'));
+  await ojAccounts.create({
+    id: 'qoj-short',
+    label: 'QOJ short cookie',
+    platform: 'qoj',
+    handle: 'short-bot',
+    transport: 'cookie',
+    secret: 'session=oj; x=a',
+  });
+  const pdfPath = join(base, 'paper.pdf');
+  await synthesizeTextContestPdf([{ id: '1', title: 'Problem 1', body: 'Solve 1' }], pdfPath);
+  const studio = await startStudio(root, 0, {
+    base,
+    store,
+    ojAccounts,
+    getImage,
+    previewContest: async (platform, contestId) => ({
+      platform,
+      contest_ref: String(contestId),
+      title: 'Prefix oj a and abc',
+      status: 'finished',
+      problems: [{ remote_id: 'A', title: 'Title oj a abc' }],
+      suggested_languages: [],
+    }),
+    queue: { preflight: async () => {} },
+  });
+  t.after(() => studio.close());
+  const req = makeRequester(studio.url);
+
+  const agentDoc = {
+    kind: 'contestreplay.dev/agent',
+    schema_version: 1,
+    id: 'admission-agent',
+    vendor: 'openai',
+    model: 'gpt-5.4',
+    provider: 'admission-provider',
+    harness: { kind: 'codex', version: '0.170.0', options: {} },
+  };
+  assert.equal((await req('/api/agents', { body: { document: agentDoc } })).status, 201);
+
+  // Preview preserves trusted enum identities even for cookie value "oj", redacts short text,
+  // validates the response, and returns a workspace-relative pdf_info.path instead of an absolute input path.
+  const previewRes = await req('/api/contests/preview', {
+    body: { platform: 'qoj', contest_id: 42, account_id: 'qoj-short', pdf_path: pdfPath },
+  });
+  assert.equal(previewRes.status, 200, previewRes.text);
+  contestPreviewResponseSchema.parse(previewRes.value);
+  assert.equal(previewRes.value.preview.platform, 'qoj');
+  assert.equal(previewRes.value.preview.status, 'finished');
+  assert.ok(!previewRes.text.includes('Prefix oj a and abc'));
+  assert.equal(previewRes.value.pdf_info.path, 'paper.pdf');
+  assert.ok(!previewRes.value.pdf_info.path.startsWith('/'));
+
+  const answerTable = {
+    schema_version: 1,
+    problems: [{ id: '1', max_points: 1, accepted_answers: ['1'] }],
+  };
+  await writeFile(join(base, 'contests', 'judge.json'), JSON.stringify(answerTable));
+  await writeFile(join(base, 'contests', 'disguised-answer.dat'), JSON.stringify(answerTable));
+  const unsafeManifest = {
+    schema_version: 2,
+    contest_id: 'unsafe-admission',
+    data_version: 1,
+    title: 'Unsafe admission',
+    source: { name: 'Local' },
+    materials: {
+      entrypoint: { kind: 'pdf', path: '../paper.pdf' },
+      attachments: [{ name: 'statement-helper.dat', path: 'disguised-answer.dat' }],
+    },
+    judge: { kind: 'local', answers: { path: 'judge.json' } },
+  };
+  const unsafePath = join(base, 'contests', 'unsafe.json');
+  await writeFile(unsafePath, JSON.stringify(unsafeManifest));
+  const spec = {
+    schema_version: 2,
+    cells: [{ agent: 'agents/admission-agent.toml', contest: 'contests/unsafe.json' }],
+  };
+  // Studio plan admission uses the exact same artifact policy as item GET/preflight.
+  const planRes = await req('/api/plan', { body: spec });
+  assert.equal(planRes.status, 400, planRes.text);
+
+  // A plan produced through the unrestricted CLI loader must also be rejected at Studio execution,
+  // before any run directory is created, rather than allowing an invalid contest into the sandbox.
+  const cliPlan = await makePlan(spec, base, getImage, store);
+  const batchId = randomUUID();
+  await writeFile(
+    join(root, '.batches', `${batchId}.json`),
+    JSON.stringify({
+      schema_version: 1,
+      id: batchId,
+      created_at: new Date().toISOString(),
+      plan: cliPlan,
+      jobs: [{ status: 'queued' }],
+    }),
+  );
+  assert.equal((await req(`/api/batches/${batchId}/resume`, { body: {} })).status, 202);
+  let terminalJob;
+  for (let i = 0; i < 40; i++) {
+    const batches = await req('/api/batches');
+    terminalJob = batches.value.batches.find(b => b.id === batchId)?.jobs[0];
+    if (terminalJob && terminalJob.status !== 'queued' && terminalJob.status !== 'running') break;
+    await new Promise(r => setTimeout(r, 25));
+  }
+  assert.equal(terminalJob?.status, 'void');
+  assert.equal(terminalJob?.reason, 'runner_error');
+  await assert.rejects(stat(join(root, terminalJob.run_id)), { code: 'ENOENT' });
+
+  // Parent-directory symlinks are rejected even though O_NOFOLLOW alone protects only the final component.
+  const outside = join(dir, 'outside-parent');
+  await mkdir(outside, { recursive: true });
+  await writeFile(join(outside, 'data.json'), '{}');
+  await symlink(outside, join(base, 'linked-parent'));
+  await assert.rejects(
+    readWorkspaceFileNoFollow(join(base, 'linked-parent', 'data.json')),
+    /Parent directory changed|symlink/i,
+  );
+
+  // Two independent Node processes publishing the same manifest/answer bytes serialize on the shared
+  // filesystem lock. The losing manifest link must never remove the winner's immutable answer table.
+  const moduleUrl = pathToFileURL(resolve('dist/contest-author.js')).href;
+  const childPayload = JSON.stringify({
+    file: 'contests/race.json',
+    document: {
+      schema_version: 2,
+      contest_id: 'race-immutable',
+      data_version: 1,
+      title: 'Cross-process immutable publication',
+      source: { name: 'Local' },
+      materials: { entrypoint: { kind: 'pdf', path: '../paper.pdf' }, attachments: [] },
+      judge: { kind: 'local', problems: answerTable.problems },
+    },
+  });
+  const childSource = `
+    import { createContestDocument } from ${JSON.stringify(moduleUrl)};
+    const raw = JSON.parse(process.argv[1]);
+    try {
+      await createContestDocument(process.argv[2], process.argv[3], raw, new AbortController().signal);
+      process.exit(0);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    }
+  `;
+  const runPublisher = () => new Promise((resolveExit, rejectExit) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', childSource, childPayload, root, base], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    child.once('error', rejectExit);
+    child.once('close', code => resolveExit({ code, stderr }));
+  });
+  const publishers = await Promise.all([runPublisher(), runPublisher()]);
+  assert.deepEqual(publishers.map(p => p.code).sort(), [0, 1], publishers.map(p => p.stderr).join('\n'));
+  const publishedManifest = JSON.parse(await readFile(join(base, 'contests', 'race.json'), 'utf8'));
+  const immutableAnswerPath = join(base, 'contests', publishedManifest.judge.answers.path);
+  assert.deepEqual(JSON.parse(await readFile(immutableAnswerPath, 'utf8')), answerTable);
 });
