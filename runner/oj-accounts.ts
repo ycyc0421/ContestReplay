@@ -128,7 +128,7 @@ export const rotateOjAccountSchema = z.strictObject({
   secret: ojSecretSchema,
 });
 
-export const ojAccountResponseSchema = z.strictObject({
+export const ojAccountMetadataSchema = z.strictObject({
   id: ojAccountId,
   label: z.string(),
   platform: ojPlatformSchema,
@@ -139,9 +139,12 @@ export const ojAccountResponseSchema = z.strictObject({
   executable_path: ojExecutablePath.optional(),
   credential_ref: z.uuid().optional(),
   backend: ojBackendSchema,
-  ready: z.boolean(),
   created_at: isoTimestamp,
   updated_at: isoTimestamp,
+});
+
+export const ojAccountResponseSchema = ojAccountMetadataSchema.extend({
+  ready: z.boolean(),
 });
 
 export const ojAccountsResponseSchema = z.strictObject({
@@ -151,6 +154,7 @@ export const ojAccountsResponseSchema = z.strictObject({
 export type CreateOjAccountInput = z.infer<typeof createOjAccountSchema>;
 export type PatchOjAccountInput = z.infer<typeof patchOjAccountSchema>;
 export type RotateOjAccountInput = z.infer<typeof rotateOjAccountSchema>;
+export type OjAccountMetadata = z.infer<typeof ojAccountMetadataSchema>;
 export type OjAccount = z.infer<typeof ojAccountResponseSchema>;
 
 export interface ExpectedAccountBinding {
@@ -175,7 +179,7 @@ export class OjAccountError extends Error {
 
 const missing = (e: unknown) => (e as NodeJS.ErrnoException)?.code === 'ENOENT';
 
-function toPublic(value: StoredOjAccount, ready: boolean): OjAccount {
+function toMetadata(value: StoredOjAccount): OjAccountMetadata {
   return {
     id: value.id,
     label: value.label,
@@ -187,9 +191,15 @@ function toPublic(value: StoredOjAccount, ready: boolean): OjAccount {
     ...(value.executable_path ? { executable_path: value.executable_path } : {}),
     ...(value.credential_ref ? { credential_ref: value.credential_ref } : {}),
     backend: value.backend,
-    ready,
     created_at: value.created_at,
     updated_at: value.updated_at,
+  };
+}
+
+function toPublic(value: StoredOjAccount, ready: boolean): OjAccount {
+  return {
+    ...toMetadata(value),
+    ready,
   };
 }
 
@@ -435,6 +445,28 @@ export class OjAccounts {
     } else if (old.backend === 'secret-service') {
       await secretChannel('clear', old.credential_ref);
     }
+  }
+
+  async getMetadata(id: string): Promise<OjAccountMetadata> {
+    const value = await this.stored(id);
+    return toMetadata(value);
+  }
+
+  async listMetadata(): Promise<OjAccountMetadata[]> {
+    const ids = await this.ids();
+    const result: OjAccountMetadata[] = [];
+    for (let i = 0; i < ids.length; i += 8) {
+      const batch = await Promise.all(
+        ids.slice(i, i + 8).map(id =>
+          this.getMetadata(id).catch(error => {
+            if (!(error instanceof OjAccountError) || error.status !== 404) throw error;
+            return undefined;
+          }),
+        ),
+      );
+      for (const item of batch) if (item !== undefined) result.push(item);
+    }
+    return result;
   }
 
   async get(id: string): Promise<OjAccount> {
