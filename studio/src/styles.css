@@ -20,8 +20,10 @@
   --font-sans: "Inter Variable", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   --font-mono: "JetBrains Mono Variable", "SFMono-Regular", Consolas, monospace;
   --radius-card: 0.25rem;
-  --animate-fade-in: fade-in 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
-  --animate-panel-in: panel-in 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  --animate-fade-in: fade-in 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  --animate-panel-in: panel-in 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  --animate-drawer-in: drawer-in 210ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  --animate-drawer-out: drawer-out 140ms ease-in both;
   --animate-dialog-in: dialog-in 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
   --animate-dialog-out: dialog-out 120ms ease-in both;
   --animate-overlay-in: overlay-in 160ms ease-out both;
@@ -87,7 +89,9 @@ body, .bg-card, .bg-sidebar, .bg-background { transition: background-color 180ms
 .log-view { tab-size: 2; overflow-wrap: normal; }
 
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
-@keyframes panel-in { from { opacity: 0; transform: translateX(8px); } to { opacity: 1; transform: translateX(0); } }
+@keyframes panel-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes drawer-in { from { opacity: 0; transform: translateX(24px); } to { opacity: 1; transform: translateX(0); } }
+@keyframes drawer-out { from { opacity: 1; transform: translateX(0); } to { opacity: 0; transform: translateX(18px); } }
 @keyframes dialog-in { from { opacity: 0; scale: .975; } to { opacity: 1; scale: 1; } }
 @keyframes dialog-out { from { opacity: 1; scale: 1; } to { opacity: 0; scale: .98; } }
 @keyframes overlay-in { from { opacity: 0; } to { opacity: 1; } }

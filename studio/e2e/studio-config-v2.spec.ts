@@ -120,11 +120,12 @@ test('preserves external native_config, shows legacy Agent read-only, and clears
   });
 
   await page.goto('/configs');
-  // Legacy Agent renders read-only without a Save button
+  // Legacy Agent renders read-only inside drawer without a Save button
   await page.getByRole('button', { name: '编辑 demo-codex', exact: true }).click();
   await expect(page.getByText(/此配置使用旧版 Agent 格式/)).toBeVisible();
   await expect(page.getByText('OPENAI_API_KEY', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: '保存修改' })).toHaveCount(0);
+  await page.getByRole('button', { name: '关闭抽屉' }).click();
 
   // External native_config { path, sha256, format } is preserved on name-only save and preview sends file: initial.path
   await page.getByRole('button', { name: '编辑 agent-base', exact: true }).click();
@@ -137,32 +138,26 @@ test('preserves external native_config, shows legacy Agent read-only, and clears
   await page.getByRole('button', { name: '保存修改', exact: true }).click();
   expect(updates[0].document.harness.native_config).toEqual(nativeOverride);
   expect(updates[0].document.model_family_id).toBeUndefined();
+  // Drawer closes after save so list is unobstructed
+  await expect(page.getByRole('button', { name: '编辑 agent-base', exact: true })).toBeVisible();
 
-  // Removing external native_config awaits delayed baseline reload (keeping Save disabled)
-  // Deleting an unrelated Agent (demo-codex) while agent-base reload is pending must NOT cancel agent-base's reload
-  delayNextAgentReload = true;
+  // Re-open agent-base, remove external native_config, and save
+  await page.getByRole('button', { name: '编辑 agent-base', exact: true }).click();
   await page.getByRole('tab', { name: '原生覆盖' }).click();
   await page.getByLabel('移除已绑定的外部原生覆盖文件').check();
   await page.getByRole('button', { name: '保存修改', exact: true }).click();
-  await expect(page.getByRole('button', { name: '保存修改', exact: true })).toBeDisabled();
+  expect(updates[1].document.harness.native_config).toBeUndefined();
+
+  // Re-open agent-base after reload failure shows clear error state instead of stale snapshot
+  failNextAgentReload = true;
+  await page.getByRole('button', { name: '编辑 agent-base', exact: true }).click();
+  await expect(page.getByText('无法读取配置')).toBeVisible();
+  await page.getByRole('button', { name: '关闭抽屉' }).click();
+
+  // Deleting an Agent removes it cleanly from the library
   await page.getByRole('button', { name: '删除 demo-codex', exact: true }).click();
   await page.getByRole('button', { name: '删除配置', exact: true }).click();
-  await expect(page.getByRole('button', { name: '保存修改', exact: true })).toBeEnabled();
-  expect(updates[1].document.harness.native_config).toBeUndefined();
-  await page.getByLabel(/TOML 参数覆盖/).fill('model_verbosity = "high"');
-  await page.getByLabel(/TOML 参数覆盖/).fill('');
-  failNextAgentReload = true;
-  await page.getByRole('button', { name: '保存修改', exact: true }).click();
-  expect(updates[2].document.harness.native_config).toBeUndefined();
-  await expect(page.getByText(/刷新编辑器快照失败/)).toBeVisible();
-  // Reload failure clears stale edit mode so user cannot save against an obsolete snapshot
-  await expect(page.getByRole('tab', { name: '新建 Agent' })).toBeVisible();
-
-  // Re-open and delete currently open Agent clears edit state back to "新建 Agent"
-  await page.getByRole('button', { name: '编辑 agent-base', exact: true }).click();
-  await page.getByRole('button', { name: '删除 agent-base', exact: true }).click();
-  await page.getByRole('button', { name: '删除配置', exact: true }).click();
-  await expect(page.getByRole('tab', { name: '新建 Agent' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '编辑 demo-codex', exact: true })).toHaveCount(0);
 });
 
 test('save-and-add-to-batch waits for catalog refetch and disables batch add on invalid configs', async ({ page }) => {
@@ -184,6 +179,7 @@ test('save-and-add-to-batch waits for catalog refetch and disables batch add on 
 
   await page.goto('/configs');
   await expect(page.getByRole('button', { name: '将 agent-bad 加入批次', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: '新建 Agent', exact: true }).click();
   await page.getByLabel('Agent ID').fill('agent-fresh');
   await page.getByLabel('模型标识').fill('gpt-test');
   await page.getByRole('combobox', { name: 'Provider' }).click();
@@ -288,7 +284,7 @@ test('merges partial remote preview mappings, carries points_known=false for inc
   await page.getByRole('combobox', { name: '判题后端' }).click();
   await page.getByRole('option', { name: 'Codeforces', exact: true }).click();
   await page.getByLabel('Codeforces 赛事 ID').fill('2000');
-  await page.getByLabel('专用账号名').fill('cf_bot');
+  await page.getByLabel('专用用户名（Handle）').fill('cf_bot');
   await page.getByRole('button', { name: '拉取赛事信息' }).click();
   await expect(page.getByLabel('远程题目 1 分值')).toHaveValue('500');
   // Override verified 500 with unverified 1 -> notice appears, points_known becomes false
@@ -302,16 +298,21 @@ test('merges partial remote preview mappings, carries points_known=false for inc
   await page.getByLabel('远程题目 1 分值').fill('1');
   await expect(page.getByLabel(/我已手工核对并确认当前全部题目真实满分/)).not.toBeChecked();
   await expect(page.getByText(/points_known = false/)).toBeVisible();
+  // Confirming on a custom mirror must match between UI display and saved manifest (points_known=true)
+  await page.getByLabel('Base URL').fill('https://mirror.codeforces.com');
+  await page.getByLabel(/我已手工核对并确认当前全部题目真实满分/).check();
+  await expect(page.getByText(/如再修改题号或分值需重新确认/)).toBeVisible();
   await page.getByRole('button', { name: '继续', exact: true }).click();
   await page.getByRole('button', { name: '仅保存', exact: true }).click();
   expect(createdCf.document.problems).toEqual([{ id: 'A', max_points: 1 }]);
-  expect(createdCf.document.judge.points_known).toBe(false);
+  expect(createdCf.document.judge.base_url).toBe('https://mirror.codeforces.com');
+  expect(createdCf.document.judge.points_known).toBe(true);
 
   // PushTargetsPanel surfaces load errors cleanly instead of empty state
   await page.route('**/api/push-targets', route => route.fulfill({ status: 500, json: { error: 'push store unavailable' } }));
   await page.route('**/api/push-deliveries?*', route => route.fulfill({ json: { deliveries: [] } }));
-  await page.goto('/providers');
-  await page.getByRole('tab', { name: 'Push Targets' }).click();
+  await page.goto('/connections');
+  await page.getByRole('tab', { name: '事件推送' }).click();
   await expect(page.getByText('无法读取 Push Targets')).toBeVisible();
   await expect(page.getByText('push store unavailable')).toBeVisible();
 });
@@ -404,14 +405,29 @@ test('updates Contest data and local judge atomically', async ({ page }) => {
   expect(updated.document.materials.attachments).toHaveLength(1);
 });
 
-test('creates OJ account and Push Target without echoing secrets', async ({ page }) => {
+test('creates OJ account with multi-format Cookie Importer + session probe and Push Target without echoing secrets', async ({ page }) => {
   let accounts: any[] = [];
   let targets: any[] = [];
   await page.route('**/api/providers', route => route.fulfill({ json: { providers: [] } }));
+  await page.route('**/api/oj-accounts/probe', async route => {
+    const input = route.request().postDataJSON();
+    expect(input.platform).toBe('codeforces');
+    expect(input.secret).toBe('JSESSIONID=oj-cookie-secret; 39ce7=xyz');
+    return route.fulfill({
+      json: {
+        ok: true,
+        authenticated: true,
+        origin: 'https://codeforces.com',
+        detected_handle: 'cf_handle',
+        message: '已验证登录态：cf_handle',
+      },
+    });
+  });
   await page.route('**/api/oj-accounts', async route => {
     if (route.request().method() === 'GET') return route.fulfill({ json: { accounts } });
     const input = route.request().postDataJSON();
-    expect(input.secret).toBe('oj-cookie-secret');
+    expect(input.secret).toBe('JSESSIONID=oj-cookie-secret; 39ce7=xyz');
+    expect(input.handle).toBe('cf_handle');
     accounts = [{ id: 'cf-main', label: input.label, platform: 'codeforces', handle: input.handle, pool: 'default', transport: 'cookie', credential_ref: 'a720a849-3c7d-4f35-a4bd-51ee0baf7f15', backend: 'file', ready: true, created_at: '2025-01-01T00:00:00.000Z', updated_at: '2025-01-01T00:00:00.000Z' }];
     return route.fulfill({ status: 201, json: accounts[0] });
   });
@@ -423,16 +439,39 @@ test('creates OJ account and Push Target without echoing secrets', async ({ page
     return route.fulfill({ status: 201, json: targets[0] });
   });
   await page.route('**/api/push-deliveries?*', route => route.fulfill({ json: { deliveries: [] } }));
+  // Verify legacy /providers route still works identically to /connections
   await page.goto('/providers');
   await page.getByRole('tab', { name: 'OJ 账号池' }).click();
   await page.getByRole('button', { name: '登记第一个账号' }).click();
-  await page.getByLabel('显示名称').fill('CF Main');
-  await page.getByLabel('Handle').fill('cf_handle');
-  await page.getByLabel('Cookie / Session', { exact: true }).fill('oj-cookie-secret');
-  await page.getByRole('button', { name: '创建账号' }).click();
-  await expect(page.getByText('CF Main', { exact: true })).toBeVisible();
+  // Switching from Hydro with custom URL to Codeforces clears destination-bound URL/cookie/handle
+  await page.getByRole('button', { name: /Hydro/ }).click();
+  await page.getByLabel(/Hydro 站点地址/).fill('https://hydro.example.com');
+  await page.getByRole('button', { name: /Codeforces/ }).click();
+  await expect(page.getByText('目标站点：https://codeforces.com')).toBeVisible();
+
+  // Paste Netscape cookies.txt format into CookieImporter -> immediately masked in DOM (never echoed in cleartext)
+  const netscapeCookies = [
+    '# Netscape HTTP Cookie File',
+    '#HttpOnly_.codeforces.com\tTRUE\t/\tTRUE\t2147483647\tJSESSIONID\toj-cookie-secret',
+    '.codeforces.com\tTRUE\t/\tFALSE\t2147483647\t39ce7\txyz',
+  ].join('\n');
+  await page.getByLabel(/登录 Cookie/).fill(netscapeCookies);
+  await expect(page.getByText(/已暂存脱敏 Cookie/)).toBeVisible();
+  await expect(page.getByText('JSESSIONID=•••')).toBeVisible();
+  await expect(page.getByText('39ce7=•••')).toBeVisible();
   await expect(page.locator('body')).not.toContainText('oj-cookie-secret');
-  await page.getByRole('tab', { name: 'Push Targets' }).click();
+
+  // If user already typed a conflicting handle, probe asks for confirmation rather than silently overwriting
+  await page.getByLabel(/Codeforces 用户名/).fill('manual_handle');
+  await page.getByRole('button', { name: '验证并识别用户名' }).click();
+  await expect(page.getByLabel(/Codeforces 用户名/)).toHaveValue('manual_handle');
+  await page.getByRole('button', { name: '采用探测用户名' }).click();
+  await expect(page.getByLabel(/Codeforces 用户名/)).toHaveValue('cf_handle');
+  await page.getByRole('button', { name: '创建账号' }).click();
+  await expect(page.getByText('Codeforces · cf_handle', { exact: true })).toBeVisible();
+  await expect(page.locator('body')).not.toContainText('oj-cookie-secret');
+
+  await page.getByRole('tab', { name: '事件推送' }).click();
   await page.getByRole('button', { name: '创建第一个 Target' }).click();
   await page.getByLabel('显示名称').fill('Local Hook');
   await page.getByLabel('Webhook URL').fill('https://hooks.example.com/contestreplay');
@@ -458,19 +497,19 @@ test('does not leak cancelled rotation secrets across OJ accounts or Push Target
   await page.route('**/api/push-targets', route => route.fulfill({ json: { targets } }));
   await page.route('**/api/push-deliveries?*', route => route.fulfill({ json: { deliveries: [] } }));
 
-  await page.goto('/providers');
+  await page.goto('/connections');
   await page.getByRole('tab', { name: 'OJ 账号池' }).click();
   await page.getByRole('button', { name: '轮换 OJ 账号 CF A', exact: true }).click();
-  await page.getByLabel('新 Cookie / Session', { exact: true }).fill('secret-for-cf-a');
-  await page.getByRole('button', { name: '显示秘密' }).click();
+  await page.getByLabel('新 Cookie / Session', { exact: true }).fill('JSESSIONID=secret-for-cf-a');
+  await expect(page.getByText('JSESSIONID=•••')).toBeVisible();
+  await expect(page.locator('body')).not.toContainText('secret-for-cf-a');
   await page.getByRole('button', { name: '取消', exact: true }).click();
   await page.getByRole('button', { name: '轮换 OJ 账号 CF B', exact: true }).click();
-  const ojInput = page.getByLabel('新 Cookie / Session', { exact: true });
-  await expect(ojInput).toHaveValue('');
-  await expect(ojInput).toHaveAttribute('type', 'password');
+  await expect(page.getByText('JSESSIONID=•••')).toHaveCount(0);
+  await expect(page.getByLabel('新 Cookie / Session', { exact: true })).toHaveValue('');
   await page.getByRole('button', { name: '取消', exact: true }).click();
 
-  await page.getByRole('tab', { name: 'Push Targets' }).click();
+  await page.getByRole('tab', { name: '事件推送' }).click();
   await page.getByRole('button', { name: '轮换 Push Target Hook A', exact: true }).click();
   await page.getByLabel('新 Webhook Secret', { exact: true }).fill('secret-for-hook-a');
   await page.getByRole('button', { name: '显示秘密' }).click();
@@ -479,4 +518,62 @@ test('does not leak cancelled rotation secrets across OJ accounts or Push Target
   const hookInput = page.getByLabel('新 Webhook Secret', { exact: true });
   await expect(hookInput).toHaveValue('');
   await expect(hookInput).toHaveAttribute('type', 'password');
+});
+
+test('Studio V3 layout invariants: all 5 routes render cleanly without overflow or console errors in light/dark mode and Scheme A drawer docks right', async ({ page }) => {
+  await mockShell(page);
+  await page.route('**/api/batches', route => route.fulfill({ json: { batches: [], busy: false, error: null } }));
+  await page.route('**/api/catalog/agents', route => route.fulfill({ json: { agents: [baseAgent] } }));
+  await page.route('**/api/catalog/contests', route => route.fulfill({ json: { contests: [baseContest] } }));
+  await page.route('**/api/results/ranked?*', route => route.fulfill({ json: { scoring_mode: null, group_by: 'revision', groups: [], omitted_runs: [] } }));
+  await page.route('**/api/coverage', route => route.fulfill({ json: { cells: [] } }));
+  await page.route('**/api/oj-accounts', route => route.fulfill({ json: { accounts: [] } }));
+  await page.route('**/api/push-targets', route => route.fulfill({ json: { targets: [] } }));
+  await page.route('**/api/push-deliveries?*', route => route.fulfill({ json: { deliveries: [] } }));
+
+  const errors: string[] = [];
+  page.on('pageerror', err => errors.push(err.message));
+  page.on('console', msg => { if (msg.type() === 'error') errors.push(msg.text()); });
+
+  for (const routePath of ['/', '/batches/new', '/results', '/configs', '/connections']) {
+    await page.goto(routePath);
+    await expect(page.getByRole('navigation', { name: '主导航' })).toBeVisible();
+    // Sidebar uses unified Chinese navigation labels without raw "Providers"
+    await expect(page.getByRole('link', { name: /连接与凭据/ })).toBeVisible();
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    expect(overflow, `horizontal overflow on ${routePath}`).toBeLessThanOrEqual(1);
+  }
+
+  // Scheme A SlideDrawer opens docked to the right edge with opaque card surface
+  await page.goto('/configs');
+  await page.getByRole('button', { name: '新建 Agent', exact: true }).click();
+  const drawer = page.getByRole('dialog');
+  await expect(drawer).toBeVisible();
+  const vp = page.viewportSize()!;
+  await expect.poll(async () => {
+    const box = await drawer.boundingBox();
+    return box ? Math.abs((box.x + box.width) - vp.width) : 999;
+  }).toBeLessThanOrEqual(2);
+  const bgAlpha = await drawer.evaluate(el => {
+    const bg = getComputedStyle(el).backgroundColor;
+    const match = bg.match(/rgba?\([^,]+,[^,]+,[^,]+(?:,\s*([\d.]+))?\)/);
+    return match?.[1] ? Number(match[1]) : 1;
+  });
+  expect(bgAlpha).toBe(1);
+  // Escape dismisses drawer cleanly
+  await page.keyboard.press('Escape');
+  await expect(drawer).toHaveCount(0);
+
+  // Dark mode toggle + WAI-ARIA keyboard navigation on SegmentedTabs
+  await page.getByRole('button', { name: '切换深色主题' }).click();
+  await expect(page.locator('html')).toHaveClass(/dark/);
+  await page.goto('/connections?tab=oj');
+  const ojTab = page.getByRole('tab', { name: 'OJ 账号池', selected: true });
+  await expect(ojTab).toBeVisible();
+  await expect(ojTab).toHaveAttribute('tabindex', '0');
+  await expect(page.getByRole('tab', { name: '模型 API' })).toHaveAttribute('tabindex', '-1');
+  await ojTab.focus();
+  await page.keyboard.press('ArrowRight');
+  await expect(page.getByRole('tab', { name: '事件推送', selected: true })).toBeFocused();
+  expect(errors).toEqual([]);
 });

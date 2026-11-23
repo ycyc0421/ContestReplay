@@ -2,17 +2,21 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { runProgressSchema, runStatusEventSchema, type RunProgressContract } from '@studio-api';
 import { studioApi } from '@/lib/api';
+import { queryKeys } from '@/state/query-keys';
+import {
+  isTerminalProgress,
+  type ProgressConnection,
+  type TerminalQueueStatus,
+} from '@/state/run-monitor.machine';
 
-export type ProgressConnection = 'connecting' | 'live' | 'polling' | 'closed';
-export type TerminalQueueStatus = { status: ReturnType<typeof runStatusEventSchema.parse>['status']; reason?: string };
-const isTerminal = (progress?: RunProgressContract) => progress?.status === 'completed' || progress?.status === 'void';
+export type { ProgressConnection, TerminalQueueStatus };
 
 export function useRunProgress(runId: string) {
   const queryClient = useQueryClient();
   const [connection, setConnection] = useState<ProgressConnection>('connecting');
   const [terminalStatus, setTerminalStatus] = useState<TerminalQueueStatus>();
   const lastSseSeq = useRef(0);
-  const queryKey = useMemo(() => ['progress', runId] as const, [runId]);
+  const queryKey = useMemo(() => queryKeys.progress(runId), [runId]);
   const query = useQuery({
     queryKey,
     queryFn: async ({ signal }) => {
@@ -24,7 +28,7 @@ export function useRunProgress(runId: string) {
       }
       return result;
     },
-    refetchInterval: current => connection === 'live' || connection === 'closed' || Boolean(terminalStatus) || isTerminal(current.state.data) ? false : 4_000,
+    refetchInterval: current => connection === 'live' || connection === 'closed' || Boolean(terminalStatus) || isTerminalProgress(current.state.data) ? false : 4_000,
   });
 
   useEffect(() => {
@@ -46,11 +50,11 @@ export function useRunProgress(runId: string) {
         void queryClient.cancelQueries({ queryKey });
         queryClient.setQueryData(queryKey, progress);
         setConnection('live');
-        if (isTerminal(progress)) {
+        if (isTerminalProgress(progress)) {
           terminalClosed = true;
           source.close();
           setConnection('closed');
-          void queryClient.invalidateQueries({ queryKey: ['batches'] });
+          void queryClient.invalidateQueries({ queryKey: queryKeys.batches });
         }
       } catch {
         setConnection('polling');
@@ -64,8 +68,8 @@ export function useRunProgress(runId: string) {
         setTerminalStatus({ status: parsed.status, ...(parsed.reason ? { reason: parsed.reason } : {}) });
         source.close();
         setConnection('closed');
-        void queryClient.invalidateQueries({ queryKey: ['batches'] });
-        if (!isTerminal(queryClient.getQueryData<RunProgressContract>(queryKey))) {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.batches });
+        if (!isTerminalProgress(queryClient.getQueryData<RunProgressContract>(queryKey))) {
           void queryClient.invalidateQueries({ queryKey });
         }
       } catch {

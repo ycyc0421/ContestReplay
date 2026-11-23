@@ -6,9 +6,22 @@ import {
   runProgressSchema, runLogSliceSchema, runReplaySchema, ghostRaceSchema, rankedResultsResponseSchema,
   coverageResponseSchema, preflightReportSchema, providerResponseSchema, providersResponseSchema,
   agentItemResponseSchema, contestItemResponseSchema, agentVariantsResponseSchema, contestPreviewResponseSchema,
-  ojAccountSchema, ojAccountsResponseSchema, pushTargetSchema, pushTargetsResponseSchema,
+  ojAccountSchema, ojAccountsResponseSchema, ojAccountProbeResponseSchema, pushTargetSchema, pushTargetsResponseSchema,
   pushDeliveriesResponseSchema, pushDeliverySchema,
 } from '@studio-api';
+
+export interface ApiIssue {
+  path: string[];
+  code?: string;
+  message: string;
+}
+
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number, readonly issues: ApiIssue[] = []) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
 
 export async function api<T>(path: string, schema: z.ZodType<T>, payload?: unknown, method?: 'POST' | 'PATCH' | 'PUT' | 'DELETE', signal?: AbortSignal): Promise<T> {
   const httpMethod = method ?? (payload === undefined ? 'GET' : 'POST');
@@ -25,8 +38,12 @@ export async function api<T>(path: string, schema: z.ZodType<T>, payload?: unkno
   }
   const data: unknown = await response.json().catch(() => null);
   if (!response.ok) {
-    const message = z.object({ error: z.string() }).safeParse(data);
-    throw new Error(message.success ? message.data.error : `请求失败（${response.status}）`);
+    const parsed = z.object({
+      error: z.string(),
+      issues: z.array(z.object({ path: z.array(z.string()), code: z.string().optional(), message: z.string() })).optional(),
+    }).safeParse(data);
+    if (parsed.success) throw new ApiError(parsed.data.error, response.status, parsed.data.issues ?? []);
+    throw new ApiError(`请求失败（${response.status}）`, response.status);
   }
   return schema.parse(data);
 }
@@ -109,6 +126,8 @@ export const studioApi = {
   rotateProvider: (id: string, secret: string) => api(`/api/providers/${segment(id)}/rotate`, providerResponseSchema, { secret }),
   deleteProvider: (id: string) => api(`/api/providers/${segment(id)}`, z.strictObject({ deleted: z.boolean() }), undefined, 'DELETE'),
   ojAccounts: () => api('/api/oj-accounts', ojAccountsResponseSchema),
+  probeOjAccount: (input: { platform: 'codeforces' | 'qoj' | 'vjudge' | 'hydro'; base_url?: string; secret: string }) =>
+    api('/api/oj-accounts/probe', ojAccountProbeResponseSchema, input),
   createOjAccount: (input: { id?: string; label: string; platform: 'codeforces' | 'qoj' | 'vjudge' | 'hydro'; handle: string; pool?: string; base_url?: string; transport: 'cookie'; secret: string } | { id?: string; label: string; platform: 'codeforces' | 'qoj' | 'vjudge' | 'hydro'; handle: string; pool?: string; base_url?: string; transport: 'submitter'; executable_path: string }) => api('/api/oj-accounts', ojAccountSchema, input),
   updateOjAccount: (id: string, input: { label?: string; handle?: string; pool?: string; base_url?: string; executable_path?: string }) => api(`/api/oj-accounts/${segment(id)}`, ojAccountSchema, input, 'PATCH'),
   rotateOjAccount: (id: string, secret: string) => api(`/api/oj-accounts/${segment(id)}/rotate`, ojAccountSchema, { secret }),

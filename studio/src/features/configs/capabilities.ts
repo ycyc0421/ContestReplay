@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import type { z } from 'zod';
 import { capabilitiesSchema, harnessFieldSchema, manifestFormatSchema } from '@studio-api';
+import { queryKeys } from '@/state/query-keys';
 
 export type ConfigFormat = z.infer<typeof manifestFormatSchema>;
 export type HarnessField = z.infer<typeof harnessFieldSchema>;
@@ -30,7 +31,7 @@ async function loadCapabilities(): Promise<StudioCapabilities> {
   return capabilitiesSchema.parse(await response.json());
 }
 export function useCapabilities() {
-  return useQuery({ queryKey: ['capabilities'], queryFn: loadCapabilities, staleTime: Infinity, retry: false });
+  return useQuery({ queryKey: queryKeys.capabilities, queryFn: loadCapabilities, staleTime: Infinity, retry: false });
 }
 export const formatLabel = (format: ConfigFormat) => ({ toml: 'TOML', yaml: 'YAML', json: 'JSON' })[format];
 export const formatExtension = (format: ConfigFormat) => ({ toml: '.toml', yaml: '.yaml', json: '.json' })[format];

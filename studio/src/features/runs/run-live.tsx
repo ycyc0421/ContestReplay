@@ -34,13 +34,13 @@ export function RunLive({ progress, connection }: { progress: RunProgressContrac
         <div className="flex items-center gap-2 text-xs"><span className={cn('size-1.5 bg-primary', connection === 'live' && 'animate-pulse-soft')} />
           <span className="font-medium">{connection === 'live' ? '实时事件流已连接' : connection === 'connecting' ? '正在连接实时事件流' : connection === 'closed' ? '运行已结束' : '事件流重连中 · 使用轮询兜底'}</span>
         </div>
-        <div className="font-mono text-[10px] text-muted-foreground">ELAPSED {formatDuration(progress.elapsed_ms)} · LAST ACTIVITY {formatDuration(progress.last_activity_ms, true)}</div>
+        <div className="font-mono text-[11px] text-muted-foreground">已用时 {formatDuration(progress.elapsed_ms)} · 最近活动 {formatDuration(progress.last_activity_ms, true)}</div>
       </div>
       <div className="grid grid-cols-2 md:grid-cols-5">{metrics.map(({ label, value, icon: Icon }, index) => <div key={label} className={cn('p-4 max-md:nth-[5]:col-span-2', index < metrics.length - 1 && 'md:border-r')}>
-        <div className="flex items-center gap-1.5 font-mono text-[9px] uppercase tracking-wider text-muted-foreground"><Icon className="size-3" />{label}</div>
+        <div className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground"><Icon className="size-3.5" />{label}</div>
         <div className="mt-2 font-mono text-lg font-semibold tabular-nums tracking-tight">{value}</div>
       </div>)}</div>
-      <div className="border-t px-4 py-3"><div className="mb-2 flex justify-between font-mono text-[9px] text-muted-foreground"><span>CONTEST CLOCK</span><span>{Math.round(timeRatio)}%</span></div><Progress value={timeRatio} label="赛时进度" /></div>
+      <div className="border-t px-4 py-3"><div className="mb-2 flex justify-between text-[11px] text-muted-foreground"><span>赛时进度</span><span className="font-mono">{Math.round(timeRatio)}%</span></div><Progress value={timeRatio} label="赛时进度" /></div>
     </Card>
 
     <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
@@ -64,9 +64,9 @@ export function RunLive({ progress, connection }: { progress: RunProgressContrac
       </Card>
     </div>
 
-    <Card className="grid grid-cols-2 divide-x md:grid-cols-4"><div className="p-4"><div className="font-mono text-[9px] text-muted-foreground">MODEL WAIT</div><div className="mt-1 font-mono text-sm">{formatDuration(progress.telemetry.total_model_wait_ms, true)}</div></div>
-      <div className="p-4"><div className="font-mono text-[9px] text-muted-foreground">INPUT TOKENS</div><div className="mt-1 font-mono text-sm">{formatNumber(progress.telemetry.total_input_tokens)}</div></div>
-      <div className="p-4 max-md:border-t"><div className="font-mono text-[9px] text-muted-foreground">OUTPUT TOKENS</div><div className="mt-1 font-mono text-sm">{formatNumber(progress.telemetry.total_output_tokens)}</div></div>
-      <div className="p-4 max-md:border-t"><div className="font-mono text-[9px] text-muted-foreground">ACTIVITY</div><div className="mt-1 truncate text-xs">{progress.last_activity_type?.replaceAll('_', ' ') ?? '—'}</div></div></Card>
+    <Card className="grid grid-cols-2 divide-x md:grid-cols-4"><div className="p-4"><div className="text-[11px] text-muted-foreground">模型等待耗时</div><div className="mt-1 font-mono text-sm">{formatDuration(progress.telemetry.total_model_wait_ms, true)}</div></div>
+      <div className="p-4"><div className="text-[11px] text-muted-foreground">输入 Token</div><div className="mt-1 font-mono text-sm">{formatNumber(progress.telemetry.total_input_tokens)}</div></div>
+      <div className="p-4 max-md:border-t"><div className="text-[11px] text-muted-foreground">输出 Token</div><div className="mt-1 font-mono text-sm">{formatNumber(progress.telemetry.total_output_tokens)}</div></div>
+      <div className="p-4 max-md:border-t"><div className="text-[11px] text-muted-foreground">最近事件类型</div><div className="mt-1 truncate text-xs">{progress.last_activity_type?.replaceAll('_', ' ') ?? '—'}</div></div></Card>
   </div>;
 }

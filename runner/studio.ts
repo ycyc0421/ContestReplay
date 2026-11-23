@@ -5,7 +5,7 @@ import { resolve } from 'node:path';
 import { z } from 'zod';
 import { codeforcesContest, saveAgent, saveContest } from './author.js';
 import { Connections } from './connections.js';
-import { OjAccounts, type previewContest as defaultPreviewContest } from './judges/index.js';
+import { OjAccounts, type previewContest as defaultPreviewContest, type probeOjAccountSession as defaultProbeOjAccount } from './judges/index.js';
 import { executeJob, makePlan, type Plan } from './plan.js';
 import {
   buildGhostRace,
@@ -213,6 +213,7 @@ export interface StartStudioOptions {
   pushTargets?: PushTargets;
   pushDispatcher?: PushDispatcher;
   previewContest?: typeof defaultPreviewContest;
+  probeOjAccount?: typeof defaultProbeOjAccount;
   ssePollMs?: number;
   sseDrainTimeoutMs?: number;
 }
@@ -293,6 +294,7 @@ export async function startStudio(root: string, port = 0, opts: StartStudioOptio
               signal: control.signal,
               getImage: opts.getImage,
               previewContest: opts.previewContest,
+              probeOjAccount: opts.probeOjAccount,
             },
             () => body(req, 512 * 1024),
           );

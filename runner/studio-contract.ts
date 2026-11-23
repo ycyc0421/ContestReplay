@@ -244,6 +244,12 @@ export const ojAccountsResponseSchema = z.strictObject({
   accounts: z.array(ojAccountSchema),
 });
 
+const cookieSecretSchema = z
+  .string()
+  .refine(value => !/[\r\n\0]/.test(value), 'Cookie 不能包含换行符或控制字符')
+  .transform(value => value.trim())
+  .pipe(z.string().min(1).max(16_384));
+
 const createOjAccountBase = {
   id: ojAccountIdSchema.optional(),
   label: z.string().trim().min(1).max(120),
@@ -256,7 +262,7 @@ export const createOjAccountRequestSchema = z.discriminatedUnion('transport', [
   z.strictObject({
     ...createOjAccountBase,
     transport: z.literal('cookie'),
-    secret: z.string().trim().min(1).max(16_384),
+    secret: cookieSecretSchema,
   }),
   z.strictObject({
     ...createOjAccountBase,
@@ -272,7 +278,19 @@ export const patchOjAccountRequestSchema = z.strictObject({
   executable_path: z.string().trim().min(1).max(4096).optional(),
 });
 export const rotateOjAccountRequestSchema = z.strictObject({
-  secret: z.string().trim().min(1).max(16_384),
+  secret: cookieSecretSchema,
+});
+export const ojAccountProbeRequestSchema = z.strictObject({
+  platform: ojPlatformSchema,
+  base_url: httpUrlSchema.optional(),
+  secret: cookieSecretSchema,
+});
+export const ojAccountProbeResponseSchema = z.strictObject({
+  ok: z.boolean(),
+  authenticated: z.boolean(),
+  origin: z.string(),
+  detected_handle: z.string().optional(),
+  message: z.string(),
 });
 
 // --- Push Targets & Deliveries ---

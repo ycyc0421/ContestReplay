@@ -1,106 +1,232 @@
-import { useRef, useState } from 'react';
+import { useCallback, useEffect, useReducer, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Bot, FileCheck2, FilePlus2, LockKeyhole, X } from 'lucide-react';
-import { motion } from 'motion/react';
-import { toast } from 'sonner';
-import type { AgentItemResponse, ContestItemResponse } from '@studio-api';
+import { useNavigate, useSearch } from '@tanstack/react-router';
+import { AlertTriangle, Bot, FilePlus2 } from 'lucide-react';
 import { studioApi } from '@/lib/api';
-import { Card, PageHeader } from '@/components/ui/card';
+import { invalidateConfigGraph } from '@/state/query-keys';
+import {
+  configEditorReducer,
+  initialConfigEditorState,
+  type ConfigKind,
+} from '@/state/config-editor.machine';
+import { PageHeader } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { Separator } from '@/components/ui/separator';
+import { EmptyState } from '@/components/empty-state';
+import { SlideDrawer } from '@/design-system/motion';
 import { AgentForm } from './agent-form';
 import { ContestForm } from './contest-form';
 import { ConfigLibrary } from './config-library';
 
+type ConfigsSearch = {
+  tab?: 'agents' | 'contests';
+  q?: string;
+  drawer?: 'new-agent' | 'new-contest' | 'edit-agent' | 'edit-contest';
+  path?: string;
+};
+
 export function ConfigsPage() {
-  const [tab, setTab] = useState('agent');
-  const [agent, setAgent] = useState<AgentItemResponse>();
-  const [contest, setContest] = useState<ContestItemResponse>();
-  const agentReloadSeq = useRef(0);
-  const contestReloadSeq = useRef(0);
-  const openAgentPath = useRef<string | undefined>(undefined);
-  const openContestPath = useRef<string | undefined>(undefined);
-  openAgentPath.current = agent?.path;
-  openContestPath.current = contest?.path;
+  const search = useSearch({ strict: false }) as ConfigsSearch;
+  const navigate = useNavigate();
   const client = useQueryClient();
-  const refresh = () => {
-    void Promise.all([
-      client.invalidateQueries({ queryKey: ['catalog'] }),
-      client.invalidateQueries({ queryKey: ['matrix'] }),
-      client.invalidateQueries({ queryKey: ['preflight'] }),
-      client.invalidateQueries({ queryKey: ['coverage'] }),
-      client.invalidateQueries({ queryKey: ['agent-item'] }),
-      client.invalidateQueries({ queryKey: ['contest-item'] }),
-    ]);
-  };
-  const savedAgent = async (intent: 'save' | 'batch' = 'save') => {
-    refresh();
-    if (intent !== 'save' || !agent) return;
-    const editingPath = agent.path;
-    const seq = ++agentReloadSeq.current;
-    try {
-      const updated = await studioApi.agentItem(editingPath);
-      if (agentReloadSeq.current === seq) {
-        setAgent(current => current?.path === editingPath ? updated : current);
-      }
-    } catch (error) {
-      if (agentReloadSeq.current === seq) {
-        setAgent(current => current?.path === editingPath ? undefined : current);
-        toast.error('Agent 已保存，但刷新编辑器快照失败，请重新打开编辑', { description: (error as Error).message });
-      }
+  const [editor, dispatch] = useReducer(configEditorReducer, initialConfigEditorState);
+  const requestSeq = useRef(0);
+  const drawerGenRef = useRef(0);
+  const lastUrlKey = useRef('');
+
+  const activeTab: 'agents' | 'contests' = search.tab === 'contests' ? 'contests' : 'agents';
+
+  const patchSearch = useCallback((patch: Partial<ConfigsSearch>, opts?: { clearDrawer?: boolean; replace?: boolean }) => {
+    void navigate({
+      search: (prev: Record<string, unknown>) => {
+        const next: Record<string, unknown> = { ...prev, ...patch };
+        if (opts?.clearDrawer) {
+          delete next.drawer;
+          delete next.path;
+        }
+        if (!next.q) delete next.q;
+        return next;
+      },
+      replace: opts?.replace ?? false,
+    } as never);
+  }, [navigate]);
+
+  const loadForEdit = useCallback((kind: ConfigKind, path: string) => {
+    const requestId = ++requestSeq.current;
+    dispatch({ type: 'OPEN_EDIT_START', kind, path, requestId });
+    const fetchPromise = kind === 'agent'
+      ? studioApi.agentItem(path).then(item => dispatch({ type: 'LOAD_AGENT_OK', requestId, item }))
+      : studioApi.contestItem(path).then(item => dispatch({ type: 'LOAD_CONTEST_OK', requestId, item }));
+    fetchPromise.catch((error: Error) => {
+      dispatch({ type: 'LOAD_ERROR', requestId, message: error.message });
+    });
+  }, []);
+
+  // Rehydrate drawer state from URL search params on initial mount / back-forward navigation
+  useEffect(() => {
+    const key = `${search.drawer ?? ''}:${search.path ?? ''}`;
+    if (key === lastUrlKey.current) return;
+    lastUrlKey.current = key;
+    drawerGenRef.current += 1;
+    if (!search.drawer) {
+      dispatch({ type: 'CLOSE' });
+    } else if (search.drawer === 'new-agent') {
+      dispatch({ type: 'OPEN_NEW', kind: 'agent' });
+    } else if (search.drawer === 'new-contest') {
+      dispatch({ type: 'OPEN_NEW', kind: 'contest' });
+    } else if (search.drawer === 'edit-agent' && search.path) {
+      loadForEdit('agent', search.path);
+    } else if (search.drawer === 'edit-contest' && search.path) {
+      loadForEdit('contest', search.path);
+    } else {
+      // Normalize incomplete edit-* URLs missing path to closed drawer
+      lastUrlKey.current = ':';
+      dispatch({ type: 'CLOSE' });
+      patchSearch({}, { clearDrawer: true, replace: true });
     }
+  }, [search.drawer, search.path, loadForEdit, patchSearch]);
+
+  const openNew = (kind: ConfigKind) => {
+    const drawer = kind === 'agent' ? 'new-agent' : 'new-contest';
+    drawerGenRef.current += 1;
+    lastUrlKey.current = `${drawer}:`;
+    dispatch({ type: 'OPEN_NEW', kind });
+    patchSearch({ drawer, path: undefined }, { replace: false });
   };
-  const savedContest = async (intent: 'save' | 'batch' = 'save') => {
-    refresh();
-    if (intent !== 'save' || !contest) return;
-    const editingPath = contest.path;
-    const seq = ++contestReloadSeq.current;
-    try {
-      const updated = await studioApi.contestItem(editingPath);
-      if (contestReloadSeq.current === seq) {
-        setContest(current => current?.path === editingPath ? updated : current);
-      }
-    } catch (error) {
-      if (contestReloadSeq.current === seq) {
-        setContest(current => current?.path === editingPath ? undefined : current);
-        toast.error('Contest 已保存，但刷新编辑器快照失败，请重新打开编辑', { description: (error as Error).message });
-      }
+
+  const openEdit = (kind: ConfigKind, path: string) => {
+    const drawer = kind === 'agent' ? 'edit-agent' : 'edit-contest';
+    drawerGenRef.current += 1;
+    lastUrlKey.current = `${drawer}:${path}`;
+    loadForEdit(kind, path);
+    patchSearch({ drawer, path }, { replace: false });
+  };
+
+  const closeDrawer = () => {
+    drawerGenRef.current += 1;
+    lastUrlKey.current = ':';
+    dispatch({ type: 'CLOSE' });
+    patchSearch({}, { clearDrawer: true, replace: false });
+  };
+
+  const handleSaved = async (kind: ConfigKind, ownerGen: number, intent: 'save' | 'batch' = 'save') => {
+    await invalidateConfigGraph(client);
+    if (intent !== 'save') return;
+    // Only close the drawer if this save still owns the active drawer session
+    if (drawerGenRef.current !== ownerGen) return;
+    drawerGenRef.current += 1;
+    lastUrlKey.current = ':';
+    dispatch({ type: 'CLOSE' });
+    patchSearch({ tab: kind === 'agent' ? 'agents' : 'contests' }, { clearDrawer: true, replace: true });
+  };
+
+  const handleDeleted = (kind: ConfigKind, path: string) => {
+    const matchingOpen =
+      (editor.phase === 'loading' && editor.kind === kind && editor.path === path) ||
+      (editor.phase === 'load_error' && editor.kind === kind && editor.path === path) ||
+      (kind === 'agent' && editor.phase === 'editing_agent' && editor.item.path === path) ||
+      (kind === 'contest' && editor.phase === 'editing_contest' && editor.item.path === path);
+    dispatch({ type: 'ITEM_DELETED', kind, path });
+    if (matchingOpen) {
+      drawerGenRef.current += 1;
+      lastUrlKey.current = ':';
+      patchSearch({}, { clearDrawer: true, replace: true });
     }
+    void invalidateConfigGraph(client);
   };
-  const editAgent = (item: AgentItemResponse) => { agentReloadSeq.current += 1; setAgent(item); setTab('agent'); document.getElementById('config-editor')?.scrollIntoView({ block: 'start' }); };
-  const editContest = (item: ContestItemResponse) => { contestReloadSeq.current += 1; setContest(item); setTab('contest'); document.getElementById('config-editor')?.scrollIntoView({ block: 'start' }); };
-  const deletedAgent = (path: string) => {
-    if (openAgentPath.current === path) {
-      agentReloadSeq.current += 1;
-      setAgent(undefined);
+
+  const drawerOpen = editor.phase !== 'closed';
+  const drawerMeta = (() => {
+    switch (editor.phase) {
+      case 'creating':
+        return editor.kind === 'agent'
+          ? { eyebrow: '新建 Agent 配置', title: '新建 Agent', description: '定义模型、Provider 接入与 Harness 参数，保存为独立可复现清单。' }
+          : { eyebrow: '新建 Contest 配置', title: '新建 Contest', description: '配置题面材料、本地或远端判题后端与赛时预算。' };
+      case 'loading':
+        return { eyebrow: '正在读取配置', title: editor.path, description: '正在从本机工作区加载清单与修订摘要…' };
+      case 'editing_agent':
+        return {
+          eyebrow: '编辑 Agent 配置',
+          title: editor.item.name ?? editor.item.id ?? editor.item.path,
+          description: `文件：${editor.item.path} · 格式：${editor.item.format.toUpperCase()}`,
+        };
+      case 'editing_contest':
+        return {
+          eyebrow: '编辑 Contest 配置',
+          title: (editor.item.document as { title?: string })?.title ?? editor.item.contest_id ?? editor.item.path,
+          description: `文件：${editor.item.path}`,
+        };
+      case 'load_error':
+        return { eyebrow: '无法加载配置', title: editor.path, description: '读取目标清单失败。' };
+      default:
+        return { eyebrow: '', title: '', description: '' };
     }
-    refresh();
-  };
-  const deletedContest = (path: string) => {
-    if (openContestPath.current === path) {
-      contestReloadSeq.current += 1;
-      setContest(undefined);
-    }
-    refresh();
-  };
+  })();
+
   return <>
-    <PageHeader eyebrow="06 / Configuration library" title="配置库" description="检索、编辑、克隆并派生可复现的比赛输入；不再需要手工查找 Manifest 文件。" actions={<div className="flex gap-2"><Button variant="secondary" onClick={() => { setAgent(undefined); setTab('agent'); }}><Bot className="size-4" />新建 Agent</Button><Button onClick={() => { setContest(undefined); setTab('contest'); }}><FilePlus2 className="size-4" />新建 Contest</Button></div>} />
-    <div className="mb-8"><ConfigLibrary onEditAgent={editAgent} onEditContest={editContest} onDeletedAgent={deletedAgent} onDeletedContest={deletedContest} /></div>
-    <div id="config-editor" className="grid scroll-mt-24 items-start gap-6 xl:grid-cols-[minmax(0,800px)_minmax(260px,1fr)]">
-      <motion.div layout="size" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}><Card className="overflow-hidden">
-        <Tabs value={tab} onValueChange={setTab}><div className="flex items-center justify-between border-b bg-muted/25 px-4 py-3"><TabsList className="w-full sm:w-auto"><TabsTrigger value="agent" className="flex-1 sm:flex-none"><Bot className="size-4" />{agent ? '编辑 Agent' : '新建 Agent'}</TabsTrigger><TabsTrigger value="contest" className="flex-1 sm:flex-none"><FileCheck2 className="size-4" />{contest ? '编辑 Contest' : '新建 Contest'}</TabsTrigger></TabsList>{(tab === 'agent' ? agent : contest) && <Button variant="ghost" size="sm" onClick={() => tab === 'agent' ? setAgent(undefined) : setContest(undefined)}><X className="size-3.5" />结束编辑</Button>}</div>
-          <div className="p-5 sm:p-7"><TabsContent forceMount value="agent" className="data-[state=active]:animate-panel-in"><AgentForm key={agent?.path ?? 'new-agent'} initial={agent} onSaved={savedAgent} /></TabsContent><TabsContent forceMount value="contest" className="data-[state=active]:animate-panel-in"><ContestForm key={contest?.path ?? 'new-contest'} initial={contest} onSaved={savedContest} /></TabsContent></div>
-        </Tabs></Card></motion.div>
-      <motion.aside initial={{ opacity: 0, x: 8 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: .08 }}><Card className="p-5 xl:sticky xl:top-24">
-        <div className="font-mono text-[9px] uppercase tracking-[0.18em] text-primary">Evaluation contract</div><h2 className="mt-2 text-sm font-semibold">一次配置，一场可复现的比赛</h2>
-        <div className="mt-6 space-y-5">{[
-          ['01', '定义输入', '明确 Harness、模型、题面和判题后端。'],
-          ['02', '锁定修订', '计划记录配置内容、材料摘要和协议版本。'],
-          ['03', '进入矩阵', '将多个 Agent 与 Contest 组合为批次任务。'],
-        ].map(([index, title, description]) => <div key={index} className="grid grid-cols-[28px_1fr] gap-3"><span className="font-mono text-[10px] text-primary">{index}</span><div><div className="text-xs font-medium">{title}</div><p className="mt-1 text-[11px] leading-5 text-muted-foreground">{description}</p></div></div>)}</div>
-        <Separator className="my-6" /><div className="flex gap-3"><LockKeyhole className="mt-0.5 size-4 shrink-0 text-primary" /><div><div className="text-xs font-medium">凭据边界</div><p className="mt-1.5 text-[11px] leading-5 text-muted-foreground">密钥只由本机连接服务使用，不进入 Manifest、日志或沙盒。私有题面与判题材料不会通过静态资源公开。</p></div></div>
-      </Card></motion.aside>
-    </div>
+    <PageHeader
+      eyebrow="04 · 配置库"
+      title="配置库"
+      description="集中检索、编辑、克隆并派生可复现的 Agent 与 Contest 配置；新建与编辑在右侧抽屉完成，不打断列表上下文。"
+      actions={
+        <div className="flex gap-2">
+          <Button variant="secondary" onClick={() => openNew('agent')}><Bot className="size-4" />新建 Agent</Button>
+          <Button onClick={() => openNew('contest')}><FilePlus2 className="size-4" />新建 Contest</Button>
+        </div>
+      }
+    />
+
+    <ConfigLibrary
+      activeTab={activeTab}
+      onTabChange={tab => patchSearch({ tab }, { replace: false })}
+      search={search.q ?? ''}
+      onSearchChange={q => patchSearch({ q }, { replace: true })}
+      loadingPath={editor.phase === 'loading' ? editor.path : ''}
+      onEditAgent={path => openEdit('agent', path)}
+      onEditContest={path => openEdit('contest', path)}
+      onDeletedAgent={path => handleDeleted('agent', path)}
+      onDeletedContest={path => handleDeleted('contest', path)}
+      onCreateAgent={() => openNew('agent')}
+      onCreateContest={() => openNew('contest')}
+    />
+
+    <SlideDrawer
+      open={drawerOpen}
+      onOpenChange={open => { if (!open) closeDrawer(); }}
+      eyebrow={drawerMeta.eyebrow}
+      title={drawerMeta.title}
+      description={drawerMeta.description}
+    >
+      {editor.phase === 'loading' && (
+        <div className="space-y-4">
+          <div className="skeleton h-12 rounded-[3px] border bg-muted/40" />
+          <div className="skeleton h-36 rounded-[3px] border bg-muted/40" />
+          <div className="skeleton h-48 rounded-[3px] border bg-muted/40" />
+        </div>
+      )}
+      {editor.phase === 'load_error' && (
+        <EmptyState
+          icon={AlertTriangle}
+          title="无法读取配置"
+          description={editor.message}
+          action={<Button variant="secondary" onClick={() => loadForEdit(editor.kind, editor.path)}>重试</Button>}
+        />
+      )}
+      {editor.phase === 'creating' && editor.kind === 'agent' && (() => {
+        const ownerGen = drawerGenRef.current;
+        return <AgentForm key={`new-agent-${ownerGen}`} onSaved={intent => handleSaved('agent', ownerGen, intent)} />;
+      })()}
+      {editor.phase === 'creating' && editor.kind === 'contest' && (() => {
+        const ownerGen = drawerGenRef.current;
+        return <ContestForm key={`new-contest-${ownerGen}`} onSaved={intent => handleSaved('contest', ownerGen, intent)} />;
+      })()}
+      {editor.phase === 'editing_agent' && (() => {
+        const ownerGen = drawerGenRef.current;
+        return <AgentForm key={`${editor.item.path}-${ownerGen}`} initial={editor.item} onSaved={intent => handleSaved('agent', ownerGen, intent)} />;
+      })()}
+      {editor.phase === 'editing_contest' && (() => {
+        const ownerGen = drawerGenRef.current;
+        return <ContestForm key={`${editor.item.path}-${ownerGen}`} initial={editor.item} onSaved={intent => handleSaved('contest', ownerGen, intent)} />;
+      })()}
+    </SlideDrawer>
   </>;
 }
