@@ -2398,17 +2398,29 @@ test('Studio v3 API: probeOjAccountSession and POST /api/oj-accounts/probe detec
   assert.equal(cfRes.origin, 'https://codeforces.com');
   assert.equal(cfOk.calls.length, 1);
 
-  // 1b. Codeforces page where account menu has no profile link MUST NOT climb into enclosing page wrapper and grab a public author
-  const cfNoSelfProfile = mkFetch(
+  // 1b. Codeforces page where logout is directly inside a generic page wrapper alongside a public author MUST NOT grab the author
+  const cfGenericWrapper = mkFetch(
     200,
-    '<html><body><div class="page-wrapper"><div class="blog"><a href="/profile/public_author">public_author</a></div><div class="lang-chooser"><a href="/1234/logout">Logout</a></div></div></body></html>',
+    '<html><body><div class="page-wrapper"><a href="/profile/public_author">public_author</a><a href="/1234/logout">Logout</a></div></body></html>',
   );
-  const cfNoSelfRes = await probeOjAccountSession(
+  const cfGenericRes = await probeOjAccountSession(
     { platform: 'codeforces', secret: 'JSESSIONID=cf-secret-token-123' },
-    { fetchImpl: cfNoSelfProfile.fn },
+    { fetchImpl: cfGenericWrapper.fn },
   );
-  assert.equal(cfNoSelfRes.authenticated, true);
-  assert.equal(cfNoSelfRes.detected_handle, undefined);
+  assert.equal(cfGenericRes.authenticated, true);
+  assert.equal(cfGenericRes.detected_handle, undefined);
+
+  // 1c. QOJ page where logout is directly inside a generic wrapper alongside a public author MUST NOT grab the author
+  const qojGenericWrapper = mkFetch(
+    200,
+    '<html><body><div class="page-wrapper"><a href="/user/profile/public_author">public_author</a><a href="/logout?_token=abc">Logout</a></div></body></html>',
+  );
+  const qojGenericRes = await probeOjAccountSession(
+    { platform: 'qoj', secret: 'UOJSESSID=qoj-secret-token-789' },
+    { fetchImpl: qojGenericWrapper.fn },
+  );
+  assert.equal(qojGenericRes.authenticated, true);
+  assert.equal(qojGenericRes.detected_handle, undefined);
 
   // 2. QOJ skips malformed percent-encoded profile links cleanly and scopes to account navbar around /logout
   const qojOk = mkFetch(

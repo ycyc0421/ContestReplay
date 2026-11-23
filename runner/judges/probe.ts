@@ -108,14 +108,18 @@ function findAccountContainers(
   for (const logoutLink of logoutNodes) {
     const directParent = parents.get(logoutLink);
     if (!directParent || !directParent.tagName || ['html', 'body', 'main'].includes(directParent.tagName)) continue;
-    containers.push(directParent);
     const grandParent = parents.get(directParent);
-    if (
+    const directRecognized = isRecognizedAncestor(directParent);
+    const grandRecognized = Boolean(
       grandParent &&
       grandParent.tagName &&
       !['html', 'body', 'main'].includes(grandParent.tagName) &&
-      isRecognizedAncestor(grandParent)
-    ) {
+      isRecognizedAncestor(grandParent),
+    );
+    if (directRecognized || grandRecognized) {
+      containers.push(directParent);
+    }
+    if (grandRecognized && grandParent) {
       containers.push(grandParent);
     }
   }

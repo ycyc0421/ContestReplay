@@ -443,10 +443,10 @@ export function NewBatchPage() {
               />
             </div>
           </div>
-          {!selectedCells.size && !compatibleKeys.length && matrix.isLoading
-            ? <div className="p-12 text-center text-xs text-muted-foreground">正在校验矩阵兼容性…</div>
-            : <AnimatedPanel panelKey={composer.view} role="tabpanel" id={`batch-matrix-panel-${composer.view}`} ariaLabelledBy={`batch-matrix-view-tab-${composer.view}`}>
-                {composer.view === 'matrix' ? (
+          <AnimatedPanel panelKey={composer.view} role="tabpanel" id={`batch-matrix-panel-${composer.view}`} ariaLabelledBy={`batch-matrix-view-tab-${composer.view}`}>
+            {!selectedCells.size && !compatibleKeys.length && matrix.isLoading ? (
+              <div className="p-12 text-center text-xs text-muted-foreground">正在校验矩阵兼容性…</div>
+            ) : composer.view === 'matrix' ? (
                   <div className="scrollbar-thin overflow-auto p-4 sm:p-6">
                     <table className="mx-auto w-auto min-w-[560px] border-collapse text-left">
                       <thead>
@@ -519,7 +519,7 @@ export function NewBatchPage() {
                     })}
                   </div>
                 )}
-              </AnimatedPanel>}
+          </AnimatedPanel>
           {matrix.isError && <p className="border-t p-4 text-xs text-danger">{(matrix.error as Error).message}</p>}
         </Card>
       )}

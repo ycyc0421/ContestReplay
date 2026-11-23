@@ -147,17 +147,18 @@ function isValidPair(name: string, value: string): boolean {
 }
 
 function parseNetscape(text: string): RawCookieEntry[] | null {
-  const lines = text.split(/\r?\n/);
+  const lines = text.split('\n');
   const entries: RawCookieEntry[] = [];
   let matchedNetscapeLines = 0;
 
   for (const rawLine of lines) {
-    const trimmed = rawLine.trim();
+    const line = rawLine.replace(/\r$/, '');
+    const trimmed = line.trim();
     if (!trimmed) continue;
-    const isHttpOnlyPrefixed = /^#HttpOnly_/i.test(trimmed);
+    const isHttpOnlyPrefixed = /^#HttpOnly_/i.test(line);
     if (trimmed.startsWith('#') && !isHttpOnlyPrefixed) continue;
 
-    const cleanLine = isHttpOnlyPrefixed ? trimmed.replace(/^#HttpOnly_/i, '') : trimmed;
+    const cleanLine = isHttpOnlyPrefixed ? line.replace(/^#HttpOnly_/i, '') : line;
     const fields = cleanLine.split('\t');
     if (fields.length < 7) continue;
 
@@ -171,7 +172,7 @@ function parseNetscape(text: string): RawCookieEntry[] | null {
       domain,
       hostOnly,
       secure,
-      name: name.trim(),
+      name,
       value: rest.join('\t'),
       expiresSec: Number.isFinite(expNum) && expNum > 0 ? expNum : undefined,
     });
@@ -303,32 +304,73 @@ const CURL_VALUE_FLAGS = new Set([
   '-x', '--proxy', '--preproxy', '--noproxy',
   '-u', '--user', '--proxy-user',
   '-o', '--output', '-w', '--write-out', '-D', '--dump-header',
-  '-m', '--max-time', '--connect-timeout', '--retry', '--retry-delay',
+  '-m', '--max-time', '--connect-timeout', '--retry', '--retry-delay', '--retry-max-time',
   '-K', '--config', '--resolve', '--connect-to', '--interface',
-  '--cacert', '--capath', '--cert', '--key', '--proxy-header', '--oauth2-bearer',
+  '--cacert', '--capath', '--cert', '--key', '--proxy-cacert', '--proxy-cert', '--proxy-key',
+  '--proxy-header', '--oauth2-bearer', '--pinnedpubkey',
+  '--doh-url', '--dns-servers', '--dns-interface', '--unix-socket', '--abstract-unix-socket',
+  '--etag-save', '--etag-compare', '--speed-limit', '--speed-time', '--limit-rate',
   '-r', '--range', '-T', '--upload-file',
 ]);
+
+// Known boolean cURL flags (take no following argument token)
+const CURL_BOOLEAN_FLAGS = new Set([
+  '-s', '--silent',
+  '-S', '--show-error',
+  '-i', '--include',
+  '-I', '--head',
+  '-L', '--location', '--location-trusted',
+  '-k', '--insecure',
+  '-v', '--verbose',
+  '-g', '--globoff',
+  '-f', '--fail', '--fail-with-body',
+  '-N', '--no-buffer',
+  '-G', '--get',
+  '-4', '--ipv4',
+  '-6', '--ipv6',
+  '-q', '--disable',
+  '-#', '--progress-bar',
+  '--compressed', '--http1.0', '--http1.1', '--http2', '--http2-prior-knowledge', '--http3',
+  '--raw', '--tr-encoding', '--tlsv1.2', '--tlsv1.3', '--ssl', '--ssl-reqd',
+  '--post301', '--post302', '--post303', '--keepalive', '--no-keepalive',
+  '--tcp-nodelay', '--path-as-is', '--anyauth', '--basic', '--digest', '--ntlm', '--negotiate',
+  '--no-progress-meter', '--doh-insecure',
+]);
+const CURL_SHORT_BOOLEAN_CHARS = new Set(['s', 'S', 'i', 'I', 'L', 'k', 'v', 'g', 'f', 'N', 'G', '4', '6', 'q']);
+
+function isKnownBooleanCurlFlag(tok: string): boolean {
+  if (CURL_BOOLEAN_FLAGS.has(tok)) return true;
+  // Support bundled short boolean flags such as `-sSLk`
+  if (/^-[A-Za-z0-9]{2,}$/.test(tok)) {
+    return [...tok.slice(1)].every(ch => CURL_SHORT_BOOLEAN_CHARS.has(ch));
+  }
+  return false;
+}
+
+// Strip ONLY RFC 6265 ASCII OWS (SP / HTAB), never Unicode whitespace such as NBSP (\u00A0).
+function stripAsciiOws(value: string): string {
+  return value.replace(/^[ \t]+|[ \t]+$/g, '');
+}
 
 function parseHeaderPairs(raw: string): { entries: RawCookieEntry[]; rejectedCount: number } {
   const entries: RawCookieEntry[] = [];
   let rejectedCount = 0;
 
-  // Header input must not use raw line breaks as cookie separators; strip optional leading `Cookie:` prefix only.
-  const trimmed = raw.trim().replace(/^cookie\s*:\s*/i, '');
-  if (/[\r\n\0]/.test(trimmed)) {
+  if (/[\r\n\0]/.test(raw)) {
     return { entries: [], rejectedCount: 1 };
   }
+  const stripped = stripAsciiOws(raw).replace(/^cookie[ \t]*:[ \t]*/i, '');
 
-  for (const part of trimmed.split(';')) {
-    const seg = part.trim();
+  for (const part of stripped.split(';')) {
+    const seg = stripAsciiOws(part);
     if (!seg) continue;
     const eq = seg.indexOf('=');
     if (eq <= 0) {
       rejectedCount += 1;
       continue;
     }
-    const name = seg.slice(0, eq).trim();
-    const value = seg.slice(eq + 1).trim();
+    const name = seg.slice(0, eq);
+    const value = seg.slice(eq + 1);
     if (!isValidPair(name, value)) {
       rejectedCount += 1;
       continue;
@@ -343,6 +385,7 @@ function parseCurl(text: string): {
   rejectedCount: number;
   sourceOrigins: string[];
   ambiguousUrl: boolean;
+  unknownFlag?: string;
 } | null {
   const tokens = tokenizeShellCommand(text.trim());
   const curlIdx = tokens.findIndex(tok => /^curl$/i.test(tok));
@@ -351,13 +394,20 @@ function parseCurl(text: string): {
   const rawChunks: string[] = [];
   const requestOrigins = new Set<string>();
   let ambiguousUrl = false;
+  let unknownFlag: string | undefined;
   let afterDoubleDash = false;
 
   const recordUrl = (candidate: string) => {
+    if (!/^https?:\/\//i.test(candidate)) {
+      ambiguousUrl = true;
+      return;
+    }
     try {
       const parsed = new URL(candidate);
       if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
         requestOrigins.add(parsed.origin.toLowerCase());
+      } else {
+        ambiguousUrl = true;
       }
     } catch {
       ambiguousUrl = true;
@@ -373,33 +423,34 @@ function parseCurl(text: string): {
     if (!afterDoubleDash && (tok === '-H' || tok === '--header')) {
       const val = tokens[i + 1] ?? '';
       i += 1;
-      if (/^cookie\s*:/i.test(val.trim())) {
-        rawChunks.push(val.replace(/^cookie\s*:/i, '').trim());
+      if (/^cookie[ \t]*:/i.test(stripAsciiOws(val))) {
+        rawChunks.push(stripAsciiOws(val).replace(/^cookie[ \t]*:[ \t]*/i, ''));
       }
       continue;
     }
     if (!afterDoubleDash && tok.startsWith('--header=')) {
       const val = tok.slice('--header='.length);
-      if (/^cookie\s*:/i.test(val.trim())) {
-        rawChunks.push(val.replace(/^cookie\s*:/i, '').trim());
+      if (/^cookie[ \t]*:/i.test(stripAsciiOws(val))) {
+        rawChunks.push(stripAsciiOws(val).replace(/^cookie[ \t]*:[ \t]*/i, ''));
       }
       continue;
     }
     if (!afterDoubleDash && (tok === '-b' || tok === '--cookie')) {
       const val = tokens[i + 1] ?? '';
       i += 1;
-      if (val.trim()) rawChunks.push(val.trim());
+      if (stripAsciiOws(val)) rawChunks.push(stripAsciiOws(val));
       continue;
     }
     if (!afterDoubleDash && tok.startsWith('--cookie=')) {
       const val = tok.slice('--cookie='.length);
-      if (val.trim()) rawChunks.push(val.trim());
+      if (stripAsciiOws(val)) rawChunks.push(stripAsciiOws(val));
       continue;
     }
     if (!afterDoubleDash && tok === '--url') {
       const val = tokens[i + 1];
       i += 1;
       if (val) recordUrl(val);
+      else ambiguousUrl = true;
       continue;
     }
     if (!afterDoubleDash && tok.startsWith('--url=')) {
@@ -407,17 +458,25 @@ function parseCurl(text: string): {
       continue;
     }
     if (!afterDoubleDash && CURL_VALUE_FLAGS.has(tok)) {
-      // Skip value of option flags such as --referer, --proxy, --data, etc.
+      // Skip value of known option flags such as --referer, --doh-url, --proxy, --data, etc.
       i += 1;
       continue;
     }
     if (!afterDoubleDash && tok.startsWith('-')) {
-      // Flag with inline `=` value or boolean flag
+      if (tok.startsWith('--') && tok.includes('=')) {
+        // Long flag with inline `=value` has self-contained arity (consumes 0 extra tokens)
+        continue;
+      }
+      if (isKnownBooleanCurlFlag(tok)) {
+        continue;
+      }
+      // Fail closed on unrecognized options whose arity is unknown so their value cannot spoof or hide a URL
+      unknownFlag = tok;
+      ambiguousUrl = true;
       continue;
     }
-    if (/^https?:\/\//i.test(tok)) {
-      recordUrl(tok);
-    }
+    // Every positional argument in cURL is a request URL target (including scheme-less hosts)
+    recordUrl(tok);
   }
 
   if (!rawChunks.length) return null;
@@ -429,6 +488,7 @@ function parseCurl(text: string): {
     rejectedCount,
     sourceOrigins: [...requestOrigins],
     ambiguousUrl,
+    unknownFlag,
   };
 }
 
@@ -450,7 +510,7 @@ export function parseOjCookieInput(
   let sourceOrigin: string | undefined;
   let ambiguousCurl = false;
 
-  const netscape = parseNetscape(trimmed);
+  const netscape = parseNetscape(rawInput);
   if (netscape) {
     format = 'netscape';
     entries = netscape;
@@ -479,7 +539,7 @@ export function parseOjCookieInput(
         }
       } else {
         format = 'header';
-        const headerParsed = parseHeaderPairs(trimmed);
+        const headerParsed = parseHeaderPairs(rawInput);
         entries = headerParsed.entries;
         initialRejected = headerParsed.rejectedCount;
         originStatus = 'unknown';
