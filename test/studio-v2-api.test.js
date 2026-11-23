@@ -2370,3 +2370,142 @@ test('Studio v2 final admission and I/O regressions: plan/execute artifact polic
   });
   assert.equal(aliasPlan.status, 200, aliasPlan.text);
 });
+
+test('Studio v3 API: probeOjAccountSession and POST /api/oj-accounts/probe detect handles across 4 platforms without echoing secrets', async t => {
+  const { probeOjAccountSession } = await import('../dist/judges/index.js');
+
+  const mkFetch = (status, body, contentType = 'text/html; charset=utf-8') => {
+    const calls = [];
+    const fn = async (url, init) => {
+      calls.push({ url: String(url), headers: init?.headers });
+      return new Response(body, { status, headers: { 'content-type': contentType } });
+    };
+    return { fn, calls };
+  };
+
+  // 1. Codeforces authenticated + handle detected
+  const cfOk = mkFetch(
+    200,
+    '<html><body><a href="/profile/tourist_bot">tourist_bot</a><a href="/1234/logout">Logout</a></body></html>',
+  );
+  const cfRes = await probeOjAccountSession(
+    { platform: 'codeforces', secret: 'JSESSIONID=cf-secret-token-123; 39ce7=cf-39ce7-456' },
+    { fetchImpl: cfOk.fn },
+  );
+  assert.equal(cfRes.ok, true);
+  assert.equal(cfRes.authenticated, true);
+  assert.equal(cfRes.detected_handle, 'tourist_bot');
+  assert.equal(cfRes.origin, 'https://codeforces.com');
+  assert.equal(cfOk.calls.length, 1);
+
+  // 2. QOJ authenticated + handle detected
+  const qojOk = mkFetch(
+    200,
+    '<html><body><a href="/user/profile/qoj_tester">qoj_tester</a><a href="/logout?_token=abc">Logout</a></body></html>',
+  );
+  const qojRes = await probeOjAccountSession(
+    { platform: 'qoj', secret: 'UOJSESSID=qoj-secret-token-789' },
+    { fetchImpl: qojOk.fn },
+  );
+  assert.equal(qojRes.authenticated, true);
+  assert.equal(qojRes.detected_handle, 'qoj_tester');
+
+  // 3. VJudge plain username response
+  const vjOk = mkFetch(200, '"vj_runner"', 'text/plain');
+  const vjRes = await probeOjAccountSession(
+    { platform: 'vjudge', secret: 'JSESSIONID=vj-secret-999' },
+    { fetchImpl: vjOk.fn },
+  );
+  assert.equal(vjRes.authenticated, true);
+  assert.equal(vjRes.detected_handle, 'vj_runner');
+
+  // 4. Hydro JSON UserContext
+  const hydroOk = mkFetch(200, JSON.stringify({ UserContext: { _id: 42, uname: 'hydro_bot' } }), 'application/json');
+  const hydroRes = await probeOjAccountSession(
+    { platform: 'hydro', base_url: 'https://hydro.example.com', secret: 'sid=hydro-secret-111' },
+    { fetchImpl: hydroOk.fn },
+  );
+  assert.equal(hydroRes.authenticated, true);
+  assert.equal(hydroRes.detected_handle, 'hydro_bot');
+  assert.equal(hydroRes.origin, 'https://hydro.example.com');
+
+  // 5. Unauthenticated response returns ok=true, authenticated=false
+  const unauth = mkFetch(200, '<html><body><a href="/enter">Enter</a></body></html>');
+  const unauthRes = await probeOjAccountSession(
+    { platform: 'codeforces', secret: 'JSESSIONID=expired' },
+    { fetchImpl: unauth.fn },
+  );
+  assert.equal(unauthRes.ok, true);
+  assert.equal(unauthRes.authenticated, false);
+  assert.equal(unauthRes.detected_handle, undefined);
+
+  // 6. Invalid origin / non-HTTPS blocked before network call
+  const blocked = mkFetch(200, '');
+  await assert.rejects(
+    () => probeOjAccountSession(
+      { platform: 'codeforces', base_url: 'http://evil.example.com', secret: 'JSESSIONID=never-sent' },
+      { fetchImpl: blocked.fn },
+    ),
+    /HTTPS|loopback/i,
+  );
+  assert.equal(blocked.calls.length, 0);
+
+  // 7. HTTP endpoint POST /api/oj-accounts/probe returns handle and redacts leaked secrets on error
+  const dir = await mkdtemp(join(tmpdir(), 'cr-studio-probe-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const base = join(dir, 'workspace');
+  const root = join(dir, 'runs');
+  await mkdir(base, { recursive: true });
+  await mkdir(root, { recursive: true });
+  const store = new Connections(join(dir, 'connections'));
+  const ojAccounts = new OjAccounts(join(dir, 'oj-accounts'));
+
+  let shouldThrowSecret = false;
+  const studio = await startStudio(root, 0, {
+    base,
+    store,
+    ojAccounts,
+    getImage,
+    probeOjAccount: async req => {
+      if (shouldThrowSecret) {
+        throw new Error(`upstream failed with ${req.secret}`);
+      }
+      return {
+        ok: true,
+        authenticated: true,
+        origin: 'https://codeforces.com',
+        detected_handle: 'probe_user',
+        message: '已验证登录态：probe_user',
+      };
+    },
+  });
+  t.after(() => studio.close());
+  const req = makeRequester(studio.url);
+
+  const secretCookie = 'JSESSIONID=ultra-secret-probe-cookie-value-42';
+  const okProbe = await req('/api/oj-accounts/probe', {
+    body: { platform: 'codeforces', secret: secretCookie },
+  });
+  assert.equal(okProbe.status, 200, okProbe.text);
+  assert.equal(okProbe.value.authenticated, true);
+  assert.equal(okProbe.value.detected_handle, 'probe_user');
+  assert.ok(!okProbe.text.includes('ultra-secret-probe-cookie-value-42'));
+
+  shouldThrowSecret = true;
+  const errProbe = await req('/api/oj-accounts/probe', {
+    body: { platform: 'codeforces', secret: secretCookie },
+  });
+  assert.equal(errProbe.status, 400);
+  assert.ok(!errProbe.text.includes('ultra-secret-probe-cookie-value-42'));
+
+  // Real default probe rejects multiline cookie cleanly without storing anything
+  const studioDefault = await startStudio(root, 0, { base, store, ojAccounts, getImage });
+  t.after(() => studioDefault.close());
+  const reqDefault = makeRequester(studioDefault.url);
+  const badProbe = await reqDefault('/api/oj-accounts/probe', {
+    body: { platform: 'codeforces', secret: 'JSESSIONID=abc\r\nX-Injected: 1' },
+  });
+  assert.equal(badProbe.status, 400);
+  assert.ok(!badProbe.text.includes('X-Injected'));
+  assert.equal((await reqDefault('/api/oj-accounts')).value.accounts.length, 0);
+});

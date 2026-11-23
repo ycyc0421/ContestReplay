@@ -274,6 +274,18 @@ export const patchOjAccountRequestSchema = z.strictObject({
 export const rotateOjAccountRequestSchema = z.strictObject({
   secret: z.string().trim().min(1).max(16_384),
 });
+export const ojAccountProbeRequestSchema = z.strictObject({
+  platform: ojPlatformSchema,
+  base_url: httpUrlSchema.optional(),
+  secret: z.string().trim().min(1).max(16_384),
+});
+export const ojAccountProbeResponseSchema = z.strictObject({
+  ok: z.boolean(),
+  authenticated: z.boolean(),
+  origin: z.string(),
+  detected_handle: z.string().optional(),
+  message: z.string(),
+});
 
 // --- Push Targets & Deliveries ---
 export const pushTargetIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);

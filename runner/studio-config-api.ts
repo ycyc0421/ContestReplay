@@ -54,6 +54,7 @@ import {
   ojPlatformSchema,
   patchOjAccountSchema,
   previewContest as defaultPreviewContest,
+  probeOjAccountSession as defaultProbeOjAccount,
   rotateOjAccountSchema,
   type OjAccount,
   type OjPlatform,
@@ -70,6 +71,8 @@ import {
   contestPreviewSchema,
   coverageResponseSchema,
   effectiveConfigSchema,
+  ojAccountProbeRequestSchema,
+  ojAccountProbeResponseSchema,
   preflightReportSchema,
   providerResponseSchema,
   providersResponseSchema,
@@ -773,6 +776,7 @@ export type StudioConfigOptions = {
   signal: AbortSignal;
   getImage?: typeof inspectImage;
   previewContest?: typeof defaultPreviewContest;
+  probeOjAccount?: typeof defaultProbeOjAccount;
 };
 
 export function isConfigRoute(path: string) {
@@ -830,6 +834,7 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
   const ojAccounts = opts.ojAccounts ?? new OjAccounts();
   const getImage = opts.getImage ?? inspectImage;
   const previewFn = opts.previewContest ?? defaultPreviewContest;
+  const probeFn = opts.probeOjAccount ?? defaultProbeOjAccount;
   const method = req.method;
   const url = new URL(req.url ?? path, 'http://127.0.0.1');
 
@@ -859,6 +864,28 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
         }
       }
     }
+  }
+
+  // OJ Account Session Probe (write-only cookie verification; never persists or echoes secret)
+  if (method === 'POST' && path === '/api/oj-accounts/probe') {
+    const input = ojAccountProbeRequestSchema.parse(await body());
+    const cookieSecrets = extractCookieSecrets(input.secret);
+    let result: Awaited<ReturnType<typeof probeFn>>;
+    try {
+      result = await probeFn(input, { signal });
+    } catch (err) {
+      const safeMessage = redactSecretText(err instanceof Error ? err.message : String(err), cookieSecrets);
+      throw new FieldError(['secret'], safeMessage, 400);
+    }
+    return {
+      data: ojAccountProbeResponseSchema.parse({
+        ok: result.ok,
+        authenticated: result.authenticated,
+        origin: redactSecretText(result.origin, cookieSecrets),
+        ...(result.detected_handle ? { detected_handle: redactSecretText(result.detected_handle, cookieSecrets) } : {}),
+        message: redactSecretText(result.message, cookieSecrets),
+      }),
+    };
   }
 
   // OJ Accounts CRUD (write-only secrets; never echoed)

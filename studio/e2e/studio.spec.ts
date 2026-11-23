@@ -100,7 +100,8 @@ test('keeps queue controls usable with reduced motion', async ({ page }) => {
 test('supports configuration and theme navigation', async ({ page }) => {
   await page.goto('/configs');
   await expect(page.getByRole('heading', { name: '配置库' })).toBeVisible();
-  await page.getByRole('tab', { name: '新建 Contest' }).click();
+  await page.getByRole('button', { name: '新建 Contest', exact: true }).click();
+  await expect(page).toHaveURL(/drawer=new-contest/);
   await page.getByLabel('Contest ID').fill('e2e-contest');
   await page.getByRole('button', { name: '继续' }).click();
   await page.getByRole('tab', { name: '引用本机路径' }).click();
@@ -109,14 +110,14 @@ test('supports configuration and theme navigation', async ({ page }) => {
   await page.getByRole('combobox', { name: '判题后端' }).click();
   await page.getByRole('option', { name: 'Codeforces' }).click();
   await expect(page.getByLabel('Codeforces 赛事 ID')).toBeVisible();
-  await page.getByRole('tab', { name: '新建 Agent' }).click();
+  await page.getByRole('button', { name: /基本信息/ }).click();
+  await expect(page.getByLabel('Contest ID')).toHaveValue('e2e-contest');
+  await page.getByRole('button', { name: '关闭抽屉' }).click();
+  await page.getByRole('button', { name: '新建 Agent', exact: true }).click();
   await expect(page.getByText('模型系列')).toHaveCount(0);
   await expect(page.getByText('LANG', { exact: true })).toHaveCount(0);
   await expect(page.getByText('Manifest 格式')).toHaveCount(0);
-  await page.getByRole('tab', { name: '新建 Contest' }).click();
-  await expect(page.getByLabel('Codeforces 赛事 ID')).toBeVisible();
-  await page.getByRole('button', { name: /基本信息/ }).click();
-  await expect(page.getByLabel('Contest ID')).toHaveValue('e2e-contest');
+  await page.getByRole('button', { name: '关闭抽屉' }).click();
   await page.getByRole('button', { name: '切换深色主题' }).click();
   await expect(page.locator('html')).toHaveClass('dark');
   await page.reload();
@@ -129,6 +130,7 @@ test('uses backend capabilities for vendor, provider, max effort and native over
   let saved: any;
   await page.route('**/api/agents', route => { saved = route.request().postDataJSON(); return route.fulfill({ status: 201, json: { path: '/tmp/anthropic.yaml' } }); });
   await page.goto('/configs');
+  await page.getByRole('button', { name: '新建 Agent', exact: true }).click();
   await page.getByLabel('Agent ID').fill('claude-max');
   await page.getByLabel('模型标识').fill('claude-sonnet-4-5');
   await page.getByRole('combobox', { name: 'Provider' }).click();
@@ -158,7 +160,7 @@ test('uploads contest materials and authors local judge data', async ({ page }) 
   let saved: any;
   await page.route('**/api/contests', route => { saved = route.request().postDataJSON(); return route.fulfill({ status: 201, json: { path: '/tmp/upload-demo.json' } }); });
   await page.goto('/configs');
-  await page.getByRole('tab', { name: '新建 Contest' }).click();
+  await page.getByRole('button', { name: '新建 Contest', exact: true }).click();
   await page.getByLabel('Contest ID').fill('upload-demo');
   await page.getByRole('button', { name: '继续' }).click();
   await page.locator('input[type=file]').setInputFiles({ name: 'paper.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-demo') });
@@ -191,7 +193,7 @@ test('creates, edits, rotates and deletes Providers without echoing secrets', as
     expect(route.request().postDataJSON().secret).toBe('rotated-secret');
     return route.fulfill({ json: publicProvider });
   });
-  await page.goto('/providers');
+  await page.goto('/connections');
   await page.getByRole('button', { name: '创建第一个 Provider' }).click();
   const dialogBox = await page.getByRole('dialog').boundingBox();
   expect(dialogBox!.x).toBeGreaterThan(400);
@@ -210,5 +212,5 @@ test('creates, edits, rotates and deletes Providers without echoing secrets', as
   await expect(page.locator('body')).not.toContainText('rotated-secret');
   await page.getByRole('button', { name: '删除 OpenAI 生产' }).click();
   await page.getByRole('button', { name: '删除 Provider', exact: true }).click();
-  await expect(page.getByText('尚未登记 Provider')).toBeVisible();
+  await expect(page.getByText('尚未登记模型 API 接入')).toBeVisible();
 });

@@ -223,9 +223,9 @@ test('ranks results, starts Ghost Racing and reads coverage', async ({ page }) =
   await page.getByRole('checkbox', { name: '加入竞速 Agent A', exact: true }).click();
   await page.getByRole('checkbox', { name: '加入竞速 Agent B', exact: true }).click();
   await page.getByRole('button', { name: '开始 Ghost Racing' }).click();
-  await expect(page.getByText('Score trajectories')).toBeVisible();
+  await expect(page.getByText('得分曲线')).toBeVisible();
   await page.getByRole('button', { name: '竞速回到起点' }).click();
-  await expect(page.getByText('SAMPLE')).toBeVisible();
+  await expect(page.getByText('采样时刻')).toBeVisible();
   await expect(page.getByText('Agent A 通过 A')).toHaveCount(0);
   await page.getByRole('slider', { name: '竞速时间轴' }).focus();
   await page.getByRole('slider', { name: '竞速时间轴' }).press('End');

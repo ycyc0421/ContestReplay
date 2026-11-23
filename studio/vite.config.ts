@@ -15,7 +15,7 @@ export default defineConfig({
     proxy: { '/api': { target: studioOrigin, changeOrigin: true, headers: { Origin: studioOrigin } } },
   },
   build: {
-    outDir: resolve(import.meta.dirname, '../dist/studio'), emptyOutDir: true,
+    outDir: resolve(import.meta.dirname, '../dist/studio'), emptyOutDir: true, assetsInlineLimit: 0,
     rolldownOptions: { output: { codeSplitting: { groups: [
       { name: 'react-vendor', test: /node_modules[\\/](?:react|react-dom|scheduler)[\\/]/ },
       { name: 'tanstack', test: /node_modules[\\/]@tanstack[\\/]/ },

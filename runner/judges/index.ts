@@ -41,6 +41,7 @@ export * from './codeforces.js';
 export * from './qoj.js';
 export * from './vjudge.js';
 export * from './hydro.js';
+export * from './probe.js';
 export {
   OjAccounts,
   OjAccountPool,
