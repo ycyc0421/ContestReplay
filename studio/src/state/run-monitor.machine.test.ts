@@ -1,9 +1,10 @@
 import type { RunProgressContract } from '@studio-api';
 import { deriveRunAuthority } from './run-monitor.machine';
 
-const makeProgress = (status: RunProgressContract['status']): RunProgressContract => ({
+const makeProgress = (status: RunProgressContract['status'], reason?: string): RunProgressContract => ({
   run_id: '11111111-1111-4111-8111-111111111111',
   status,
+  ...(reason ? { reason } : {}),
   agent_id: 'a',
   contest_id: 'c',
   data_version: 1,
@@ -24,13 +25,33 @@ const makeProgress = (status: RunProgressContract['status']): RunProgressContrac
 });
 
 describe('deriveRunAuthority', () => {
-  it('prefers terminal SSE queue status even when batch and progress GET still say running', () => {
+  it('prefers terminal SSE queue status and its own reason, ignoring stale conflicting batch reason', () => {
     const auth = deriveRunAuthority({
       terminalStatus: { status: 'interrupted', reason: 'cancelled' },
       progress: makeProgress('running'),
       batchJobStatus: 'running',
+      batchJobReason: 'stale_batch_reason',
     });
     expect(auth).toEqual({ running: false, displayStatus: 'interrupted', displayReason: 'cancelled' });
+
+    // Even when terminal SSE has no reason, a disagreeing batch status must NOT leak its stale reason
+    const noReasonAuth = deriveRunAuthority({
+      terminalStatus: { status: 'interrupted' },
+      progress: makeProgress('running', 'running_note'),
+      batchJobStatus: 'running',
+      batchJobReason: 'stale_batch_reason',
+    });
+    expect(noReasonAuth).toEqual({ running: false, displayStatus: 'interrupted', displayReason: undefined });
+  });
+
+  it('falls back to batch reason when batch agrees on the winning terminal status', () => {
+    const auth = deriveRunAuthority({
+      terminalStatus: { status: 'void' },
+      progress: makeProgress('void'),
+      batchJobStatus: 'void',
+      batchJobReason: 'auth_expired',
+    });
+    expect(auth).toEqual({ running: false, displayStatus: 'void', displayReason: 'auth_expired' });
   });
 
   it('prefers terminal SSE progress completed over stale nonterminal batch running status', () => {

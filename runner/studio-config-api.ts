@@ -679,8 +679,14 @@ function extractCookieSecrets(cookie: string | undefined): CookieRedactionRules 
     const eq = part.indexOf('=');
     if (eq >= 0) {
       const val = part.slice(eq + 1).trim();
-      if (val.length >= 2) exact.add(val);
-      else if (val.length === 1) wordBoundary.add(val);
+      const candidates = [val];
+      if (val.length >= 2 && val.startsWith('"') && val.endsWith('"')) {
+        candidates.push(val.slice(1, -1));
+      }
+      for (const candidate of candidates) {
+        if (candidate.length >= 2) exact.add(candidate);
+        else if (candidate.length === 1) wordBoundary.add(candidate);
+      }
     }
   }
   return {
@@ -873,17 +879,28 @@ export async function configRoute(path: string, req: IncomingMessage, opts: Stud
     let result: Awaited<ReturnType<typeof probeFn>>;
     try {
       result = await probeFn(input, { signal });
-    } catch (err) {
-      const safeMessage = redactSecretText(err instanceof Error ? err.message : String(err), cookieSecrets);
-      throw new FieldError(['secret'], safeMessage, 400);
+    } catch {
+      throw new FieldError(['secret'], 'OJ 会话探测失败，请检查站点地址与 Cookie 格式', 400);
     }
+    const rawHandle = result.detected_handle;
+    const safeHandle = rawHandle && redactSecretText(rawHandle, cookieSecrets) === rawHandle
+      ? rawHandle
+      : undefined;
+    const rawOrigin = result.origin;
+    const safeOrigin = redactSecretText(rawOrigin, cookieSecrets) === rawOrigin ? rawOrigin : '';
+    const rawMessage = result.message;
+    const safeMessage = redactSecretText(rawMessage, cookieSecrets) === rawMessage
+      ? rawMessage
+      : result.authenticated
+        ? (safeHandle ? `会话有效，已识别用户名 ${safeHandle}` : '会话有效（请手动确认用户名）')
+        : '会话未通过验证，请重新导入登录 Cookie';
     return {
       data: ojAccountProbeResponseSchema.parse({
         ok: result.ok,
         authenticated: result.authenticated,
-        origin: redactSecretText(result.origin, cookieSecrets),
-        ...(result.detected_handle ? { detected_handle: redactSecretText(result.detected_handle, cookieSecrets) } : {}),
-        message: redactSecretText(result.message, cookieSecrets),
+        origin: safeOrigin,
+        ...(safeHandle ? { detected_handle: safeHandle } : {}),
+        message: safeMessage,
       }),
     };
   }

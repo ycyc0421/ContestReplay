@@ -27,7 +27,7 @@ export function RunPage() {
   const navigate = useNavigate();
   const view: RunView = search.view === 'replay' || search.view === 'logs' ? search.view : 'live';
   const setView = (next: RunView) => {
-    void navigate({ search: (prev: Record<string, unknown>) => ({ ...prev, view: next }), replace: true } as never);
+    void navigate({ search: (prev: Record<string, unknown>) => ({ ...prev, view: next }), replace: false } as never);
   };
   const [confirmStop, setConfirmStop] = useState(false);
   const queryClient = useQueryClient();
@@ -82,6 +82,7 @@ export function RunPage() {
     <div className="mb-5 flex flex-col gap-3 border-b pb-4 sm:flex-row sm:items-center sm:justify-between">
       <SegmentedTabs
         id={`run-view-${runId}`}
+        panelIdPrefix={`run-panel-${runId}`}
         ariaLabel="运行详情视图"
         value={view}
         onValueChange={setView}
@@ -94,7 +95,7 @@ export function RunPage() {
       <span className="text-[11px] text-muted-foreground">沙盒外可信 Supervisor 事件 · 仅本机可见</span>
     </div>
 
-    <AnimatedPanel panelKey={view}>
+    <AnimatedPanel panelKey={view} role="tabpanel" id={`run-panel-${runId}-${view}`} ariaLabelledBy={`run-view-${runId}-tab-${view}`}>
       {view === 'live' && (progress.isLoading
         ? <div className="skeleton h-[520px] rounded-card border bg-card" />
         : progress.isError || !data

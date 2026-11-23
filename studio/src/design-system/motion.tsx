@@ -1,7 +1,7 @@
 import * as DialogPrimitive from '@radix-ui/react-dialog';
-import { AnimatePresence, motion, type Transition } from 'motion/react';
+import { AnimatePresence, motion, useReducedMotion, type Transition } from 'motion/react';
 import { X } from 'lucide-react';
-import type { ReactNode } from 'react';
+import { useEffect, useRef, type ReactNode } from 'react';
 import { cn } from '@/lib/utils';
 
 export const SPRING_INDICATOR: Transition = { type: 'spring', stiffness: 500, damping: 38, mass: 0.85 };
@@ -15,19 +15,29 @@ export function AnimatedPanel({
   panelKey,
   children,
   className,
+  role,
+  id,
+  ariaLabelledBy,
 }: {
   panelKey: string | number;
   children: ReactNode;
   className?: string;
+  role?: string;
+  id?: string;
+  ariaLabelledBy?: string;
 }) {
+  const reduced = useReducedMotion();
   return (
     <AnimatePresence mode="wait" initial={false}>
       <motion.div
         key={panelKey}
-        initial={{ opacity: 0, y: 4 }}
+        id={id}
+        role={role}
+        aria-labelledby={ariaLabelledBy}
+        initial={reduced ? { opacity: 1 } : { opacity: 0, y: 4 }}
         animate={{ opacity: 1, y: 0 }}
-        exit={{ opacity: 0, y: -3 }}
-        transition={PANEL_TRANSITION}
+        exit={reduced ? { opacity: 0 } : { opacity: 0, y: -3 }}
+        transition={reduced ? { duration: 0 } : PANEL_TRANSITION}
         className={className}
       >
         {children}
@@ -39,6 +49,7 @@ export function AnimatedPanel({
 /**
  * Opaque right-side slide-over drawer (Scheme A).
  * Built on Radix Dialog for focus trapping, ESC handling, and accessible dialog semantics.
+ * Restores focus cleanly to the initiating trigger (or <main> fallback) on close.
  */
 export function SlideDrawer({
   open,
@@ -61,12 +72,36 @@ export function SlideDrawer({
   widthClass?: string;
   children: ReactNode;
 }) {
+  const openerRef = useRef<HTMLElement | null>(null);
+  const wasOpenRef = useRef(false);
+
+  useEffect(() => {
+    if (open && !wasOpenRef.current) {
+      const active = document.activeElement;
+      openerRef.current = active instanceof HTMLElement ? active : null;
+    }
+    wasOpenRef.current = open;
+  }, [open]);
+
   return (
     <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/50 backdrop-blur-[2px] data-[state=open]:animate-overlay-in data-[state=closed]:animate-overlay-out" />
         <DialogPrimitive.Content
-          aria-describedby={description ? undefined : undefined}
+          {...(!description ? { 'aria-describedby': undefined } : {})}
+          onCloseAutoFocus={event => {
+            event.preventDefault();
+            const target = openerRef.current;
+            if (target && target.isConnected && typeof target.focus === 'function') {
+              target.focus();
+            } else {
+              const main = document.querySelector('main');
+              if (main instanceof HTMLElement) {
+                if (!main.hasAttribute('tabindex')) main.setAttribute('tabindex', '-1');
+                main.focus();
+              }
+            }
+          }}
           className={cn(
             'fixed inset-y-0 right-0 z-50 flex w-full flex-col border-l bg-card text-card-foreground shadow-2xl outline-none data-[state=open]:animate-drawer-in data-[state=closed]:animate-drawer-out',
             widthClass,

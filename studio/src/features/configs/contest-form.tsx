@@ -213,8 +213,21 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
   const judgeBackend = capabilities.judge_backends.find(item => item.kind === values.judge);
   const accounts = useQuery({ queryKey: queryKeys.ojAccounts, queryFn: studioApi.ojAccounts, enabled: values.judge !== 'local' });
 
+  const previewGenRef = useRef(0);
+  const currentUpstreamKey = JSON.stringify([
+    values.judge,
+    values.cfId.trim(),
+    values.gym,
+    values.baseUrl.trim(),
+    values.domain.trim(),
+    values.accountId,
+    values.pdf.trim(),
+  ]);
+  const latestUpstreamKeyRef = useRef(currentUpstreamKey);
+  latestUpstreamKeyRef.current = currentUpstreamKey;
+
   const currentCfWeightSig = values.judge === 'codeforces'
-    ? buildCfWeightSigFromDrafts(values.cfId, values.gym === 'gym', wizard.problems, parsePlainRecord(values.problemMap) ?? {})
+    ? buildCfWeightSigFromDrafts(values.cfId, values.gym === 'gym', wizard.problems, parsePlainRecord(values.problemMap) ?? {}, values.baseUrl)
     : undefined;
 
   useEffect(() => {
@@ -225,9 +238,11 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
     ? computeCodeforcesPointsKnown({
         cfId: values.cfId,
         gym: values.gym === 'gym',
+        baseUrl: values.baseUrl,
         problems: wizard.problems.map(p => ({ id: p.id.trim(), max_points: p.maxPoints })),
         problemMap: parsePlainRecord(values.problemMap) ?? {},
         preview: wizard.remotePreview,
+        previewBaseUrl: wizard.remotePreviewBaseUrl,
         confirmedSignature: wizard.confirmedWeightsSig,
         isEdit: Boolean(initial),
         sourceJudge,
@@ -241,24 +256,35 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
 
   const setProblems = (nextProblems: ProblemDraft[]) => {
     const nextSig = values.judge === 'codeforces'
-      ? buildCfWeightSigFromDrafts(values.cfId, values.gym === 'gym', nextProblems, parsePlainRecord(values.problemMap) ?? {})
+      ? buildCfWeightSigFromDrafts(values.cfId, values.gym === 'gym', nextProblems, parsePlainRecord(values.problemMap) ?? {}, values.baseUrl)
       : undefined;
     dispatch({ type: 'SET_PROBLEMS', problems: nextProblems, nextCfWeightSig: nextSig });
   };
 
   const previewContest = useMutation({
-    mutationFn: () => studioApi.previewContest({
-      platform: values.judge as 'codeforces' | 'qoj' | 'vjudge' | 'hydro',
-      contest_id: values.judge === 'codeforces' ? Number(values.cfId) : values.cfId,
-      ...(values.judge === 'codeforces' && values.gym === 'gym' ? { gym: true } : {}),
-      ...(values.baseUrl.trim() ? { base_url: values.baseUrl.trim() } : {}),
-      ...(values.domain.trim() ? { domain: values.domain.trim() } : {}),
-      ...(values.accountId ? { account_id: values.accountId } : {}),
-      ...(values.pdf.trim() ? { pdf_path: values.pdf.trim() } : {}),
-      ...(values.file.trim() ? { manifest_path: values.file.trim() } : {}),
-      ...(values.id.trim() ? { manifest_contest_id: values.id.trim() } : {}),
-    }),
-    onSuccess: result => {
+    mutationFn: async () => {
+      const gen = ++previewGenRef.current;
+      const upstreamKey = latestUpstreamKeyRef.current;
+      const reqJudge = getValues('judge');
+      const reqCfId = getValues('cfId');
+      const reqGym = getValues('gym') === 'gym';
+      const reqBaseUrl = getValues('baseUrl').trim();
+      const result = await studioApi.previewContest({
+        platform: reqJudge as 'codeforces' | 'qoj' | 'vjudge' | 'hydro',
+        contest_id: reqJudge === 'codeforces' ? Number(reqCfId) : reqCfId,
+        ...(reqJudge === 'codeforces' && reqGym ? { gym: true } : {}),
+        ...(reqBaseUrl ? { base_url: reqBaseUrl } : {}),
+        ...(getValues('domain').trim() ? { domain: getValues('domain').trim() } : {}),
+        ...(getValues('accountId') ? { account_id: getValues('accountId') } : {}),
+        ...(getValues('pdf').trim() ? { pdf_path: getValues('pdf').trim() } : {}),
+        ...(getValues('file').trim() ? { manifest_path: getValues('file').trim() } : {}),
+        ...(getValues('id').trim() ? { manifest_contest_id: getValues('id').trim() } : {}),
+      });
+      return { gen, upstreamKey, reqJudge, reqCfId, reqGym, reqBaseUrl, result };
+    },
+    onSuccess: ({ gen, upstreamKey, reqJudge, reqCfId, reqGym, reqBaseUrl, result }) => {
+      // Discard stale preview responses if user changed judge/contest/mirror/PDF while in flight
+      if (previewGenRef.current !== gen || latestUpstreamKeyRef.current !== upstreamKey) return;
       if (!getValues('title').trim()) setValue('title', result.preview.title);
       if (result.language_presets.length) {
         setValue('languages', JSON.stringify(Object.fromEntries(result.language_presets.map(language => [language.id, language.remote_id]))));
@@ -270,9 +296,10 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
       }
       dispatch({
         type: 'APPLY_REMOTE_PREVIEW',
-        judge: values.judge,
-        cfId: getValues('cfId'),
-        gym: getValues('gym') === 'gym',
+        judge: reqJudge,
+        cfId: reqCfId,
+        gym: reqGym,
+        baseUrl: reqBaseUrl || undefined,
         existingProblemMap,
         result,
         isEdit: Boolean(initial),
@@ -411,15 +438,40 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
       }
     } catch (error) {
       if (error instanceof ApiError) {
+        let targetStep: number | undefined;
+        const markStep = (step: number) => { targetStep = targetStep === undefined ? step : Math.min(targetStep, step); };
         for (const issue of error.issues) {
           const joined = issue.path.join('.');
-          if (joined.includes('contest_id')) setError('id', { message: issue.message });
-          else if (joined.includes('entrypoint')) setError('pdf', { message: issue.message });
-          else if (joined.includes('base_url')) setError('baseUrl', { message: issue.message });
-          else if (joined.includes('languages')) setError('languages', { message: issue.message });
-          else if (joined.includes('problem_map')) setError('problemMap', { message: issue.message });
-          else if (joined.includes('time_limit_ms')) setError('timeLimitMs', { message: issue.message });
-          else if (joined.includes('file')) setError('file', { message: issue.message });
+          if (joined === 'document.judge.contest_id' || joined === 'judge.contest_id') {
+            setError('cfId', { message: issue.message }); markStep(2);
+          } else if (joined === 'document.contest_id' || joined === 'contest_id') {
+            setError('id', { message: issue.message }); markStep(0);
+          } else if (joined === 'document.title' || joined === 'title') {
+            setError('title', { message: issue.message }); markStep(0);
+          } else if (joined === 'document.data_version' || joined === 'data_version') {
+            setError('dataVersion', { message: issue.message }); markStep(0);
+          } else if (joined === 'file' || joined === 'path') {
+            setError('file', { message: issue.message }); markStep(0);
+          } else if (joined.includes('materials') || joined.includes('entrypoint')) {
+            setError('pdf', { message: issue.message }); markStep(1);
+          } else if (joined.includes('base_url')) {
+            setError('baseUrl', { message: issue.message }); markStep(2);
+          } else if (joined.includes('languages')) {
+            setError('languages', { message: issue.message }); markStep(2);
+          } else if (joined.includes('problem_map')) {
+            setError('problemMap', { message: issue.message }); markStep(2);
+          } else if (joined.includes('handle') || joined.includes('account_id')) {
+            setError('handle', { message: issue.message }); markStep(2);
+          } else if (joined.includes('judge.answers')) {
+            setError('answers', { message: issue.message }); markStep(2);
+          } else if (joined.includes('time_limit_ms')) {
+            setError('timeLimitMs', { message: issue.message }); markStep(3);
+          } else if (joined.includes('max_submissions')) {
+            setError('maxSubmissions', { message: issue.message }); markStep(3);
+          }
+        }
+        if (targetStep !== undefined && targetStep !== wizard.step) {
+          goTo(targetStep);
         }
       }
       toast.error('无法保存 Contest', { description: (error as Error).message });

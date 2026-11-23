@@ -57,9 +57,25 @@ describe('computeCodeforcesPointsKnown', () => {
       sourceProblems: [{ id: 'A', max_points: 500 }],
     })).toBe(false);
 
-    // Confirmation signature differs between Round and Gym
+    // Confirmation signature differs between Round, Gym, and different mirrors
     const roundSig = codeforcesWeightSignature('2000', false, [{ id: 'A', max_points: 500 }], {});
     const gymSig = codeforcesWeightSignature('2000', true, [{ id: 'A', max_points: 500 }], {});
+    const mirrorSig = codeforcesWeightSignature('2000', false, [{ id: 'A', max_points: 500 }], {}, 'https://mirror.codeforces.com');
     expect(roundSig).not.toBe(gymSig);
+    expect(roundSig).not.toBe(mirrorSig);
+
+    // Changing mirror invalidates points_known even when numeric contest ID is unchanged
+    expect(computeCodeforcesPointsKnown({
+      cfId: '2000',
+      gym: false,
+      baseUrl: 'https://mirror.codeforces.com',
+      problems: [{ id: 'A', max_points: 500 }],
+      problemMap: {},
+      preview: previewFor('2000', [{ remote_id: 'A', max_points: 500 }]),
+      previewBaseUrl: 'https://codeforces.com',
+      isEdit: true,
+      sourceJudge: { kind: 'codeforces', contest_id: 2000, gym: false, points_known: true },
+      sourceProblems: [{ id: 'A', max_points: 500 }],
+    })).toBe(false);
   });
 });

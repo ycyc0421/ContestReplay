@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link, Outlet, useLocation } from '@tanstack/react-router';
 import { Activity, BarChart3, Braces, FilePlus2, FolderCog, Link2, Menu, Moon, ShieldCheck, Sun, X } from 'lucide-react';
-import { AnimatePresence, motion } from 'motion/react';
+import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { Toaster } from 'sonner';
 import { cn } from '@/lib/utils';
 import { TooltipProvider } from '@/components/ui/tooltip';
@@ -69,6 +69,7 @@ function NavItems({ onNavigate, id }: { onNavigate?: () => void; id: string }) {
 export function AppShell() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const pathname = useLocation({ select: location => location.pathname });
+  const reduced = useReducedMotion();
   return <TooltipProvider delayDuration={350}><div className="min-h-screen">
     <aside className="fixed inset-y-0 left-0 z-30 hidden w-[236px] flex-col border-r bg-sidebar px-4 py-5 lg:flex">
       <div className="px-2"><Brand /></div>
@@ -85,9 +86,13 @@ export function AppShell() {
         <div className="hidden items-center gap-2 text-xs text-muted-foreground lg:flex"><span className="size-1.5 rounded-full bg-primary" /><span>本机工作区在线</span><span className="text-border">/</span><span className="font-mono text-[11px]">127.0.0.1</span></div>
         <div className="flex items-center gap-1"><ThemeToggle /><button className="rounded-[3px] p-2 text-muted-foreground transition hover:bg-muted lg:hidden" onClick={() => setMobileOpen(v => !v)} aria-label={mobileOpen ? '关闭导航' : '打开导航'}>{mobileOpen ? <X className="size-5" /> : <Menu className="size-5" />}</button></div>
       </header>
-      <AnimatePresence initial={false}>{mobileOpen && <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={PANEL_TRANSITION} className="overflow-hidden border-b bg-sidebar lg:hidden"><div className="p-3"><NavItems id="mobile" onNavigate={() => setMobileOpen(false)} /></div></motion.div>}</AnimatePresence>
+      {reduced ? (
+        mobileOpen ? <div className="border-b bg-sidebar lg:hidden"><div className="p-3"><NavItems id="mobile" onNavigate={() => setMobileOpen(false)} /></div></div> : null
+      ) : (
+        <AnimatePresence initial={false}>{mobileOpen && <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={PANEL_TRANSITION} className="overflow-hidden border-b bg-sidebar lg:hidden"><div className="p-3"><NavItems id="mobile" onNavigate={() => setMobileOpen(false)} /></div></motion.div>}</AnimatePresence>
+      )}
       <main className="workspace-grid mx-auto min-h-[calc(100vh-3.75rem)] w-full max-w-[1500px] px-4 py-7 sm:px-7 sm:py-9 lg:px-9">
-        <motion.div key={pathname} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} transition={PANEL_TRANSITION}><Outlet /></motion.div>
+        <motion.div key={pathname} initial={reduced ? { opacity: 1 } : { opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} transition={reduced ? { duration: 0 } : PANEL_TRANSITION}><Outlet /></motion.div>
       </main>
     </div>
     <Toaster position="bottom-right" toastOptions={{ className: '!font-sans' }} closeButton />

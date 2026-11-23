@@ -17,6 +17,7 @@ export interface ContestWizardState {
   uploaded?: MaterialArtifact;
   problems: ProblemDraft[];
   remotePreview?: ContestPreviewResponse;
+  remotePreviewBaseUrl?: string;
   confirmedWeightsSig?: string;
   cfNoticeSticky: boolean;
 }
@@ -33,6 +34,7 @@ export type ContestWizardEvent =
       judge: string;
       cfId: string;
       gym: boolean;
+      baseUrl?: string;
       existingProblemMap: Record<string, unknown>;
       result: ContestPreviewResponse;
       isEdit: boolean;
@@ -92,6 +94,7 @@ export function contestWizardReducer(
       return {
         ...state,
         remotePreview: undefined,
+        remotePreviewBaseUrl: undefined,
         confirmedWeightsSig: undefined,
         cfNoticeSticky: event.judge === 'codeforces' && event.sourceJudge?.kind === 'codeforces' && event.sourceJudge.points_known === false,
       };
@@ -120,9 +123,11 @@ export function contestWizardReducer(
         ? computeCodeforcesPointsKnown({
             cfId: event.cfId,
             gym: event.gym,
+            baseUrl: event.baseUrl,
             problems: state.problems.map(p => ({ id: p.id.trim(), max_points: p.maxPoints })),
             problemMap: event.existingProblemMap,
             preview: state.remotePreview,
+            previewBaseUrl: state.remotePreviewBaseUrl,
             confirmedSignature: state.confirmedWeightsSig,
             isEdit: event.isEdit,
             sourceJudge: event.sourceJudge,
@@ -152,9 +157,11 @@ export function contestWizardReducer(
         ? computeCodeforcesPointsKnown({
             cfId: event.cfId,
             gym: event.gym,
+            baseUrl: event.baseUrl,
             problems: nextProblems.map(p => ({ id: p.id.trim(), max_points: p.maxPoints })),
             problemMap: mergedMap,
             preview: event.result,
+            previewBaseUrl: event.baseUrl,
             confirmedSignature: undefined,
             isEdit: event.isEdit,
             sourceJudge: event.sourceJudge,
@@ -166,6 +173,7 @@ export function contestWizardReducer(
         ...state,
         problems: nextProblems,
         remotePreview: event.result,
+        remotePreviewBaseUrl: event.baseUrl,
         confirmedWeightsSig: undefined,
         cfNoticeSticky: event.judge === 'codeforces' && nextVerified === false,
       };
@@ -183,11 +191,13 @@ export function buildCfWeightSigFromDrafts(
   gym: boolean,
   drafts: ProblemDraft[],
   problemMap: Record<string, unknown>,
+  baseUrl?: string,
 ) {
   return codeforcesWeightSignature(
     cfId,
     gym,
     drafts.map(p => ({ id: p.id.trim(), max_points: p.maxPoints })),
     problemMap,
+    baseUrl,
   );
 }

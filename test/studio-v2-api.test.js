@@ -2383,10 +2383,10 @@ test('Studio v3 API: probeOjAccountSession and POST /api/oj-accounts/probe detec
     return { fn, calls };
   };
 
-  // 1. Codeforces authenticated + handle detected
+  // 1. Codeforces scopes identity strictly to the account container around /logout, ignoring earlier public author links
   const cfOk = mkFetch(
     200,
-    '<html><body><a href="/profile/tourist_bot">tourist_bot</a><a href="/1234/logout">Logout</a></body></html>',
+    '<html><body><div class="blog"><a href="/profile/public_author">public_author</a></div><div class="lang-chooser"><a href="/profile/tourist_bot">tourist_bot</a> | <a href="/1234/logout">Logout</a></div></body></html>',
   );
   const cfRes = await probeOjAccountSession(
     { platform: 'codeforces', secret: 'JSESSIONID=cf-secret-token-123; 39ce7=cf-39ce7-456' },
@@ -2398,10 +2398,10 @@ test('Studio v3 API: probeOjAccountSession and POST /api/oj-accounts/probe detec
   assert.equal(cfRes.origin, 'https://codeforces.com');
   assert.equal(cfOk.calls.length, 1);
 
-  // 2. QOJ authenticated + handle detected
+  // 2. QOJ skips malformed percent-encoded profile links cleanly and scopes to account navbar around /logout
   const qojOk = mkFetch(
     200,
-    '<html><body><a href="/user/profile/qoj_tester">qoj_tester</a><a href="/logout?_token=abc">Logout</a></body></html>',
+    '<html><body><nav><ul class="nav"><li><a href="/user/profile/%E0%A4%A">bad</a></li><li><a href="/user/profile/qoj_tester">qoj_tester</a></li><li><a href="/logout?_token=abc">Logout</a></li></ul></nav></body></html>',
   );
   const qojRes = await probeOjAccountSession(
     { platform: 'qoj', secret: 'UOJSESSID=qoj-secret-token-789' },
@@ -2410,8 +2410,16 @@ test('Studio v3 API: probeOjAccountSession and POST /api/oj-accounts/probe detec
   assert.equal(qojRes.authenticated, true);
   assert.equal(qojRes.detected_handle, 'qoj_tester');
 
-  // 3. VJudge plain username response
-  const vjOk = mkFetch(200, '"vj_runner"', 'text/plain');
+  // 3. VJudge distinguishes boolean true (authenticated without handle) from string username
+  const vjBool = mkFetch(200, 'true', 'application/json');
+  const vjBoolRes = await probeOjAccountSession(
+    { platform: 'vjudge', secret: 'JSESSIONID=vj-secret-999' },
+    { fetchImpl: vjBool.fn },
+  );
+  assert.equal(vjBoolRes.authenticated, true);
+  assert.equal(vjBoolRes.detected_handle, undefined);
+
+  const vjOk = mkFetch(200, '"vj_runner"', 'application/json');
   const vjRes = await probeOjAccountSession(
     { platform: 'vjudge', secret: 'JSESSIONID=vj-secret-999' },
     { fetchImpl: vjOk.fn },
@@ -2419,15 +2427,40 @@ test('Studio v3 API: probeOjAccountSession and POST /api/oj-accounts/probe detec
   assert.equal(vjRes.authenticated, true);
   assert.equal(vjRes.detected_handle, 'vj_runner');
 
-  // 4. Hydro JSON UserContext
-  const hydroOk = mkFetch(200, JSON.stringify({ UserContext: { _id: 42, uname: 'hydro_bot' } }), 'application/json');
+  // 4. Hydro HTML parses UserContext regardless of key order (uname before _id)
+  const hydroHtml = mkFetch(
+    200,
+    '<html><script>var UiContext = {"UserContext": {"uname": "hydro_bot", "role": "default", "_id": 42}};</script></html>',
+    'text/html',
+  );
   const hydroRes = await probeOjAccountSession(
     { platform: 'hydro', base_url: 'https://hydro.example.com', secret: 'sid=hydro-secret-111' },
-    { fetchImpl: hydroOk.fn },
+    { fetchImpl: hydroHtml.fn },
   );
   assert.equal(hydroRes.authenticated, true);
   assert.equal(hydroRes.detected_handle, 'hydro_bot');
   assert.equal(hydroRes.origin, 'https://hydro.example.com');
+
+  // 4b. Oversized upstream response body (>512 KiB) stops streaming and returns bounded diagnostic
+  let cancelledOversized = false;
+  const oversizedFetch = async () => {
+    const stream = new ReadableStream({
+      pull(controller) {
+        controller.enqueue(new Uint8Array(128 * 1024).fill(65));
+      },
+      cancel() {
+        cancelledOversized = true;
+      },
+    });
+    return new Response(stream, { status: 200, headers: { 'content-type': 'text/html' } });
+  };
+  const oversizedRes = await probeOjAccountSession(
+    { platform: 'codeforces', secret: 'JSESSIONID=cf-secret-token-123' },
+    { fetchImpl: oversizedFetch },
+  );
+  assert.equal(oversizedRes.ok, false);
+  assert.equal(oversizedRes.authenticated, false);
+  assert.equal(cancelledOversized, true);
 
   // 5. Unauthenticated response returns ok=true, authenticated=false
   const unauth = mkFetch(200, '<html><body><a href="/enter">Enter</a></body></html>');
@@ -2461,6 +2494,7 @@ test('Studio v3 API: probeOjAccountSession and POST /api/oj-accounts/probe detec
   const ojAccounts = new OjAccounts(join(dir, 'oj-accounts'));
 
   let shouldThrowSecret = false;
+  let mockHandle = 'probe_user';
   const studio = await startStudio(root, 0, {
     base,
     store,
@@ -2474,8 +2508,8 @@ test('Studio v3 API: probeOjAccountSession and POST /api/oj-accounts/probe detec
         ok: true,
         authenticated: true,
         origin: 'https://codeforces.com',
-        detected_handle: 'probe_user',
-        message: '已验证登录态：probe_user',
+        detected_handle: mockHandle,
+        message: `已验证登录态：${mockHandle}`,
       };
     },
   });
@@ -2491,12 +2525,28 @@ test('Studio v3 API: probeOjAccountSession and POST /api/oj-accounts/probe detec
   assert.equal(okProbe.value.detected_handle, 'probe_user');
   assert.ok(!okProbe.text.includes('ultra-secret-probe-cookie-value-42'));
 
+  // Handle intersecting a quoted cookie value MUST be omitted rather than returning `[REDACTED]`
+  mockHandle = 'ben';
+  const intersectingProbe = await req('/api/oj-accounts/probe', {
+    body: { platform: 'codeforces', secret: 'lang="en"; JSESSIONID=xyz' },
+  });
+  assert.equal(intersectingProbe.status, 200, intersectingProbe.text);
+  assert.equal(intersectingProbe.value.detected_handle, undefined);
+  assert.ok(!intersectingProbe.text.includes('[REDACTED]'));
+  mockHandle = 'probe_user';
+
   shouldThrowSecret = true;
   const errProbe = await req('/api/oj-accounts/probe', {
     body: { platform: 'codeforces', secret: secretCookie },
   });
   assert.equal(errProbe.status, 400);
   assert.ok(!errProbe.text.includes('ultra-secret-probe-cookie-value-42'));
+
+  // Leading/trailing CR/LF rejected BEFORE trim
+  const leadingNewlineProbe = await req('/api/oj-accounts/probe', {
+    body: { platform: 'codeforces', secret: '\nJSESSIONID=abc' },
+  });
+  assert.equal(leadingNewlineProbe.status, 400);
 
   // Real default probe rejects multiline cookie cleanly without storing anything
   const studioDefault = await startStudio(root, 0, { base, store, ojAccounts, getImage });

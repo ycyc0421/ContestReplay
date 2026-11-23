@@ -13,6 +13,7 @@ import {
   cellKey,
   createInitialBatchComposerState,
   parseCell,
+  sanitizeBatchDraft,
   type BatchDraft,
 } from '@/state/batch-composer.machine';
 import { Button } from '@/components/ui/button';
@@ -30,15 +31,19 @@ const draftKey = 'cr.batch.draft';
 
 function readDraft(): BatchDraft {
   try {
-    const raw = JSON.parse(sessionStorage.getItem(draftKey) ?? '{"agents":[],"contests":[],"cells":[]}') as Partial<BatchDraft>;
-    return {
-      agents: Array.isArray(raw.agents) ? raw.agents : [],
-      contests: Array.isArray(raw.contests) ? raw.contests : [],
-      cells: Array.isArray(raw.cells) ? raw.cells : [],
-    };
+    const raw = JSON.parse(sessionStorage.getItem(draftKey) ?? '{"agents":[],"contests":[],"cells":[]}') as unknown;
+    return sanitizeBatchDraft(raw);
   } catch {
     return { agents: [], contests: [], cells: [] };
   }
+}
+
+function findUniqueCatalogMatch<T extends { path: string }>(entries: T[], requestedPath: string): T | undefined {
+  const exact = entries.find(item => item.path === requestedPath);
+  if (exact) return exact;
+  // Fallback for legacy absolute paths only when unambiguous
+  const suffixMatches = entries.filter(item => requestedPath.endsWith(`/${item.path}`));
+  return suffixMatches.length === 1 ? suffixMatches[0] : undefined;
 }
 
 function Mark({ selected }: { selected: boolean }) {
@@ -171,15 +176,15 @@ export function NewBatchPage() {
   const selectedAgentEntries = agents.filter(agent => selectedAgents.has(agent.path));
   const selectedContestEntries = contests.filter(contest => selectedContests.has(contest.path));
 
-  // Reconcile draft against fresh catalog validity
+  // Reconcile draft strictly after fresh mount fetch succeeds (never prune against stale cache or errors)
   useEffect(() => {
-    if (!agentsQuery.data) return;
+    if (!agentsQuery.isFetchedAfterMount || agentsQuery.isFetching || !agentsQuery.isSuccess) return;
     dispatch({ type: 'RECONCILE_AGENTS', validPaths: new Set(agentsQuery.data.agents.filter(a => a.valid).map(a => a.path)) });
-  }, [agentsQuery.data]);
+  }, [agentsQuery.data, agentsQuery.isFetchedAfterMount, agentsQuery.isFetching, agentsQuery.isSuccess]);
   useEffect(() => {
-    if (!contestsQuery.data) return;
+    if (!contestsQuery.isFetchedAfterMount || contestsQuery.isFetching || !contestsQuery.isSuccess) return;
     dispatch({ type: 'RECONCILE_CONTESTS', validPaths: new Set(contestsQuery.data.contests.filter(c => c.valid).map(c => c.path)) });
-  }, [contestsQuery.data]);
+  }, [contestsQuery.data, contestsQuery.isFetchedAfterMount, contestsQuery.isFetching, contestsQuery.isSuccess]);
   useEffect(() => {
     sessionStorage.setItem(draftKey, JSON.stringify({
       agents: composer.selectedAgents,
@@ -192,46 +197,73 @@ export function NewBatchPage() {
     dispatch({ type: 'FILTER_INCOMPATIBLE', compatibleMap: new Map(matrix.data.cells.map(cell => [cellKey(cell.agent, cell.contest), cell.compatible])) });
   }, [matrix.data]);
 
-  // Consume URL ?addAgent=... / ?addContest=... strictly after catalog refetch succeeds
+  // Consume URL ?addAgent=... and ?addContest=... independently strictly after fresh catalog refetch succeeds
   useEffect(() => {
-    const pending: { kind: 'agent' | 'contest'; path: string; fromUrl: boolean } | null = search.addAgent
-      ? { kind: 'agent', path: search.addAgent, fromUrl: true }
-      : search.addContest
-        ? { kind: 'contest', path: search.addContest, fromUrl: true }
-        : (() => {
-            const raw = sessionStorage.getItem('cr.batch.pending');
-            if (!raw) return null;
-            try {
-              const parsed = JSON.parse(raw) as { kind: 'agent' | 'contest'; path: string };
-              return parsed?.path ? { ...parsed, fromUrl: false } : null;
-            } catch {
-              sessionStorage.removeItem('cr.batch.pending');
-              return null;
-            }
-          })();
-    if (!pending) return;
-
-    const targetQuery = pending.kind === 'agent' ? agentsQuery : contestsQuery;
-    if (targetQuery.isFetching || targetQuery.isError || !targetQuery.data) return;
-
-    const entries = pending.kind === 'agent' ? agents : contests;
-    const entry = entries.find(item => pending.path === item.path || pending.path.endsWith(`/${item.path}`));
-    if (entry?.valid) {
-      const validOpposite = pending.kind === 'agent'
-        ? (contestsQuery.data ? new Set(contests.filter(c => c.valid).map(c => c.path)) : undefined)
-        : (agentsQuery.data ? new Set(agents.filter(a => a.valid).map(a => a.path)) : undefined);
-      dispatch({ type: 'ADD_PENDING', kind: pending.kind, path: entry.path, validOpposite });
+    const legacyRaw = sessionStorage.getItem('cr.batch.pending');
+    let legacyPending: { kind: 'agent' | 'contest'; path: string } | null = null;
+    if (legacyRaw) {
+      try {
+        const parsed = JSON.parse(legacyRaw) as { kind: 'agent' | 'contest'; path: string };
+        if (parsed?.path) legacyPending = parsed;
+      } catch {
+        sessionStorage.removeItem('cr.batch.pending');
+      }
     }
-    if (pending.fromUrl) {
-      void navigate({ search: {}, replace: true } as never);
-    } else {
-      sessionStorage.removeItem('cr.batch.pending');
+
+    const reqAgent = search.addAgent ?? (legacyPending?.kind === 'agent' ? legacyPending.path : undefined);
+    const reqContest = search.addContest ?? (legacyPending?.kind === 'contest' ? legacyPending.path : undefined);
+    if (!reqAgent && !reqContest) return;
+
+    const agentsReady = agentsQuery.isFetchedAfterMount && !agentsQuery.isFetching && agentsQuery.isSuccess;
+    const contestsReady = contestsQuery.isFetchedAfterMount && !contestsQuery.isFetching && contestsQuery.isSuccess;
+
+    let consumedAgent = false;
+    let consumedContest = false;
+
+    if (reqAgent && agentsReady) {
+      consumedAgent = true;
+      const entry = findUniqueCatalogMatch(agents, reqAgent);
+      if (entry?.valid) {
+        const validContests = contestsReady ? new Set(contests.filter(c => c.valid).map(c => c.path)) : undefined;
+        dispatch({ type: 'ADD_PENDING', kind: 'agent', path: entry.path, validOpposite: validContests });
+      } else {
+        toast.warning('未能将指定 Agent 加入批次', { description: entry ? '该 Agent 当前配置无效' : `未找到 ${reqAgent}` });
+      }
+    }
+
+    if (reqContest && contestsReady) {
+      consumedContest = true;
+      const entry = findUniqueCatalogMatch(contests, reqContest);
+      if (entry?.valid) {
+        const validAgents = agentsReady ? new Set(agents.filter(a => a.valid).map(a => a.path)) : undefined;
+        dispatch({ type: 'ADD_PENDING', kind: 'contest', path: entry.path, validOpposite: validAgents });
+      } else {
+        toast.warning('未能将指定 Contest 加入批次', { description: entry ? '该 Contest 当前配置无效' : `未找到 ${reqContest}` });
+      }
+    }
+
+    if (consumedAgent || consumedContest) {
+      if ((consumedAgent && search.addAgent) || (consumedContest && search.addContest)) {
+        void navigate({
+          search: (prev: Record<string, unknown>) => {
+            const next = { ...prev };
+            if (consumedAgent) delete next.addAgent;
+            if (consumedContest) delete next.addContest;
+            return next;
+          },
+          replace: true,
+        } as never);
+      }
+      if ((consumedAgent && legacyPending?.kind === 'agent') || (consumedContest && legacyPending?.kind === 'contest')) {
+        sessionStorage.removeItem('cr.batch.pending');
+      }
     }
   }, [
     search.addAgent, search.addContest,
     agentsQuery.data, contestsQuery.data,
+    agentsQuery.isFetchedAfterMount, contestsQuery.isFetchedAfterMount,
     agentsQuery.isFetching, contestsQuery.isFetching,
-    agentsQuery.isError, contestsQuery.isError,
+    agentsQuery.isSuccess, contestsQuery.isSuccess,
     agents, contests, navigate,
   ]);
 
@@ -259,18 +291,27 @@ export function NewBatchPage() {
 
   const selectedPairs = useMemo(() => composer.selectedCells.map(parseCell).map(([agent, contest]) => ({ agent, contest })), [composer.selectedCells]);
   const preview = useMutation({
-    mutationFn: () => studioApi.planCells(selectedPairs.map(cell => ({ ...cell, ...(composer.repeats > 1 ? { repeats: composer.repeats } : {}) }))),
-    onSuccess: result => dispatch({ type: 'PLAN_READY', plan: result }),
+    mutationFn: async (gen: number) => {
+      const result = await studioApi.planCells(selectedPairs.map(cell => ({ ...cell, ...(composer.repeats > 1 ? { repeats: composer.repeats } : {}) })));
+      return { gen, result };
+    },
+    onSuccess: ({ gen, result }) => dispatch({ type: 'PLAN_READY', plan: result, gen }),
     onError: (error: Error) => toast.error('计划生成失败', { description: error.message }),
   });
   const preflightCheck = useMutation({
-    mutationFn: () => studioApi.preflight(selectedPairs),
-    onSuccess: report => dispatch({ type: 'SET_PREFLIGHT', preflight: report }),
+    mutationFn: async (gen: number) => {
+      const report = await studioApi.preflight(selectedPairs);
+      return { gen, report };
+    },
+    onSuccess: ({ gen, report }) => dispatch({ type: 'SET_PREFLIGHT', preflight: report, gen }),
     onError: (error: Error) => toast.error('Preflight 执行失败', { description: error.message }),
   });
+  const planValid = Boolean(composer.plan && composer.planGen === composer.selectionGen);
   const start = useMutation({
     mutationFn: () => {
-      if (!composer.plan) return Promise.reject(new Error('请先生成执行计划'));
+      if (!composer.plan || composer.planGen !== composer.selectionGen) {
+        return Promise.reject(new Error('选择已变更，请重新生成执行计划'));
+      }
       return studioApi.startBatch(composer.plan.token, composer.concurrency);
     },
     onSuccess: async result => {
@@ -282,7 +323,10 @@ export function NewBatchPage() {
     onError: (error: Error) => toast.error('批次启动失败', { description: error.message }),
   });
 
-  const goReview = () => { if (composer.plan) dispatch({ type: 'SET_STAGE', stage: 'review' }); else preview.mutate(); };
+  const goReview = () => {
+    if (planValid) dispatch({ type: 'SET_STAGE', stage: 'review' });
+    else preview.mutate(composer.selectionGen);
+  };
   const ready = selectedCells.size > 0 && [...selectedCells].every(key => compatibility.get(key)?.compatible);
   const compatibleKeys = [...compatibility].filter(([, cell]) => cell.compatible).map(([key]) => key);
   const allSelected = compatibleKeys.length > 0 && compatibleKeys.every(key => selectedCells.has(key));
@@ -484,7 +528,7 @@ export function NewBatchPage() {
                 </Select>
               </Field>
               <div className="pb-2 text-[11px] leading-5 text-muted-foreground">同一 OJ 账号仍互斥；并行度只控制本批次的 worker 数。</div>
-              <Button type="button" variant="secondary" size="sm" loading={preflightCheck.isPending} onClick={() => preflightCheck.mutate()}><ShieldCheck className="size-3.5" />运行 Preflight</Button>
+              <Button type="button" variant="secondary" size="sm" loading={preflightCheck.isPending} onClick={() => preflightCheck.mutate(composer.selectionGen)}><ShieldCheck className="size-3.5" />运行 Preflight</Button>
             </div>
           </div>
           <ScrollArea className="max-h-[520px]">
@@ -547,7 +591,7 @@ export function NewBatchPage() {
           {composer.stage !== 'catalog' && <Button variant="ghost" onClick={() => dispatch({ type: 'SET_STAGE', stage: composer.stage === 'review' ? 'matrix' : 'catalog' })}><ArrowLeft className="size-4" />{composer.stage === 'review' ? '返回矩阵' : '修改配置'}</Button>}
           {composer.stage === 'catalog' && <Button disabled={!selectedAgents.size || !selectedContests.size} onClick={() => dispatch({ type: 'SET_STAGE', stage: 'matrix' })}>调整矩阵<ArrowRight className="size-4" /></Button>}
           {composer.stage === 'matrix' && <Button disabled={!ready} loading={preview.isPending} onClick={goReview}>核对执行计划<ArrowRight className="size-4" /></Button>}
-          {composer.stage === 'review' && <Button disabled={!composer.plan || batches.data?.busy} loading={start.isPending} onClick={() => start.mutate()}>确认并启动批次<ArrowRight className="size-4" /></Button>}
+          {composer.stage === 'review' && <Button disabled={!planValid || batches.data?.busy} loading={start.isPending} onClick={() => start.mutate()}>确认并启动批次<ArrowRight className="size-4" /></Button>}
         </div>
       </div>
     </Card>

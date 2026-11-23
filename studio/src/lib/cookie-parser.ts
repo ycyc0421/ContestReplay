@@ -1,250 +1,437 @@
 export type OjPlatformKind = 'codeforces' | 'qoj' | 'vjudge' | 'hydro';
-export type DetectedCookieFormat = 'netscape' | 'curl' | 'json' | 'header';
 
-export interface OjPlatformMeta {
-  kind: OjPlatformKind;
-  label: string;
-  defaultDomain: string;
-  userLabel: string;
-  userPlaceholder: string;
-  recommendedKeys: readonly string[];
-  requiresBaseUrl?: boolean;
-}
-
-export const OJ_PLATFORM_META: Record<OjPlatformKind, OjPlatformMeta> = {
-  codeforces: {
-    kind: 'codeforces',
-    label: 'Codeforces',
-    defaultDomain: 'codeforces.com',
-    userLabel: 'Codeforces 用户名（Handle）',
-    userPlaceholder: '例如 tourist',
-    recommendedKeys: ['JSESSIONID'],
-  },
-  qoj: {
-    kind: 'qoj',
-    label: 'QOJ',
-    defaultDomain: 'qoj.ac',
-    userLabel: 'QOJ 用户名',
-    userPlaceholder: '输入 QOJ 登录用户名',
-    recommendedKeys: ['UOJSESSID'],
-  },
-  vjudge: {
-    kind: 'vjudge',
-    label: 'VJudge',
-    defaultDomain: 'vjudge.net',
-    userLabel: 'VJudge 用户名',
-    userPlaceholder: '输入 VJudge 登录用户名',
-    recommendedKeys: ['JSESSIONID'],
-  },
-  hydro: {
-    kind: 'hydro',
-    label: 'Hydro',
-    defaultDomain: '自托管站点',
-    userLabel: 'Hydro 用户名',
-    userPlaceholder: '输入 Hydro 用户名',
-    recommendedKeys: ['sid'],
-    requiresBaseUrl: true,
-  },
-};
-
-export const COOKIE_FORMAT_LABELS: Record<DetectedCookieFormat, string> = {
-  netscape: 'Netscape cookies.txt',
-  curl: 'cURL 命令',
-  json: 'JSON Cookie 导出',
-  header: 'HTTP Cookie 请求头',
-};
+export type CookieInputFormat = 'netscape' | 'curl' | 'json' | 'header';
+export type CookieOriginStatus = 'matched' | 'unknown' | 'mismatched';
 
 export interface ParsedCookieImport {
-  format: DetectedCookieFormat;
+  format: CookieInputFormat;
   formatLabel: string;
-  targetDomain: string;
   normalizedHeader: string;
   keys: string[];
+  targetDomain: string;
+  targetOrigin: string;
+  originStatus: CookieOriginStatus;
+  sourceOrigin?: string;
   filteredOutCount: number;
+  expiredCount: number;
+  secureFilteredCount: number;
+  rejectedCount: number;
   missingRecommendedKeys: string[];
   warnings: string[];
 }
 
-function resolveTargetHost(platform: OjPlatformKind, baseUrl?: string): string | undefined {
-  if (baseUrl?.trim()) {
-    try {
-      return new URL(baseUrl.trim()).hostname.toLowerCase();
-    } catch {
-      // Fall back to platform default below
+export interface OjPlatformMeta {
+  id: OjPlatformKind;
+  label: string;
+  defaultDomain: string;
+  defaultOrigin?: string;
+  userLabel: string;
+  userPlaceholder: string;
+  recommendedCookieKeys: string[];
+  requiresBaseUrl: boolean;
+}
+
+export const OJ_PLATFORM_META: Record<OjPlatformKind, OjPlatformMeta> = {
+  codeforces: {
+    id: 'codeforces',
+    label: 'Codeforces',
+    defaultDomain: 'codeforces.com',
+    defaultOrigin: 'https://codeforces.com',
+    userLabel: 'Codeforces 用户名（Handle）',
+    userPlaceholder: '例如 tourist（必须与当前登录 Cookie 一致）',
+    recommendedCookieKeys: ['JSESSIONID'],
+    requiresBaseUrl: false,
+  },
+  qoj: {
+    id: 'qoj',
+    label: 'QOJ',
+    defaultDomain: 'qoj.ac',
+    defaultOrigin: 'https://qoj.ac',
+    userLabel: 'QOJ 用户名',
+    userPlaceholder: '例如 your_qoj_username',
+    recommendedCookieKeys: ['UOJSESSID'],
+    requiresBaseUrl: false,
+  },
+  vjudge: {
+    id: 'vjudge',
+    label: 'VJudge',
+    defaultDomain: 'vjudge.net',
+    defaultOrigin: 'https://vjudge.net',
+    userLabel: 'VJudge 用户名',
+    userPlaceholder: '例如 your_vjudge_username',
+    recommendedCookieKeys: ['JSESSIONID'],
+    requiresBaseUrl: false,
+  },
+  hydro: {
+    id: 'hydro',
+    label: 'Hydro',
+    defaultDomain: 'hydro.ac',
+    userLabel: 'Hydro 用户名',
+    userPlaceholder: '例如 your_hydro_username',
+    recommendedCookieKeys: ['sid'],
+    requiresBaseUrl: true,
+  },
+};
+
+const FORMAT_LABELS: Record<CookieInputFormat, string> = {
+  netscape: 'Netscape cookies.txt',
+  curl: 'cURL 命令',
+  json: 'Cookie JSON 导出',
+  header: 'Cookie 请求头',
+};
+
+// RFC 6265 cookie-name token (tchar)
+const VALID_COOKIE_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+// Disallow control characters (including CR/LF/NUL/TAB) and ';' in serialized cookie values
+const VALID_COOKIE_VALUE_RE = /^[^\x00-\x1F\x7F;]*$/;
+
+interface RawCookieEntry {
+  name: string;
+  value: string;
+  domain?: string;
+  hostOnly?: boolean;
+  secure?: boolean;
+  expiresSec?: number;
+}
+
+export function resolveTargetEndpoint(
+  platform: OjPlatformKind,
+  baseUrl?: string,
+): { host: string; protocol: 'https:' | 'http:'; origin: string } {
+  const fallbackHost = OJ_PLATFORM_META[platform].defaultDomain;
+  const fallbackOrigin = OJ_PLATFORM_META[platform].defaultOrigin ?? `https://${fallbackHost}`;
+  const raw = baseUrl?.trim();
+  if (!raw) {
+    return { host: fallbackHost, protocol: 'https:', origin: fallbackOrigin };
+  }
+  try {
+    const parsed = new URL(raw);
+    const protocol = parsed.protocol === 'http:' ? 'http:' : 'https:';
+    return {
+      host: parsed.hostname.toLowerCase(),
+      protocol,
+      origin: parsed.origin,
+    };
+  } catch {
+    return { host: fallbackHost, protocol: 'https:', origin: fallbackOrigin };
+  }
+}
+
+function normalizeHost(domain: string): string {
+  return domain.trim().replace(/^#HttpOnly_/i, '').replace(/^\./, '').toLowerCase();
+}
+
+/**
+ * RFC 6265 domain matching (strict one-way parent-to-child only):
+ * - hostOnly cookies match ONLY exact hostname.
+ * - domain cookies match exact hostname OR subdomains of cookieDomain (NEVER reverse!).
+ */
+function domainMatches(cookieDomain: string | undefined, hostOnly: boolean | undefined, targetHost: string): boolean {
+  if (!cookieDomain) return true;
+  const cleaned = normalizeHost(cookieDomain);
+  if (!cleaned) return false;
+  if (hostOnly) return targetHost === cleaned;
+  return targetHost === cleaned || targetHost.endsWith(`.${cleaned}`);
+}
+
+function isValidPair(name: string, value: string): boolean {
+  return VALID_COOKIE_NAME_RE.test(name) && VALID_COOKIE_VALUE_RE.test(value);
+}
+
+function parseNetscape(text: string): RawCookieEntry[] | null {
+  const lines = text.split(/\r?\n/);
+  const entries: RawCookieEntry[] = [];
+  let matchedNetscapeLines = 0;
+
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    const isHttpOnlyPrefixed = /^#HttpOnly_/i.test(trimmed);
+    if (trimmed.startsWith('#') && !isHttpOnlyPrefixed) continue;
+
+    const cleanLine = isHttpOnlyPrefixed ? trimmed.replace(/^#HttpOnly_/i, '') : trimmed;
+    const fields = cleanLine.split('\t');
+    if (fields.length < 7) continue;
+
+    const [domain, includeSubdomains, _path, secureFlag, expiration, name, ...rest] = fields;
+    if (!domain || !name) continue;
+    matchedNetscapeLines += 1;
+    const expNum = Number(expiration);
+    const hostOnly = includeSubdomains!.trim().toUpperCase() !== 'TRUE';
+    const secure = secureFlag!.trim().toUpperCase() === 'TRUE';
+    entries.push({
+      domain,
+      hostOnly,
+      secure,
+      name: name.trim(),
+      value: rest.join('\t'),
+      expiresSec: Number.isFinite(expNum) && expNum > 0 ? expNum : undefined,
+    });
+  }
+
+  return matchedNetscapeLines > 0 ? entries : null;
+}
+
+function parseJsonCookies(text: string): RawCookieEntry[] | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('[') && !trimmed.startsWith('{')) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+
+  const arr = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === 'object' && Array.isArray((parsed as { cookies?: unknown }).cookies)
+      ? (parsed as { cookies: unknown[] }).cookies
+      : null;
+
+  if (!arr) return null;
+
+  const entries: RawCookieEntry[] = [];
+  for (const item of arr) {
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as Record<string, unknown>;
+    if (typeof rec.name !== 'string' || typeof rec.value !== 'string') continue;
+    const exp = typeof rec.expirationDate === 'number'
+      ? rec.expirationDate
+      : typeof rec.expires === 'number'
+        ? rec.expires
+        : undefined;
+    const rawDomain = typeof rec.domain === 'string' ? rec.domain : undefined;
+    const hostOnly = typeof rec.hostOnly === 'boolean'
+      ? rec.hostOnly
+      : rawDomain !== undefined
+        ? !rawDomain.trim().startsWith('.')
+        : undefined;
+    entries.push({
+      name: rec.name,
+      value: rec.value,
+      domain: rawDomain,
+      hostOnly,
+      secure: typeof rec.secure === 'boolean' ? rec.secure : undefined,
+      expiresSec: exp && exp > 0 ? exp : undefined,
+    });
+  }
+  return entries.length > 0 ? entries : null;
+}
+
+function extractCurlOrigin(text: string): string | undefined {
+  // Collapse explicit shell line continuations before scanning URL tokens
+  const flat = text.replace(/\\\r?\n/g, ' ');
+  // Match first http(s) URL argument (quoted or unquoted), skipping header/cookie values
+  const stripped = flat
+    .replace(/(?:-H|--header)\s+(?:'[^']*'|"[^"]*")/g, ' ')
+    .replace(/(?:-b|--cookie)\s+(?:'[^']*'|"[^"]*")/g, ' ');
+  const urlMatch = stripped.match(/(?:^|\s)['"]?(https?:\/\/[^\s'"]+)['"]?/i);
+  if (!urlMatch?.[1]) return undefined;
+  try {
+    return new URL(urlMatch[1]).origin;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseHeaderPairs(raw: string): { entries: RawCookieEntry[]; rejectedCount: number } {
+  const entries: RawCookieEntry[] = [];
+  let rejectedCount = 0;
+
+  // Header input must not use raw line breaks as cookie separators; strip optional leading `Cookie:` prefix only.
+  const trimmed = raw.trim().replace(/^cookie\s*:\s*/i, '');
+  if (/[\r\n\0]/.test(trimmed)) {
+    return { entries: [], rejectedCount: 1 };
+  }
+
+  for (const part of trimmed.split(';')) {
+    const seg = part.trim();
+    if (!seg) continue;
+    const eq = seg.indexOf('=');
+    if (eq <= 0) {
+      rejectedCount += 1;
+      continue;
+    }
+    const name = seg.slice(0, eq).trim();
+    const value = seg.slice(eq + 1).trim();
+    if (!isValidPair(name, value)) {
+      rejectedCount += 1;
+      continue;
+    }
+    entries.push({ name, value });
+  }
+  return { entries, rejectedCount };
+}
+
+function parseCurl(text: string): { entries: RawCookieEntry[]; rejectedCount: number; sourceOrigin?: string } | null {
+  if (!/(^|\s)curl(\s|$)/i.test(text.trim())) return null;
+  const flat = text.replace(/\\\r?\n/g, ' ');
+  const rawChunks: string[] = [];
+
+  const headerRe = /(?:-H|--header)\s+(?:'([^']*)'|"([^"]*)")/g;
+  for (const match of flat.matchAll(headerRe)) {
+    const content = match[1] ?? match[2] ?? '';
+    if (/^cookie\s*:/i.test(content.trim())) {
+      rawChunks.push(content.replace(/^cookie\s*:/i, '').trim());
     }
   }
-  if (platform === 'hydro') return undefined;
-  return OJ_PLATFORM_META[platform].defaultDomain;
-}
 
-function domainMatches(cookieDomain: string | undefined, targetHost: string | undefined): boolean {
-  if (!targetHost || !cookieDomain) return true;
-  const clean = cookieDomain.replace(/^#HttpOnly_/i, '').replace(/^\./, '').trim().toLowerCase();
-  if (!clean) return true;
-  return targetHost === clean || targetHost.endsWith(`.${clean}`) || clean.endsWith(`.${targetHost}`);
-}
-
-function sanitizeCookieToken(value: string): string {
-  return value.replace(/[\r\n\0]/g, '').trim();
-}
-
-function parseHeaderPairs(raw: string): Map<string, string> {
-  const pairs = new Map<string, string>();
-  const singleLine = raw.replace(/\r?\n/g, '; ').replace(/^\s*cookie\s*:\s*/i, '');
-  for (const part of singleLine.split(';')) {
-    const trimmed = part.trim();
-    const idx = trimmed.indexOf('=');
-    if (idx <= 0) continue;
-    const key = sanitizeCookieToken(trimmed.slice(0, idx));
-    const val = sanitizeCookieToken(trimmed.slice(idx + 1));
-    if (key && /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(key) && val.length > 0) {
-      pairs.set(key, val);
-    }
+  const cookieFlagRe = /(?:-b|--cookie)\s+(?:'([^']*)'|"([^"]*)")/g;
+  for (const match of flat.matchAll(cookieFlagRe)) {
+    const content = match[1] ?? match[2] ?? '';
+    if (content.trim()) rawChunks.push(content.trim());
   }
-  return pairs;
-}
 
-function extractCurlCookieBody(text: string): string | undefined {
-  const joined = text.replace(/\\\r?\n/g, ' ').replace(/\^\r?\n/g, ' ');
-  const patterns = [
-    /(?:-H|--header)\s+['"]\s*cookie\s*:\s*([^'"]+)['"]/gi,
-    /(?:-b|--cookie)\s+['"]([^'"]+)['"]/gi,
-  ];
-  const chunks: string[] = [];
-  for (const re of patterns) {
-    let match: RegExpExecArray | null;
-    while ((match = re.exec(joined)) !== null) {
-      if (match[1]) chunks.push(match[1]);
-    }
-  }
-  return chunks.length ? chunks.join('; ') : undefined;
+  if (!rawChunks.length) return null;
+  const combined = rawChunks.join('; ');
+  const { entries, rejectedCount } = parseHeaderPairs(combined);
+  const sourceOrigin = extractCurlOrigin(text);
+  return { entries, rejectedCount, sourceOrigin };
 }
 
 export function parseOjCookieInput(
-  raw: string,
+  rawInput: string,
   platform: OjPlatformKind,
   baseUrl?: string,
+  nowSec = Math.floor(Date.now() / 1000),
 ): ParsedCookieImport | null {
-  const text = raw.trim();
-  if (!text) return null;
+  const trimmed = rawInput.trim();
+  if (!trimmed) return null;
 
-  const targetHost = resolveTargetHost(platform, baseUrl);
-  const targetDomain = targetHost ?? OJ_PLATFORM_META[platform].defaultDomain;
-  const pairs = new Map<string, string>();
-  const warnings: string[] = [];
-  let filteredOutCount = 0;
-  let format: DetectedCookieFormat = 'header';
+  const target = resolveTargetEndpoint(platform, baseUrl);
+  const meta = OJ_PLATFORM_META[platform];
+  let format: CookieInputFormat = 'header';
+  let entries: RawCookieEntry[] = [];
+  let initialRejected = 0;
+  let originStatus: CookieOriginStatus = 'unknown';
+  let sourceOrigin: string | undefined;
 
-  // 1. Netscape cookies.txt (including #HttpOnly_ lines!)
-  const lines = text.split(/\r?\n/);
-  const looksNetscape =
-    /^#\s*Netscape\s+HTTP\s+Cookie\s+File/im.test(text) ||
-    lines.some(line => /^#HttpOnly_/i.test(line.trim()) || line.split('\t').length >= 7);
-
-  if (looksNetscape) {
+  const netscape = parseNetscape(trimmed);
+  if (netscape) {
     format = 'netscape';
-    const nowSec = Math.floor(Date.now() / 1000);
-    let expiredCount = 0;
-    for (const rawLine of lines) {
-      const trimmed = rawLine.trim();
-      if (!trimmed) continue;
-      const isHttpOnly = /^#HttpOnly_/i.test(trimmed);
-      if (trimmed.startsWith('#') && !isHttpOnly) continue;
-      const normalizedLine = isHttpOnly ? trimmed.replace(/^#HttpOnly_/i, '') : trimmed;
-      const cols = normalizedLine.split('\t');
-      if (cols.length < 7) continue;
-      const [domain, , , , expiresRaw, nameRaw, ...rest] = cols;
-      const name = sanitizeCookieToken(nameRaw ?? '');
-      const value = sanitizeCookieToken(rest.join('\t'));
-      if (!name || !value) continue;
-      if (!domainMatches(domain, targetHost)) {
-        filteredOutCount += 1;
-        continue;
-      }
-      const expires = Number(expiresRaw);
-      if (Number.isFinite(expires) && expires > 0 && expires < nowSec) {
-        expiredCount += 1;
-        continue;
-      }
-      pairs.set(name, value);
-    }
-    if (expiredCount > 0) {
-      warnings.push(`已跳过 ${expiredCount} 个已过期的 Cookie`);
-    }
-  } else if (/^\s*curl\b/i.test(text)) {
-    format = 'curl';
-    const extracted = extractCurlCookieBody(text);
-    if (!extracted) {
-      warnings.push('未在 cURL 命令中找到 -H "Cookie: ..." 或 -b 参数');
-    } else {
-      for (const [k, v] of parseHeaderPairs(extracted)) pairs.set(k, v);
-    }
-  } else if (text.startsWith('[') || text.startsWith('{')) {
-    let parsedJson: unknown;
-    try {
-      parsedJson = JSON.parse(text);
-    } catch {
-      parsedJson = undefined;
-    }
-    const items = Array.isArray(parsedJson)
-      ? parsedJson
-      : parsedJson && typeof parsedJson === 'object' && Array.isArray((parsedJson as { cookies?: unknown }).cookies)
-        ? (parsedJson as { cookies: unknown[] }).cookies
-        : undefined;
-    if (items) {
+    entries = netscape;
+    originStatus = 'matched';
+  } else {
+    const json = parseJsonCookies(trimmed);
+    if (json) {
       format = 'json';
-      const nowSec = Math.floor(Date.now() / 1000);
-      let expiredCount = 0;
-      for (const item of items) {
-        if (!item || typeof item !== 'object') continue;
-        const record = item as { name?: unknown; value?: unknown; domain?: unknown; expirationDate?: unknown; expires?: unknown };
-        if (typeof record.name !== 'string' || typeof record.value !== 'string') continue;
-        const name = sanitizeCookieToken(record.name);
-        const value = sanitizeCookieToken(record.value);
-        if (!name || !value) continue;
-        if (typeof record.domain === 'string' && !domainMatches(record.domain, targetHost)) {
-          filteredOutCount += 1;
-          continue;
-        }
-        const exp = typeof record.expirationDate === 'number' ? record.expirationDate : typeof record.expires === 'number' ? record.expires : undefined;
-        if (exp !== undefined && exp > 0 && exp < nowSec) {
-          expiredCount += 1;
-          continue;
-        }
-        pairs.set(name, value);
-      }
-      if (expiredCount > 0) {
-        warnings.push(`已跳过 ${expiredCount} 个已过期的 Cookie`);
-      }
+      entries = json;
+      originStatus = entries.some(e => Boolean(e.domain)) ? 'matched' : 'unknown';
     } else {
-      for (const [k, v] of parseHeaderPairs(text)) pairs.set(k, v);
+      const curl = parseCurl(trimmed);
+      if (curl) {
+        format = 'curl';
+        entries = curl.entries;
+        initialRejected = curl.rejectedCount;
+        sourceOrigin = curl.sourceOrigin;
+        if (sourceOrigin) {
+          originStatus = sourceOrigin.toLowerCase() === target.origin.toLowerCase() ? 'matched' : 'mismatched';
+        } else {
+          originStatus = 'unknown';
+        }
+      } else {
+        format = 'header';
+        const headerParsed = parseHeaderPairs(trimmed);
+        entries = headerParsed.entries;
+        initialRejected = headerParsed.rejectedCount;
+        originStatus = 'unknown';
+      }
+    }
+  }
+
+  const warnings: string[] = [];
+
+  if (originStatus === 'mismatched' && sourceOrigin) {
+    warnings.push(`cURL 请求来源为 ${sourceOrigin}，与当前目标站点 ${target.origin} 不一致，已阻止导入以防凭据发送到错误站点。`);
+    return {
+      format,
+      formatLabel: FORMAT_LABELS[format],
+      normalizedHeader: '',
+      keys: [],
+      targetDomain: target.host,
+      targetOrigin: target.origin,
+      originStatus: 'mismatched',
+      sourceOrigin,
+      filteredOutCount: entries.length,
+      expiredCount: 0,
+      secureFilteredCount: 0,
+      rejectedCount: initialRejected,
+      missingRecommendedKeys: meta.recommendedCookieKeys,
+      warnings,
+    };
+  }
+
+  let filteredOutCount = 0;
+  let expiredCount = 0;
+  let secureFilteredCount = 0;
+  let rejectedCount = initialRejected;
+  const deduped = new Map<string, string>();
+
+  for (const entry of entries) {
+    if (!isValidPair(entry.name, entry.value)) {
+      rejectedCount += 1;
+      continue;
+    }
+    if (entry.domain && !domainMatches(entry.domain, entry.hostOnly, target.host)) {
+      filteredOutCount += 1;
+      continue;
+    }
+    if (entry.secure && target.protocol !== 'https:') {
+      secureFilteredCount += 1;
+      continue;
+    }
+    if (entry.expiresSec && entry.expiresSec < nowSec) {
+      expiredCount += 1;
+      continue;
+    }
+    deduped.set(entry.name, entry.value);
+  }
+
+  const keys = [...deduped.keys()];
+  const normalizedHeader = [...deduped.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+
+  const keyLowerSet = new Set(keys.map(k => k.toLowerCase()));
+  const missingRecommendedKeys = meta.recommendedCookieKeys.filter(
+    req => !keyLowerSet.has(req.toLowerCase()),
+  );
+
+  if (keys.length === 0) {
+    if (filteredOutCount > 0) {
+      warnings.push(`未找到匹配 ${target.host} 的 Cookie（已过滤 ${filteredOutCount} 个其他域名或子域专用条目）。`);
+    } else if (secureFilteredCount > 0) {
+      warnings.push(`有 ${secureFilteredCount} 个 Secure Cookie 无法发送到非 HTTPS 目标 ${target.origin}。`);
+    } else if (expiredCount > 0) {
+      warnings.push(`解析到的 ${expiredCount} 个 Cookie 均已过期，请重新登录浏览器后导出。`);
+    } else if (rejectedCount > 0) {
+      warnings.push('输入包含非法 Cookie 键名、换行符或控制字符，请粘贴单行 Cookie 请求头、cookies.txt、cURL 或 JSON 导出。');
+    } else {
+      warnings.push('未能解析出有效的 Cookie 键值对。');
     }
   } else {
-    for (const [k, v] of parseHeaderPairs(text)) pairs.set(k, v);
+    if (expiredCount > 0) {
+      warnings.push(`已跳过 ${expiredCount} 个已过期条目。`);
+    }
+    if (secureFilteredCount > 0) {
+      warnings.push(`已跳过 ${secureFilteredCount} 个仅限 HTTPS 的 Secure Cookie。`);
+    }
+    if (rejectedCount > 0) {
+      warnings.push(`已忽略 ${rejectedCount} 个格式非法的 Cookie 项。`);
+    }
   }
-
-  const keys = [...pairs.keys()];
-  const lowerKeys = new Set(keys.map(k => k.toLowerCase()));
-  const missingRecommendedKeys = OJ_PLATFORM_META[platform].recommendedKeys.filter(
-    req => !lowerKeys.has(req.toLowerCase()),
-  );
-  if (keys.length === 0) {
-    warnings.push(
-      filteredOutCount > 0
-        ? `文件中包含 ${filteredOutCount} 个其他域名的 Cookie，但未匹配到 ${targetDomain}`
-        : '未能解析出有效的 key=value Cookie 项，请检查粘贴内容',
-    );
-  }
-
-  const normalizedHeader = [...pairs].map(([k, v]) => `${k}=${v}`).join('; ');
 
   return {
     format,
-    formatLabel: COOKIE_FORMAT_LABELS[format],
-    targetDomain,
+    formatLabel: FORMAT_LABELS[format],
     normalizedHeader,
     keys,
+    targetDomain: target.host,
+    targetOrigin: target.origin,
+    originStatus,
+    sourceOrigin,
     filteredOutCount,
+    expiredCount,
+    secureFilteredCount,
+    rejectedCount,
     missingRecommendedKeys,
     warnings,
   };

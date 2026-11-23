@@ -87,7 +87,9 @@ function AgentManifestForm({ capabilities, initial, onSaved }: { capabilities: S
   const [harnessTab, setHarnessTab] = useState<'guided' | 'native' | 'preview'>('guided');
   const navigate = useNavigate();
   const intent = useRef<'save' | 'batch'>('save');
-  const [preview, setPreview] = useState<{ content: string; format: ConfigFormat; revision?: string }>();
+  const previewGenRef = useRef(0);
+  const [previewState, setPreviewState] = useState<{ signature: string; content: string; format: ConfigFormat; revision?: string }>();
+  const [harnessError, setHarnessError] = useState<string>();
   const source = initial?.document as AgentDocument | undefined;
   const sourceHarness = source?.harness && typeof source.harness === 'object' ? source.harness : undefined;
   const initialHarness = capabilities.harnesses.find(item => item.id === sourceHarness?.kind) ?? capabilities.harnesses[0]!;
@@ -130,12 +132,15 @@ function AgentManifestForm({ capabilities, initial, onSaved }: { capabilities: S
         ...(nativeOverride ? { native_config: nativeOverride } : {}) },
     };
   }, [capabilities, values, harness, sourceHarness, sameHarness, hasExternalNative, removeNative]);
+  const documentSignature = useMemo(() => JSON.stringify(document), [document]);
+  const activePreview = previewState?.signature === documentSignature ? previewState : undefined;
   if (!harness) return <Note>未找到所选 Harness 的能力描述。</Note>;
   const changeHarness = (id: string) => {
     const next = capabilities.harnesses.find(item => item.id === id);
-    setValue('harness', id); setValue('harnessOptions', defaultsFor(next?.fields ?? [])); setRemoveNative(false); setPreview(undefined);
+    setValue('harness', id); setValue('harnessOptions', defaultsFor(next?.fields ?? [])); setRemoveNative(false); setPreviewState(undefined); setHarnessError(undefined);
   };
   const submit = handleSubmit(async form => {
+    setHarnessError(undefined);
     try {
       if (capabilities.features.connections && form.connection === 'default') { setError('connection', { message: '请选择已保存的 Provider' }); return; }
       const result = initial ? await studioApi.updateAgent(initial.path, initial.format, document)
@@ -154,8 +159,18 @@ function AgentManifestForm({ capabilities, initial, onSaved }: { capabilities: S
           id: 'id', name: 'name', model: 'model', vendor: 'vendor', provider: 'connection', connection: 'connection', speed_tier: 'speedTier',
         };
         for (const issue of error.issues) {
-          const target = fieldMap[issue.path[0] ?? ''];
-          if (target) setError(target, { message: issue.message });
+          const pathStr = issue.path.join('.');
+          const leaf = issue.path[0] === 'document' ? issue.path[1] : issue.path[0];
+          const target = leaf ? fieldMap[leaf] : undefined;
+          if (target) {
+            setError(target, { message: issue.message });
+          } else if (pathStr.includes('native_config')) {
+            setError('nativeConfig', { message: issue.message });
+            setHarnessTab('native');
+          } else if (pathStr.includes('harness')) {
+            setHarnessError(issue.message);
+            setHarnessTab('guided');
+          }
         }
       }
       toast.error('无法保存 Agent', { description: (error as Error).message });
@@ -170,19 +185,20 @@ function AgentManifestForm({ capabilities, initial, onSaved }: { capabilities: S
   return <form onSubmit={submit} className="space-y-8">
     <section><SectionIndex index="01" title="身份与模型" description="Agent ID 标识具体配置；厂商仅用于筛选与比较，不改变 API 行为。" />
       <div className="grid gap-5 sm:grid-cols-2"><Field label="Agent ID" error={errors.id?.message}><Input placeholder="codex-gpt53-high" disabled={!!initial} {...register('id')} /></Field>
-        <Field label="展示名称" hint="可选，不改变 Revision"><Input placeholder="GPT · High · Fast" {...register('name')} /></Field></div>
-      <div className="mt-5 grid gap-5 sm:grid-cols-2"><Field label="模型厂商" hint={capabilities.features.agent_vendor ? '研究元数据' : '等待后端契约'}><Controller control={control} name="vendor" render={({ field }) => <Select value={field.value} onValueChange={field.onChange} disabled={!capabilities.features.agent_vendor}>
-          <SelectItem value="unspecified">{capabilities.features.agent_vendor ? '未指定' : '当前后端暂不支持'}</SelectItem>{vendors.map(([value, label]) => <SelectItem key={value} value={value}>{label}</SelectItem>)}</Select>} /></Field><Field label="速度档位" hint="计入成绩披露与 Revision"><Controller control={control} name="speedTier" render={({ field }) => <Select value={field.value} onValueChange={field.onChange}><SelectItem value="standard">Standard</SelectItem><SelectItem value="fast">Fast</SelectItem><SelectItem value="ultrafast">Ultrafast</SelectItem></Select>} /></Field></div>
+        <Field label="展示名称" hint="可选，不改变 Revision" error={errors.name?.message}><Input placeholder="GPT · High · Fast" {...register('name')} /></Field></div>
+      <div className="mt-5 grid gap-5 sm:grid-cols-2"><Field label="模型厂商" hint={capabilities.features.agent_vendor ? '研究元数据' : '等待后端契约'} error={errors.vendor?.message}><Controller control={control} name="vendor" render={({ field }) => <Select value={field.value} onValueChange={field.onChange} disabled={!capabilities.features.agent_vendor}>
+          <SelectItem value="unspecified">{capabilities.features.agent_vendor ? '未指定' : '当前后端暂不支持'}</SelectItem>{vendors.map(([value, label]) => <SelectItem key={value} value={value}>{label}</SelectItem>)}</Select>} /></Field><Field label="速度档位" hint="计入成绩披露与 Revision" error={errors.speedTier?.message}><Controller control={control} name="speedTier" render={({ field }) => <Select value={field.value} onValueChange={field.onChange}><SelectItem value="standard">Standard</SelectItem><SelectItem value="fast">Fast</SelectItem><SelectItem value="ultrafast">Ultrafast</SelectItem></Select>} /></Field></div>
       <div className="mt-5"><Field label="模型标识" hint="上游精确 ID" error={errors.model?.message}><Input className="font-mono text-xs" placeholder="model-id-or-snapshot" {...register('model')} /></Field></div>
     </section><Separator />
     <section><SectionIndex index="02" title="Provider" description="Provider 描述实际上游协议和凭据；模型厂商与 API 提供方可以不同。" />
       <Controller control={control} name="connection" render={({ field }) => <ConnectionField capabilities={capabilities} value={field.value} onChange={field.onChange} register={register} error={errors.connection?.message} />} />
     </section><Separator />
     <section><SectionIndex index="03" title="Harness" description="可配置项由适配器声明，原始覆盖与最终配置严格分离。" />
-      <div className="mb-5"><Field label="Harness"><Controller control={control} name="harness" render={({ field }) => <Select value={field.value} onValueChange={changeHarness}>
+      <div className="mb-5"><Field label="Harness" error={harnessError}><Controller control={control} name="harness" render={({ field }) => <Select value={field.value} onValueChange={changeHarness}>
         {capabilities.harnesses.map(item => <SelectItem key={item.id} value={item.id}>{item.label} · {item.version}</SelectItem>)}</Select>} /></Field></div>
       <SegmentedTabs
         id={`agent-harness-${initial?.path ?? 'new'}`}
+        panelIdPrefix={`agent-harness-panel-${initial?.path ?? 'new'}`}
         size="sm"
         value={harnessTab}
         onValueChange={setHarnessTab}
@@ -193,20 +209,34 @@ function AgentManifestForm({ capabilities, initial, onSaved }: { capabilities: S
         ]}
       />
       <div className="pt-5">
-        <AnimatedPanel panelKey={harnessTab}>
+        <AnimatedPanel
+          panelKey={harnessTab}
+          role="tabpanel"
+          id={`agent-harness-panel-${initial?.path ?? 'new'}-${harnessTab}`}
+          ariaLabelledBy={`agent-harness-${initial?.path ?? 'new'}-tab-${harnessTab}`}
+        >
           {harnessTab === 'guided' && <>
             <div className="grid gap-5 sm:grid-cols-2">{harness.fields.map(renderHarnessField)}</div>
             {!harness.fields.length && <p className="text-xs text-muted-foreground">此 Harness 没有额外的结构化参数。</p>}
           </>}
           {harnessTab === 'native' && (capabilities.features.native_overrides && harness.supports_overrides ? <div className="space-y-3">
             {hasExternalNative && !values.nativeConfig.trim() && !removeNative && <div className="border-l-2 border-primary/35 bg-muted/25 px-3 py-2 text-xs text-muted-foreground">已保留外部原生覆盖文件：<span className="font-mono">{sourceHarness?.native_config?.path}</span>{sourceHarness?.native_config?.sha256 ? <span className="ml-2 font-mono text-[10px]">sha256:{sourceHarness.native_config.sha256.slice(0, 12)}…</span> : null}</div>}
-            <Field label={`${formatLabel(harness.native_format)} 参数覆盖`} hint="不能覆盖 runner 安全字段">
-            <Textarea className="min-h-44" value={values.nativeConfig} onChange={event => { setValue('nativeConfig', event.target.value); setRemoveNative(false); setPreview(undefined); }} placeholder="# 输入 Harness 原生配置覆盖" /></Field>
-            {hasExternalNative && <label className="flex items-center gap-2 text-xs text-muted-foreground"><input type="checkbox" checked={removeNative} onChange={event => { setRemoveNative(event.target.checked); setPreview(undefined); }} />移除已绑定的外部原生覆盖文件</label>}
+            <Field label={`${formatLabel(harness.native_format)} 参数覆盖`} hint="不能覆盖 runner 安全字段" error={errors.nativeConfig?.message}>
+            <Textarea className="min-h-44" value={values.nativeConfig} onChange={event => { setValue('nativeConfig', event.target.value); setRemoveNative(false); setPreviewState(undefined); }} placeholder="# 输入 Harness 原生配置覆盖" /></Field>
+            {hasExternalNative && <label className="flex items-center gap-2 text-xs text-muted-foreground"><input type="checkbox" checked={removeNative} onChange={event => { setRemoveNative(event.target.checked); setPreviewState(undefined); }} />移除已绑定的外部原生覆盖文件</label>}
           </div> : <Note>当前后端尚未开放原生配置覆盖。新契约启用后，此处将接受 {formatLabel(harness.native_format)} patch，并由服务端校验。</Note>)}
           {harnessTab === 'preview' && (capabilities.features.native_overrides ? <div className="space-y-3"><Button type="button" variant="secondary" size="sm" onClick={async () => {
-            try { setPreview(await studioApi.previewAgent(document, initial?.path)); } catch (error) { toast.error('预览失败', { description: (error as Error).message }); }
-          }}><Braces className="size-3.5" />生成脱敏预览</Button>{preview && <pre className="max-h-96 overflow-auto border bg-[#141516] p-4 font-mono text-xs leading-6 text-[#e7e7e3]">{preview.content}</pre>}</div>
+            const gen = ++previewGenRef.current;
+            const sig = documentSignature;
+            try {
+              const res = await studioApi.previewAgent(document, initial?.path);
+              if (previewGenRef.current === gen) {
+                setPreviewState({ signature: sig, ...res });
+              }
+            } catch (error) {
+              if (previewGenRef.current === gen) toast.error('预览失败', { description: (error as Error).message });
+            }
+          }}><Braces className="size-3.5" />生成脱敏预览</Button>{activePreview ? <pre className="max-h-96 overflow-auto border bg-[#141516] p-4 font-mono text-xs leading-6 text-[#e7e7e3]">{activePreview.content}</pre> : previewState && <p className="text-xs text-muted-foreground">表单已修改，请重新生成脱敏预览。</p>}</div>
             : <Note>Effective Config 需要由 runner 合并并脱敏，前端不会伪造最终配置。</Note>)}
         </AnimatedPanel>
       </div>

@@ -1,7 +1,7 @@
-import { useMemo, useRef, useState } from 'react';
-import { AlertTriangle, CheckCircle2, FileUp, HelpCircle, Trash2 } from 'lucide-react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { AlertTriangle, CheckCircle2, FileUp, HelpCircle, Lock, RefreshCw, Trash2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { parseOjCookieInput, type OjPlatformKind, type ParsedCookieImport } from '@/lib/cookie-parser';
+import { parseOjCookieInput, type OjPlatformKind } from '@/lib/cookie-parser';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/fields';
 
@@ -10,43 +10,86 @@ export interface CookieImporterProps {
   platform: OjPlatformKind;
   baseUrl?: string;
   rawValue: string;
-  onChange: (raw: string, parsed: ParsedCookieImport | null) => void;
+  onRawChange: (raw: string) => void;
 }
 
 /**
  * Multi-format write-only OJ Cookie importer.
- * Parses Netscape cookies.txt, cURL commands, Cookie-Editor JSON, and raw Cookie headers locally.
- * Never echoes cookie values in diagnostics; only displays key names and format/domain checks.
+ * - Derives parsed diagnostics strictly from current (rawValue, platform, baseUrl) props.
+ * - Discards stale async file reads on Clear, paste, or destination changes.
+ * - Consumes pasted/imported cookies into a masked write-only card so raw credentials
+ *   are not visibly displayed in the dialog.
  */
 export function CookieImporter({
   label = '登录 Cookie（只写不读）',
   platform,
   baseUrl,
   rawValue,
-  onChange,
+  onRawChange,
 }: CookieImporterProps) {
+  const inputId = useId();
   const fileRef = useRef<HTMLInputElement>(null);
+  const readGenRef = useRef(0);
   const [dragging, setDragging] = useState(false);
   const [showGuide, setShowGuide] = useState(false);
-  const parsed = useMemo(() => parseOjCookieInput(rawValue, platform, baseUrl), [rawValue, platform, baseUrl]);
+  const [sealed, setSealed] = useState(false);
 
-  const applyRaw = (nextRaw: string) => {
-    onChange(nextRaw, parseOjCookieInput(nextRaw, platform, baseUrl));
+  const parsed = useMemo(
+    () => parseOjCookieInput(rawValue, platform, baseUrl),
+    [rawValue, platform, baseUrl],
+  );
+
+  // Invalidate any in-flight file read when destination changes, and unseal if cleared.
+  useEffect(() => {
+    readGenRef.current += 1;
+  }, [platform, baseUrl]);
+
+  useEffect(() => {
+    if (!rawValue) setSealed(false);
+  }, [rawValue]);
+
+  const clearInput = () => {
+    readGenRef.current += 1;
+    setSealed(false);
+    onRawChange('');
+  };
+
+  const applyRaw = (nextRaw: string, shouldSealIfValid: boolean) => {
+    readGenRef.current += 1;
+    onRawChange(nextRaw);
+    if (!nextRaw.trim()) {
+      setSealed(false);
+      return;
+    }
+    if (shouldSealIfValid) {
+      const candidate = parseOjCookieInput(nextRaw, platform, baseUrl);
+      if (candidate?.normalizedHeader) setSealed(true);
+    }
   };
 
   const readFile = async (file?: File) => {
     if (!file) return;
     if (file.size > 512 * 1024) return;
+    const gen = ++readGenRef.current;
     const text = await file.text();
-    applyRaw(text);
+    if (readGenRef.current !== gen) return;
+    onRawChange(text);
+    const candidate = parseOjCookieInput(text, platform, baseUrl);
+    setSealed(Boolean(candidate?.normalizedHeader));
   };
 
-  const healthy = Boolean(parsed && parsed.keys.length > 0 && parsed.missingRecommendedKeys.length === 0);
+  const healthy = Boolean(
+    parsed &&
+    parsed.keys.length > 0 &&
+    parsed.originStatus !== 'mismatched' &&
+    parsed.missingRecommendedKeys.length === 0,
+  );
+  const isMaskedLoaded = sealed && Boolean(parsed?.normalizedHeader);
 
   return (
     <div className="space-y-2.5">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <label htmlFor="oj-cookie-importer-input" className="text-sm font-medium">
+        <label htmlFor={inputId} className="text-sm font-medium">
           {label}
         </label>
         <div className="flex items-center gap-1.5">
@@ -64,7 +107,7 @@ export function CookieImporter({
             <FileUp className="size-3.5" />导入文件
           </Button>
           {rawValue && (
-            <Button type="button" variant="ghost" size="sm" onClick={() => applyRaw('')}>
+            <Button type="button" variant="ghost" size="sm" onClick={clearInput}>
               <Trash2 className="size-3.5" />清空
             </Button>
           )}
@@ -74,30 +117,62 @@ export function CookieImporter({
         </div>
       </div>
 
-      <div
-        onDragOver={event => { event.preventDefault(); setDragging(true); }}
-        onDragLeave={() => setDragging(false)}
-        onDrop={event => {
-          event.preventDefault();
-          setDragging(false);
-          void readFile(event.dataTransfer.files[0]);
-        }}
-        className={cn('rounded-[3px] transition-colors', dragging && 'ring-2 ring-primary/50')}
-      >
-        <Textarea
-          id="oj-cookie-importer-input"
-          aria-label={label}
-          autoComplete="off"
-          spellCheck={false}
-          data-1p-ignore="true"
-          data-lpignore="true"
-          data-bwignore="true"
-          value={rawValue}
-          onChange={event => applyRaw(event.target.value)}
-          className="min-h-24 font-mono text-xs leading-5"
-          placeholder="直接粘贴或拖入 cookies.txt (Netscape)、DevTools Copy as cURL、Cookie-Editor JSON，或标准 Cookie 请求头 (key=value; ...)"
-        />
-      </div>
+      {isMaskedLoaded ? (
+        <div
+          onDragOver={event => { event.preventDefault(); setDragging(true); }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={event => {
+            event.preventDefault();
+            setDragging(false);
+            void readFile(event.dataTransfer.files[0]);
+          }}
+          className={cn(
+            'flex items-center justify-between gap-3 rounded-[3px] border border-primary/30 bg-muted/25 px-3.5 py-3 text-xs',
+            dragging && 'ring-2 ring-primary/50',
+          )}
+        >
+          <div className="flex items-center gap-2 text-foreground">
+            <Lock className="size-3.5 shrink-0 text-primary" />
+            <span>已暂存脱敏 Cookie（原文已隐藏，保存后写入本机只写凭据库）</span>
+          </div>
+          <Button type="button" variant="ghost" size="sm" onClick={clearInput}>
+            <RefreshCw className="size-3.5" />重新粘贴
+          </Button>
+        </div>
+      ) : (
+        <div
+          onDragOver={event => { event.preventDefault(); setDragging(true); }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={event => {
+            event.preventDefault();
+            setDragging(false);
+            void readFile(event.dataTransfer.files[0]);
+          }}
+          className={cn('rounded-[3px] transition-colors', dragging && 'ring-2 ring-primary/50')}
+        >
+          <Textarea
+            id={inputId}
+            aria-label={label}
+            autoComplete="off"
+            spellCheck={false}
+            data-1p-ignore="true"
+            data-lpignore="true"
+            data-bwignore="true"
+            value={rawValue}
+            style={{ WebkitTextSecurity: 'disc' } as React.CSSProperties}
+            onChange={event => {
+              const next = event.target.value;
+              const bulkInsert = next.length - rawValue.length >= 4;
+              applyRaw(next, bulkInsert);
+            }}
+            onBlur={() => {
+              if (parsed?.normalizedHeader) setSealed(true);
+            }}
+            className="min-h-24 font-mono text-xs leading-5"
+            placeholder="直接粘贴或拖入 cookies.txt (Netscape)、DevTools Copy as cURL、Cookie-Editor JSON，或单行 Cookie 请求头 (key=value; ...)"
+          />
+        </div>
+      )}
 
       {parsed ? (
         <div
@@ -119,8 +194,18 @@ export function CookieImporter({
                 <span className="font-medium">已识别：{parsed.formatLabel}</span>
                 <span className="mx-1.5 text-muted-foreground">·</span>
                 <span className="text-muted-foreground">
-                  匹配 <span className="font-mono">{parsed.targetDomain}</span> 共 {parsed.keys.length} 个键
-                  {parsed.filteredOutCount > 0 ? `（已自动过滤 ${parsed.filteredOutCount} 个无关域名键）` : ''}
+                  {parsed.originStatus === 'matched' ? (
+                    <>
+                      匹配 <span className="font-mono">{parsed.targetDomain}</span> 共 {parsed.keys.length} 个键
+                      {parsed.filteredOutCount > 0 ? `（已自动过滤 ${parsed.filteredOutCount} 个无关域名键）` : ''}
+                    </>
+                  ) : parsed.originStatus === 'mismatched' ? (
+                    <>来源域 <span className="font-mono">{parsed.sourceOrigin}</span> 与目标 <span className="font-mono">{parsed.targetOrigin}</span> 不一致</>
+                  ) : (
+                    <>
+                      共 {parsed.keys.length} 个键（无来源域元数据，将发送至 <span className="font-mono">{parsed.targetOrigin}</span>）
+                    </>
+                  )}
                 </span>
               </div>
               {parsed.keys.length > 0 && (
@@ -138,7 +223,7 @@ export function CookieImporter({
                   )}
                 </div>
               )}
-              {parsed.missingRecommendedKeys.length > 0 && (
+              {parsed.missingRecommendedKeys.length > 0 && parsed.originStatus !== 'mismatched' && (
                 <p className="text-warning">
                   提示：未检测到常见登录会话键 <span className="font-mono">{parsed.missingRecommendedKeys.join(', ')}</span>，提交时可能提示未登录。
                 </p>
@@ -151,7 +236,7 @@ export function CookieImporter({
         </div>
       ) : (
         <p className="text-[11px] leading-5 text-muted-foreground">
-          本地实时解析并规范化为标准 Cookie 请求头后写入本机凭据库，保存后不可查看，也不会写入日志或 Manifest。
+          本地实时解析并规范化为标准 Cookie 请求头；粘贴后自动隐藏明文，仅写入本机只写凭据库。
         </p>
       )}
 
@@ -161,7 +246,7 @@ export function CookieImporter({
           <ol className="list-decimal space-y-1 pl-4">
             <li>使用浏览器插件导出当前站点的 <span className="font-mono">cookies.txt</span>（Netscape 格式）或 JSON，直接拖入/粘贴到上方。</li>
             <li>或在已登录页面按 <span className="font-mono">F12 → Network</span>，右键任意本站请求选择 <span className="font-mono">Copy as cURL</span> 直接粘贴。</li>
-            <li>亦可直接复制请求头中的 <span className="font-mono">Cookie: ...</span> 字段值。</li>
+            <li>亦可直接复制请求头中的单行 <span className="font-mono">Cookie: ...</span> 字段值。</li>
           </ol>
         </div>
       )}

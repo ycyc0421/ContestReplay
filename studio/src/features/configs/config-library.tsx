@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
-import { Bot, Copy, FileCheck2, Pencil, Plus, Search, Sparkles, Trash2 } from 'lucide-react';
+import { AlertTriangle, Bot, Copy, FileCheck2, Pencil, Plus, Search, Sparkles, Trash2 } from 'lucide-react';
 import { toast } from 'sonner';
 import type { AgentVariantsResponse, CatalogAgent } from '@studio-api';
 import { studioApi } from '@/lib/api';
@@ -294,6 +294,7 @@ export function ConfigLibrary({
       <div className="flex flex-col gap-3 border-b bg-muted/20 p-4 sm:flex-row sm:items-center sm:justify-between">
         <SegmentedTabs
           id="config-library"
+          panelIdPrefix="config-library-panel"
           ariaLabel="配置库分类"
           value={activeTab}
           onValueChange={onTabChange}
@@ -314,10 +315,17 @@ export function ConfigLibrary({
         </label>
       </div>
 
-      <AnimatedPanel panelKey={activeTab}>
+      <AnimatedPanel panelKey={activeTab} role="tabpanel" id={`config-library-panel-${activeTab}`} ariaLabelledBy={`config-library-tab-${activeTab}`}>
         {activeTab === 'agents' ? (
           agents.isLoading ? (
             <div className="space-y-2 p-4">{[1, 2, 3].map(i => <div key={i} className="skeleton h-16 rounded-[3px] border bg-muted/30" />)}</div>
+          ) : agents.isError ? (
+            <EmptyState
+              icon={AlertTriangle}
+              title="无法读取 Agent 配置列表"
+              description={(agents.error as Error)?.message ?? '目录请求失败'}
+              action={<Button variant="secondary" onClick={() => void agents.refetch()}>重试</Button>}
+            />
           ) : filteredAgents.length === 0 ? (
             <EmptyState
               icon={Bot}
@@ -387,6 +395,13 @@ export function ConfigLibrary({
         ) : (
           contests.isLoading ? (
             <div className="space-y-2 p-4">{[1, 2, 3].map(i => <div key={i} className="skeleton h-16 rounded-[3px] border bg-muted/30" />)}</div>
+          ) : contests.isError ? (
+            <EmptyState
+              icon={AlertTriangle}
+              title="无法读取 Contest 配置列表"
+              description={(contests.error as Error)?.message ?? '目录请求失败'}
+              action={<Button variant="secondary" onClick={() => void contests.refetch()}>重试</Button>}
+            />
           ) : filteredContests.length === 0 ? (
             <EmptyState
               icon={FileCheck2}

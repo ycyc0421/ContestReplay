@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react';
 import { ChevronDown } from 'lucide-react';
-import { AnimatePresence, motion } from 'motion/react';
+import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { cn } from '@/lib/utils';
 import { PANEL_TRANSITION } from './motion';
 
@@ -18,6 +18,7 @@ export function CollapsibleSection({
   className?: string;
 }) {
   const [open, setOpen] = useState(defaultOpen);
+  const reduced = useReducedMotion();
   return (
     <div className={cn('rounded-[3px] border bg-muted/20', className)}>
       <button
@@ -34,19 +35,23 @@ export function CollapsibleSection({
         </span>
         <ChevronDown className={cn('size-4 shrink-0 transition-transform duration-150', open && 'rotate-180')} />
       </button>
-      <AnimatePresence initial={false}>
-        {open && (
-          <motion.div
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: 'auto', opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={PANEL_TRANSITION}
-            className="overflow-hidden"
-          >
-            <div className="border-t px-4 py-4">{children}</div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {reduced ? (
+        open ? <div className="border-t px-4 py-4">{children}</div> : null
+      ) : (
+        <AnimatePresence initial={false}>
+          {open && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              transition={PANEL_TRANSITION}
+              className="overflow-hidden"
+            >
+              <div className="border-t px-4 py-4">{children}</div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      )}
     </div>
   );
 }

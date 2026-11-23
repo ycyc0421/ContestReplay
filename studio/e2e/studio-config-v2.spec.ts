@@ -438,16 +438,29 @@ test('creates OJ account with multi-format Cookie Importer + session probe and P
   await page.goto('/providers');
   await page.getByRole('tab', { name: 'OJ 账号池' }).click();
   await page.getByRole('button', { name: '登记第一个账号' }).click();
-  // Paste Netscape cookies.txt format into CookieImporter
+  // Switching from Hydro with custom URL to Codeforces clears destination-bound URL/cookie/handle
+  await page.getByRole('button', { name: /Hydro/ }).click();
+  await page.getByLabel(/Hydro 站点地址/).fill('https://hydro.example.com');
+  await page.getByRole('button', { name: /Codeforces/ }).click();
+  await expect(page.getByText('目标站点：https://codeforces.com')).toBeVisible();
+
+  // Paste Netscape cookies.txt format into CookieImporter -> immediately masked in DOM (never echoed in cleartext)
   const netscapeCookies = [
     '# Netscape HTTP Cookie File',
     '#HttpOnly_.codeforces.com\tTRUE\t/\tTRUE\t2147483647\tJSESSIONID\toj-cookie-secret',
     '.codeforces.com\tTRUE\t/\tFALSE\t2147483647\t39ce7\txyz',
   ].join('\n');
   await page.getByLabel(/登录 Cookie/).fill(netscapeCookies);
+  await expect(page.getByText(/已暂存脱敏 Cookie/)).toBeVisible();
   await expect(page.getByText('JSESSIONID=•••')).toBeVisible();
   await expect(page.getByText('39ce7=•••')).toBeVisible();
+  await expect(page.locator('body')).not.toContainText('oj-cookie-secret');
+
+  // If user already typed a conflicting handle, probe asks for confirmation rather than silently overwriting
+  await page.getByLabel(/Codeforces 用户名/).fill('manual_handle');
   await page.getByRole('button', { name: '验证并识别用户名' }).click();
+  await expect(page.getByLabel(/Codeforces 用户名/)).toHaveValue('manual_handle');
+  await page.getByRole('button', { name: '采用探测用户名' }).click();
   await expect(page.getByLabel(/Codeforces 用户名/)).toHaveValue('cf_handle');
   await page.getByRole('button', { name: '创建账号' }).click();
   await expect(page.getByText('Codeforces · cf_handle', { exact: true })).toBeVisible();
@@ -484,6 +497,7 @@ test('does not leak cancelled rotation secrets across OJ accounts or Push Target
   await page.getByRole('button', { name: '轮换 OJ 账号 CF A', exact: true }).click();
   await page.getByLabel('新 Cookie / Session', { exact: true }).fill('JSESSIONID=secret-for-cf-a');
   await expect(page.getByText('JSESSIONID=•••')).toBeVisible();
+  await expect(page.locator('body')).not.toContainText('secret-for-cf-a');
   await page.getByRole('button', { name: '取消', exact: true }).click();
   await page.getByRole('button', { name: '轮换 OJ 账号 CF B', exact: true }).click();
   await expect(page.getByText('JSESSIONID=•••')).toHaveCount(0);
@@ -545,10 +559,16 @@ test('Studio V3 layout invariants: all 5 routes render cleanly without overflow 
   await page.keyboard.press('Escape');
   await expect(drawer).toHaveCount(0);
 
-  // Dark mode toggle applies cleanly without errors
+  // Dark mode toggle + WAI-ARIA keyboard navigation on SegmentedTabs
   await page.getByRole('button', { name: '切换深色主题' }).click();
   await expect(page.locator('html')).toHaveClass(/dark/);
   await page.goto('/connections?tab=oj');
-  await expect(page.getByRole('tab', { name: 'OJ 账号池', selected: true })).toBeVisible();
+  const ojTab = page.getByRole('tab', { name: 'OJ 账号池', selected: true });
+  await expect(ojTab).toBeVisible();
+  await expect(ojTab).toHaveAttribute('tabindex', '0');
+  await expect(page.getByRole('tab', { name: '模型 API' })).toHaveAttribute('tabindex', '-1');
+  await ojTab.focus();
+  await page.keyboard.press('ArrowRight');
+  await expect(page.getByRole('tab', { name: '事件推送', selected: true })).toBeFocused();
   expect(errors).toEqual([]);
 });

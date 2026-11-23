@@ -1,5 +1,5 @@
-import type { ComponentType } from 'react';
-import { motion } from 'motion/react';
+import { useRef, type ComponentType, type KeyboardEvent } from 'react';
+import { motion, useReducedMotion } from 'motion/react';
 import { cn } from '@/lib/utils';
 import { SPRING_INDICATOR } from './motion';
 
@@ -12,8 +12,10 @@ export interface SegmentedTabItem<T extends string = string> {
 }
 
 /**
- * Global unified tab control with a shared spring sliding indicator.
- * Used consistently across ConfigLibrary, ConnectionsPage, ResultsPage, RunPage, and composers.
+ * Global unified tab control implementing the WAI-ARIA Tabs pattern:
+ * - Roving tabIndex (only active tab is in Tab sequence)
+ * - ArrowLeft / ArrowRight / Home / End keyboard navigation
+ * - Shared spring sliding pill indicator (respecting prefers-reduced-motion)
  */
 export function SegmentedTabs<T extends string>({
   id,
@@ -21,6 +23,7 @@ export function SegmentedTabs<T extends string>({
   onValueChange,
   items,
   ariaLabel,
+  panelIdPrefix,
   className,
   size = 'md',
 }: {
@@ -29,9 +32,39 @@ export function SegmentedTabs<T extends string>({
   onValueChange: (value: T) => void;
   items: readonly SegmentedTabItem<T>[];
   ariaLabel?: string;
+  panelIdPrefix?: string;
   className?: string;
   size?: 'sm' | 'md';
 }) {
+  const reduced = useReducedMotion();
+  const buttonRefs = useRef<Map<T, HTMLButtonElement>>(new Map());
+  const enabledItems = items.filter(item => !item.disabled);
+
+  const activateAt = (nextItem: SegmentedTabItem<T>) => {
+    if (nextItem.value !== value) onValueChange(nextItem.value);
+    buttonRefs.current.get(nextItem.value)?.focus();
+  };
+
+  const handleKeyDown = (event: KeyboardEvent<HTMLButtonElement>, currentValue: T) => {
+    if (!enabledItems.length) return;
+    const idx = enabledItems.findIndex(item => item.value === currentValue);
+    if (idx < 0) return;
+
+    if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      activateAt(enabledItems[(idx + 1) % enabledItems.length]!);
+    } else if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      activateAt(enabledItems[(idx - 1 + enabledItems.length) % enabledItems.length]!);
+    } else if (event.key === 'Home') {
+      event.preventDefault();
+      activateAt(enabledItems[0]!);
+    } else if (event.key === 'End') {
+      event.preventDefault();
+      activateAt(enabledItems[enabledItems.length - 1]!);
+    }
+  };
+
   return (
     <div
       role="tablist"
@@ -47,10 +80,18 @@ export function SegmentedTabs<T extends string>({
         return (
           <button
             key={item.value}
+            ref={el => {
+              if (el) buttonRefs.current.set(item.value, el);
+              else buttonRefs.current.delete(item.value);
+            }}
+            id={`${id}-tab-${item.value}`}
             type="button"
             role="tab"
             aria-selected={active}
+            aria-controls={panelIdPrefix ? `${panelIdPrefix}-${item.value}` : undefined}
+            tabIndex={active ? 0 : -1}
             disabled={item.disabled}
+            onKeyDown={event => handleKeyDown(event, item.value)}
             onClick={() => {
               if (!item.disabled && item.value !== value) onValueChange(item.value);
             }}
@@ -63,7 +104,7 @@ export function SegmentedTabs<T extends string>({
             {active && (
               <motion.span
                 layoutId={`seg-tabs-${id}`}
-                transition={SPRING_INDICATOR}
+                transition={reduced ? { duration: 0 } : SPRING_INDICATOR}
                 className="absolute inset-0 rounded-[2px] border border-border/80 bg-card shadow-xs"
               />
             )}

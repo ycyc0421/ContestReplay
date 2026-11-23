@@ -48,7 +48,7 @@ export function ResultsPage() {
   const navigate = useNavigate();
   const tab: ResultsTab = search.tab === 'race' || search.tab === 'coverage' ? search.tab : 'standings';
   const setTab = (next: ResultsTab) => {
-    void navigate({ search: (prev: Record<string, unknown>) => ({ ...prev, tab: next }), replace: true } as never);
+    void navigate({ search: (prev: Record<string, unknown>) => ({ ...prev, tab: next }), replace: false } as never);
   };
 
   const [scoring, setScoring] = useState('auto');
@@ -100,6 +100,7 @@ export function ResultsPage() {
     <div className="mb-5 flex flex-col gap-3 border-b pb-4 xl:flex-row xl:items-center xl:justify-between">
       <SegmentedTabs
         id="results-tab"
+        panelIdPrefix="results-panel"
         ariaLabel="结果分析视图"
         value={tab}
         onValueChange={setTab}
@@ -126,7 +127,7 @@ export function ResultsPage() {
       )}
     </div>
 
-    <AnimatedPanel panelKey={tab}>
+    <AnimatedPanel panelKey={tab} role="tabpanel" id={`results-panel-${tab}`} ariaLabelledBy={`results-tab-tab-${tab}`}>
       {tab === 'standings' && <>
         {query.isLoading ? <div className="skeleton h-[480px] rounded-card border bg-card" />
           : query.isError ? <Card><EmptyState icon={BarChart3} title="无法读取排名" description={(query.error as Error).message} action={<Button variant="secondary" onClick={() => void query.refetch()}>重试</Button>} /></Card>

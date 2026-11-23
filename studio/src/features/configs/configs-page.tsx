@@ -30,22 +30,23 @@ export function ConfigsPage() {
   const client = useQueryClient();
   const [editor, dispatch] = useReducer(configEditorReducer, initialConfigEditorState);
   const requestSeq = useRef(0);
+  const drawerGenRef = useRef(0);
   const lastUrlKey = useRef('');
 
   const activeTab: 'agents' | 'contests' = search.tab === 'contests' ? 'contests' : 'agents';
 
-  const patchSearch = useCallback((patch: Partial<ConfigsSearch>, clearDrawer = false) => {
+  const patchSearch = useCallback((patch: Partial<ConfigsSearch>, opts?: { clearDrawer?: boolean; replace?: boolean }) => {
     void navigate({
       search: (prev: Record<string, unknown>) => {
         const next: Record<string, unknown> = { ...prev, ...patch };
-        if (clearDrawer) {
+        if (opts?.clearDrawer) {
           delete next.drawer;
           delete next.path;
         }
         if (!next.q) delete next.q;
         return next;
       },
-      replace: true,
+      replace: opts?.replace ?? false,
     } as never);
   }, [navigate]);
 
@@ -65,6 +66,7 @@ export function ConfigsPage() {
     const key = `${search.drawer ?? ''}:${search.path ?? ''}`;
     if (key === lastUrlKey.current) return;
     lastUrlKey.current = key;
+    drawerGenRef.current += 1;
     if (!search.drawer) {
       dispatch({ type: 'CLOSE' });
     } else if (search.drawer === 'new-agent') {
@@ -75,35 +77,46 @@ export function ConfigsPage() {
       loadForEdit('agent', search.path);
     } else if (search.drawer === 'edit-contest' && search.path) {
       loadForEdit('contest', search.path);
+    } else {
+      // Normalize incomplete edit-* URLs missing path to closed drawer
+      lastUrlKey.current = ':';
+      dispatch({ type: 'CLOSE' });
+      patchSearch({}, { clearDrawer: true, replace: true });
     }
-  }, [search.drawer, search.path, loadForEdit]);
+  }, [search.drawer, search.path, loadForEdit, patchSearch]);
 
   const openNew = (kind: ConfigKind) => {
     const drawer = kind === 'agent' ? 'new-agent' : 'new-contest';
+    drawerGenRef.current += 1;
     lastUrlKey.current = `${drawer}:`;
     dispatch({ type: 'OPEN_NEW', kind });
-    patchSearch({ drawer, path: undefined });
+    patchSearch({ drawer, path: undefined }, { replace: false });
   };
 
   const openEdit = (kind: ConfigKind, path: string) => {
     const drawer = kind === 'agent' ? 'edit-agent' : 'edit-contest';
+    drawerGenRef.current += 1;
     lastUrlKey.current = `${drawer}:${path}`;
     loadForEdit(kind, path);
-    patchSearch({ drawer, path });
+    patchSearch({ drawer, path }, { replace: false });
   };
 
   const closeDrawer = () => {
+    drawerGenRef.current += 1;
     lastUrlKey.current = ':';
     dispatch({ type: 'CLOSE' });
-    patchSearch({}, true);
+    patchSearch({}, { clearDrawer: true, replace: false });
   };
 
-  const handleSaved = async (kind: ConfigKind, intent: 'save' | 'batch' = 'save') => {
+  const handleSaved = async (kind: ConfigKind, ownerGen: number, intent: 'save' | 'batch' = 'save') => {
     await invalidateConfigGraph(client);
     if (intent !== 'save') return;
+    // Only close the drawer if this save still owns the active drawer session
+    if (drawerGenRef.current !== ownerGen) return;
+    drawerGenRef.current += 1;
     lastUrlKey.current = ':';
     dispatch({ type: 'CLOSE' });
-    patchSearch({ tab: kind === 'agent' ? 'agents' : 'contests' }, true);
+    patchSearch({ tab: kind === 'agent' ? 'agents' : 'contests' }, { clearDrawer: true, replace: true });
   };
 
   const handleDeleted = (kind: ConfigKind, path: string) => {
@@ -114,8 +127,9 @@ export function ConfigsPage() {
       (kind === 'contest' && editor.phase === 'editing_contest' && editor.item.path === path);
     dispatch({ type: 'ITEM_DELETED', kind, path });
     if (matchingOpen) {
+      drawerGenRef.current += 1;
       lastUrlKey.current = ':';
-      patchSearch({}, true);
+      patchSearch({}, { clearDrawer: true, replace: true });
     }
     void invalidateConfigGraph(client);
   };
@@ -163,9 +177,9 @@ export function ConfigsPage() {
 
     <ConfigLibrary
       activeTab={activeTab}
-      onTabChange={tab => patchSearch({ tab })}
+      onTabChange={tab => patchSearch({ tab }, { replace: false })}
       search={search.q ?? ''}
-      onSearchChange={q => patchSearch({ q })}
+      onSearchChange={q => patchSearch({ q }, { replace: true })}
       loadingPath={editor.phase === 'loading' ? editor.path : ''}
       onEditAgent={path => openEdit('agent', path)}
       onEditContest={path => openEdit('contest', path)}
@@ -197,18 +211,22 @@ export function ConfigsPage() {
           action={<Button variant="secondary" onClick={() => loadForEdit(editor.kind, editor.path)}>重试</Button>}
         />
       )}
-      {editor.phase === 'creating' && editor.kind === 'agent' && (
-        <AgentForm key="new-agent" onSaved={intent => handleSaved('agent', intent)} />
-      )}
-      {editor.phase === 'creating' && editor.kind === 'contest' && (
-        <ContestForm key="new-contest" onSaved={intent => handleSaved('contest', intent)} />
-      )}
-      {editor.phase === 'editing_agent' && (
-        <AgentForm key={editor.item.path} initial={editor.item} onSaved={intent => handleSaved('agent', intent)} />
-      )}
-      {editor.phase === 'editing_contest' && (
-        <ContestForm key={editor.item.path} initial={editor.item} onSaved={intent => handleSaved('contest', intent)} />
-      )}
+      {editor.phase === 'creating' && editor.kind === 'agent' && (() => {
+        const ownerGen = drawerGenRef.current;
+        return <AgentForm key={`new-agent-${ownerGen}`} onSaved={intent => handleSaved('agent', ownerGen, intent)} />;
+      })()}
+      {editor.phase === 'creating' && editor.kind === 'contest' && (() => {
+        const ownerGen = drawerGenRef.current;
+        return <ContestForm key={`new-contest-${ownerGen}`} onSaved={intent => handleSaved('contest', ownerGen, intent)} />;
+      })()}
+      {editor.phase === 'editing_agent' && (() => {
+        const ownerGen = drawerGenRef.current;
+        return <AgentForm key={`${editor.item.path}-${ownerGen}`} initial={editor.item} onSaved={intent => handleSaved('agent', ownerGen, intent)} />;
+      })()}
+      {editor.phase === 'editing_contest' && (() => {
+        const ownerGen = drawerGenRef.current;
+        return <ContestForm key={`${editor.item.path}-${ownerGen}`} initial={editor.item} onSaved={intent => handleSaved('contest', ownerGen, intent)} />;
+      })()}
     </SlideDrawer>
   </>;
 }

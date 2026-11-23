@@ -110,7 +110,7 @@ export function ProvidersPage() {
   const navigate = useNavigate();
   const tab: ConnectionsTab = search.tab === 'oj' || search.tab === 'push' ? search.tab : 'providers';
   const setTab = (next: ConnectionsTab) => {
-    void navigate({ search: (prev: Record<string, unknown>) => ({ ...prev, tab: next }), replace: true } as never);
+    void navigate({ search: (prev: Record<string, unknown>) => ({ ...prev, tab: next }), replace: false } as never);
   };
   const query = useQuery({ queryKey: queryKeys.providers, queryFn: studioApi.providers });
   const [editor, setEditor] = useState<Editor>();
@@ -141,6 +141,7 @@ export function ProvidersPage() {
     <div className="mb-5 border-b pb-4">
       <SegmentedTabs
         id="connections"
+        panelIdPrefix="connections-panel"
         ariaLabel="连接与凭据分类"
         value={tab}
         onValueChange={setTab}
@@ -148,7 +149,7 @@ export function ProvidersPage() {
       />
     </div>
 
-    <AnimatedPanel panelKey={tab}>
+    <AnimatedPanel panelKey={tab} role="tabpanel" id={`connections-panel-${tab}`} ariaLabelledBy={`connections-tab-${tab}`}>
       {tab === 'providers' && <>
         <div className="mb-5 flex gap-3 border-y py-4 text-xs leading-5 text-muted-foreground">
           <ShieldCheck className="mt-0.5 size-4 shrink-0 text-primary" />

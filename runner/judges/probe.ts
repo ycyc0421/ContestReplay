@@ -1,13 +1,15 @@
+import { parse as parseHtml } from 'parse5';
 import type { OjPlatform } from '../oj-accounts.js';
 import { defaultOriginFor } from '../oj-accounts.js';
 import {
   htmlAttr,
   htmlText,
   parseCookieHeader,
-  parseHtmlNodes,
   resolveBaseUrl,
   serializeCookieHeader,
+  walkHtml,
   type FetchLike,
+  type HtmlNode,
 } from './types.js';
 
 export interface OjAccountProbeResult {
@@ -19,6 +21,7 @@ export interface OjAccountProbeResult {
 }
 
 const SAFE_HANDLE_RE = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,79}$/;
+const MAX_PROBE_BODY_BYTES = 512 * 1024;
 
 function cleanHandle(candidate: string | undefined): string | undefined {
   if (!candidate) return undefined;
@@ -26,98 +29,287 @@ function cleanHandle(candidate: string | undefined): string | undefined {
   return SAFE_HANDLE_RE.test(trimmed) ? trimmed : undefined;
 }
 
+async function cancelBody(resp: Response): Promise<void> {
+  try {
+    await resp.body?.cancel();
+  } catch {
+    // ignore stream cancel errors
+  }
+}
+
+async function readCappedText(
+  resp: Response,
+  maxBytes = MAX_PROBE_BODY_BYTES,
+): Promise<{ text: string; truncated: boolean }> {
+  if (!resp.body) {
+    const raw = await resp.text();
+    const buf = Buffer.from(raw, 'utf8');
+    if (buf.byteLength > maxBytes) {
+      return { text: buf.subarray(0, maxBytes).toString('utf8'), truncated: true };
+    }
+    return { text: raw, truncated: false };
+  }
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let truncated = false;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      if (total + value.byteLength > maxBytes) {
+        const remaining = maxBytes - total;
+        if (remaining > 0) chunks.push(value.subarray(0, remaining));
+        truncated = true;
+        await reader.cancel();
+        break;
+      }
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return { text: Buffer.concat(chunks).toString('utf8'), truncated };
+}
+
+function buildParentMap(root: HtmlNode): Map<HtmlNode, HtmlNode> {
+  const parents = new Map<HtmlNode, HtmlNode>();
+  const stack: HtmlNode[] = [root];
+  while (stack.length) {
+    const node = stack.pop()!;
+    for (const child of node.childNodes ?? []) {
+      parents.set(child, node);
+      stack.push(child);
+    }
+  }
+  return parents;
+}
+
+/**
+ * Finds the narrowest ancestor container around the authenticated `/logout` link
+ * (e.g., Codeforces `.lang-chooser` / header or QOJ navbar account dropdown)
+ * so public author/submission profile links elsewhere in the page are never misread.
+ */
+function findAccountContainers(
+  root: HtmlNode,
+  isLogoutLink: (el: HtmlNode) => boolean,
+): HtmlNode[] {
+  const parents = buildParentMap(root);
+  const allNodes = walkHtml(root);
+  const logoutNodes = allNodes.filter(node => node.tagName === 'a' && isLogoutLink(node));
+  if (!logoutNodes.length) return [];
+
+  const containers: HtmlNode[] = [];
+  for (const logoutLink of logoutNodes) {
+    let cur = parents.get(logoutLink);
+    let depth = 0;
+    while (cur && depth < 3) {
+      if (cur.tagName && !['html', 'body', 'main'].includes(cur.tagName)) {
+        containers.push(cur);
+      }
+      cur = parents.get(cur);
+      depth += 1;
+    }
+  }
+  return containers;
+}
+
 function detectCodeforcesHandle(html: string, baseUrl: string): { authenticated: boolean; handle?: string } {
+  const doc = parseHtml(html) as HtmlNode;
   const parsedBase = new URL(baseUrl);
   const basePath = parsedBase.pathname.replace(/\/+$/, '');
   const profilePrefix = `${basePath}/profile/`;
   const logoutSuffix = `${basePath}/logout`;
-  let hasLogout = false;
-  let detected: string | undefined;
 
-  for (const el of parseHtmlNodes(html)) {
-    if (el.tagName !== 'a') continue;
+  const resolveLink = (el: HtmlNode): URL | undefined => {
     const href = htmlAttr(el, 'href');
-    if (!href) continue;
-    let resolved: URL;
+    if (!href) return undefined;
     try {
-      resolved = new URL(href, `${parsedBase.origin}${basePath}/`);
+      const resolved = new URL(href, `${parsedBase.origin}${basePath}/`);
+      return resolved.origin === parsedBase.origin ? resolved : undefined;
     } catch {
-      continue;
+      return undefined;
     }
-    if (resolved.origin !== parsedBase.origin) continue;
-    if (resolved.pathname.includes(logoutSuffix)) {
-      hasLogout = true;
-      continue;
-    }
-    if (!detected && resolved.pathname.startsWith(profilePrefix)) {
+  };
+
+  const containers = findAccountContainers(doc, el => {
+    const resolved = resolveLink(el);
+    return Boolean(resolved && resolved.pathname.includes(logoutSuffix));
+  });
+  if (!containers.length) return { authenticated: false };
+
+  // Inspect narrowest container first; accept handle only when unambiguously unique in that container.
+  for (const container of containers) {
+    const handles = new Set<string>();
+    for (const el of walkHtml(container)) {
+      if (el.tagName !== 'a') continue;
+      const resolved = resolveLink(el);
+      if (!resolved || !resolved.pathname.startsWith(profilePrefix)) continue;
       const seg = resolved.pathname.slice(profilePrefix.length).replace(/\/+$/, '');
-      if (seg && !seg.includes('/')) {
-        const text = htmlText(el).trim();
-        if (text.toLowerCase() === seg.toLowerCase()) {
-          detected = cleanHandle(seg);
-        }
+      if (!seg || seg.includes('/')) continue;
+      let decoded: string;
+      try {
+        decoded = decodeURIComponent(seg);
+      } catch {
+        continue;
       }
+      const text = htmlText(el).trim();
+      if (text.toLowerCase() === decoded.toLowerCase()) {
+        const cleaned = cleanHandle(decoded);
+        if (cleaned) handles.add(cleaned);
+      }
+    }
+    if (handles.size === 1) {
+      return { authenticated: true, handle: [...handles][0] };
+    }
+    if (handles.size > 1) {
+      return { authenticated: true };
     }
   }
 
-  if (!hasLogout) return { authenticated: false };
-  return { authenticated: true, ...(detected ? { handle: detected } : {}) };
+  return { authenticated: true };
 }
 
 function detectQojHandle(html: string, baseUrl: string): { authenticated: boolean; handle?: string } {
+  const doc = parseHtml(html) as HtmlNode;
   const parsedBase = new URL(baseUrl);
   const basePath = parsedBase.pathname.replace(/\/+$/, '');
   const profilePrefix = `${basePath}/user/profile/`;
-  let hasLogout = false;
-  let detected: string | undefined;
 
-  for (const el of parseHtmlNodes(html)) {
-    if (el.tagName !== 'a') continue;
+  const resolveLink = (el: HtmlNode): URL | undefined => {
     const href = htmlAttr(el, 'href');
-    if (!href) continue;
-    let resolved: URL;
+    if (!href) return undefined;
     try {
-      resolved = new URL(href, `${parsedBase.origin}${basePath}/`);
+      const resolved = new URL(href, `${parsedBase.origin}${basePath}/`);
+      return resolved.origin === parsedBase.origin ? resolved : undefined;
     } catch {
-      continue;
+      return undefined;
     }
-    if (resolved.origin !== parsedBase.origin) continue;
-    if (/\/logout(?:\/|$|\?)/.test(resolved.pathname)) {
-      hasLogout = true;
-      continue;
-    }
-    if (!detected && resolved.pathname.startsWith(profilePrefix)) {
-      const seg = decodeURIComponent(resolved.pathname.slice(profilePrefix.length).replace(/\/+$/, ''));
-      if (seg && !seg.includes('/')) {
-        detected = cleanHandle(seg);
+  };
+
+  const containers = findAccountContainers(doc, el => {
+    const resolved = resolveLink(el);
+    return Boolean(resolved && /\/logout(?:\/|$|\?)/.test(resolved.pathname));
+  });
+  if (!containers.length) return { authenticated: false };
+
+  for (const container of containers) {
+    const handles = new Set<string>();
+    for (const el of walkHtml(container)) {
+      if (el.tagName !== 'a') continue;
+      const resolved = resolveLink(el);
+      if (!resolved || !resolved.pathname.startsWith(profilePrefix)) continue;
+      const rawSeg = resolved.pathname.slice(profilePrefix.length).replace(/\/+$/, '');
+      if (!rawSeg || rawSeg.includes('/')) continue;
+      let decoded: string;
+      try {
+        decoded = decodeURIComponent(rawSeg);
+      } catch {
+        continue;
       }
+      const cleaned = cleanHandle(decoded);
+      if (cleaned) handles.add(cleaned);
+    }
+    if (handles.size === 1) {
+      return { authenticated: true, handle: [...handles][0] };
+    }
+    if (handles.size > 1) {
+      return { authenticated: true };
     }
   }
 
-  if (!hasLogout) return { authenticated: false };
-  return { authenticated: true, ...(detected ? { handle: detected } : {}) };
+  return { authenticated: true };
+}
+
+function extractJsonObjectAfter(raw: string, markerIndex: number): string | undefined {
+  const start = raw.indexOf('{', markerIndex);
+  if (start < 0) return undefined;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < raw.length && i - start < 65_536; i++) {
+    const ch = raw[i]!;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return raw.slice(start, i + 1);
+    }
+  }
+  return undefined;
 }
 
 function detectHydroHandle(raw: string, contentType: string): { authenticated: boolean; handle?: string } {
+  const fromContext = (ctx?: { _id?: unknown; uname?: unknown }): { authenticated: boolean; handle?: string } => {
+    const uid = typeof ctx?._id === 'number' ? ctx._id : Number.NaN;
+    if (Number.isFinite(uid) && uid > 0) {
+      const uname = typeof ctx?.uname === 'string' ? cleanHandle(ctx.uname) : undefined;
+      return { authenticated: true, ...(uname ? { handle: uname } : {}) };
+    }
+    return { authenticated: false };
+  };
+
   if (contentType.includes('application/json')) {
     try {
-      const data = JSON.parse(raw) as { UserContext?: { _id?: number; uname?: string } };
-      const uid = data?.UserContext?._id;
-      const uname = cleanHandle(data?.UserContext?.uname);
-      if (typeof uid === 'number' && uid > 0) {
-        return { authenticated: true, ...(uname ? { handle: uname } : {}) };
-      }
-      return { authenticated: false };
+      const data = JSON.parse(raw) as { UserContext?: { _id?: unknown; uname?: unknown } };
+      return fromContext(data?.UserContext);
     } catch {
       return { authenticated: false };
     }
   }
-  const match = raw.match(/"UserContext"\s*:\s*\{[^}]*"_id"\s*:\s*(\d+)[^}]*"uname"\s*:\s*"([^"]+)"/);
-  if (match && Number(match[1]) > 0) {
-    const uname = cleanHandle(match[2]);
-    return { authenticated: true, ...(uname ? { handle: uname } : {}) };
+
+  const marker = raw.search(/"UserContext"\s*:\s*\{/);
+  if (marker >= 0) {
+    const objText = extractJsonObjectAfter(raw, marker);
+    if (objText) {
+      try {
+        return fromContext(JSON.parse(objText) as { _id?: unknown; uname?: unknown });
+      } catch {
+        // fall through
+      }
+    }
   }
   return { authenticated: false };
+}
+
+function parseVjudgeStatus(raw: string): { authenticated: boolean; handle?: string } {
+  const trimmed = raw.trim();
+  if (!trimmed) return { authenticated: false };
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (parsed === false || parsed === null) return { authenticated: false };
+    if (parsed === true) return { authenticated: true };
+    if (typeof parsed === 'string') {
+      const lower = parsed.trim().toLowerCase();
+      if (!lower || lower === 'false' || lower === 'null') return { authenticated: false };
+      if (lower === 'true') return { authenticated: true };
+      const handle = cleanHandle(parsed);
+      return { authenticated: Boolean(handle), ...(handle ? { handle } : {}) };
+    }
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const obj = parsed as Record<string, unknown>;
+      const candidate = typeof obj.username === 'string' ? obj.username : typeof obj.userName === 'string' ? obj.userName : undefined;
+      const handle = cleanHandle(candidate);
+      if (handle) return { authenticated: true, handle };
+      if (obj.loggedIn === true || obj.status === true) return { authenticated: true };
+      return { authenticated: false };
+    }
+    return { authenticated: false };
+  } catch {
+    const lower = trimmed.toLowerCase();
+    if (lower === 'false' || lower === 'null') return { authenticated: false };
+    if (lower === 'true') return { authenticated: true };
+    const handle = cleanHandle(trimmed);
+    return { authenticated: Boolean(handle), ...(handle ? { handle } : {}) };
+  }
 }
 
 export async function probeOjAccountSession(
@@ -150,19 +342,25 @@ export async function probeOjAccountSession(
         signal,
       });
       if (!resp.ok) {
+        await cancelBody(resp);
         return { ok: false, authenticated: false, origin, message: `VJudge 响应异常（HTTP ${resp.status}）` };
       }
-      const text = (await resp.text()).trim().replace(/^"|"$/g, '');
-      if (!text || text.toLowerCase() === 'false' || text.toLowerCase() === 'null') {
+      const { text, truncated } = await readCappedText(resp, 32 * 1024);
+      if (truncated) {
+        return { ok: false, authenticated: false, origin, message: 'VJudge 响应体过大，已中止解析。' };
+      }
+      const result = parseVjudgeStatus(text);
+      if (!result.authenticated) {
         return { ok: true, authenticated: false, origin, message: 'VJudge 会话未登录或已过期，请重新复制已登录后的 Cookie。' };
       }
-      const handle = cleanHandle(text);
       return {
         ok: true,
-        authenticated: Boolean(handle),
+        authenticated: true,
         origin,
-        ...(handle ? { detected_handle: handle } : {}),
-        message: handle ? `VJudge 会话有效，已识别用户名 ${handle}` : '无法从 VJudge 响应确认登录状态。',
+        ...(result.handle ? { detected_handle: result.handle } : {}),
+        message: result.handle
+          ? `VJudge 会话有效，已识别用户名 ${result.handle}`
+          : 'VJudge 会话有效（上游仅返回登录态布尔值，请手动填写用户名）',
       };
     }
 
@@ -174,12 +372,18 @@ export async function probeOjAccountSession(
         signal,
       });
       if (resp.status >= 300 && resp.status < 400) {
+        await cancelBody(resp);
         return { ok: true, authenticated: false, origin, message: 'Hydro 将请求重定向至登录页，请检查站点地址与 Cookie。' };
       }
       if (!resp.ok) {
+        await cancelBody(resp);
         return { ok: false, authenticated: false, origin, message: `Hydro 响应异常（HTTP ${resp.status}）` };
       }
-      const result = detectHydroHandle(await resp.text(), resp.headers.get('content-type') ?? '');
+      const { text, truncated } = await readCappedText(resp);
+      if (truncated) {
+        return { ok: false, authenticated: false, origin, message: 'Hydro 首页响应超过 512 KiB 安全上限，请确认站点地址是否正确。' };
+      }
+      const result = detectHydroHandle(text, resp.headers.get('content-type') ?? '');
       return {
         ok: true,
         authenticated: result.authenticated,
@@ -198,12 +402,17 @@ export async function probeOjAccountSession(
       signal,
     });
     if (resp.status >= 300 && resp.status < 400) {
+      await cancelBody(resp);
       return { ok: true, authenticated: false, origin, message: `${input.platform} 将请求重定向，请确认 Cookie 为当前登录会话。` };
     }
     if (!resp.ok) {
+      await cancelBody(resp);
       return { ok: false, authenticated: false, origin, message: `上游平台响应异常（HTTP ${resp.status}），可能触发风控或站内维护。` };
     }
-    const html = await resp.text();
+    const { text: html, truncated } = await readCappedText(resp);
+    if (truncated) {
+      return { ok: false, authenticated: false, origin, message: '上游页面响应超过 512 KiB 安全上限，已中止解析。' };
+    }
     const result = input.platform === 'codeforces' ? detectCodeforcesHandle(html, baseUrl) : detectQojHandle(html, baseUrl);
     const label = input.platform === 'codeforces' ? 'Codeforces' : 'QOJ';
     return {
@@ -212,7 +421,7 @@ export async function probeOjAccountSession(
       origin,
       ...(result.handle ? { detected_handle: result.handle } : {}),
       message: result.authenticated
-        ? result.handle ? `${label} 会话有效，已识别用户名 ${result.handle}` : `${label} 会话有效（未解析到用户名，请手动填写）`
+        ? result.handle ? `${label} 会话有效，已识别用户名 ${result.handle}` : `${label} 会话有效（未解析到唯一用户名，请手动填写）`
         : `${label} 会话未登录或已过期，请确认已在浏览器登录并重新导出 Cookie。`,
     };
   } catch {
