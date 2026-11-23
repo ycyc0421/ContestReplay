@@ -86,6 +86,18 @@ describe('parseOjCookieInput', () => {
     const unknownFlagRes = parseOjCookieInput(unknownFlagCurl, 'qoj', undefined, fixedNow)!;
     expect(unknownFlagRes.originStatus).toBe('mismatched');
     expect(unknownFlagRes.normalizedHeader).toBe('');
+
+    // Unknown inline --flag=value (e.g. --expand-url=...) MUST fail closed too
+    const expandUrlCurl = `curl --expand-url='https://evil.example.com' 'https://qoj.ac/' -H 'Cookie: UOJSESSID=qoj_ok'`;
+    const expandUrlRes = parseOjCookieInput(expandUrlCurl, 'qoj', undefined, fixedNow)!;
+    expect(expandUrlRes.originStatus).toBe('mismatched');
+    expect(expandUrlRes.normalizedHeader).toBe('');
+
+    // Unquoted cURL -b ending with NBSP MUST reject the malformed NBSP value instead of stripping it
+    const curlTrailingNbsp = `curl 'https://qoj.ac/' -b X=\u00A0`;
+    const curlNbspRes = parseOjCookieInput(curlTrailingNbsp, 'qoj', undefined, fixedNow)!;
+    expect(curlNbspRes.normalizedHeader).toBe('');
+    expect(curlNbspRes.rejectedCount).toBe(1);
   });
 
   it('marks bare Cookie header as unknown origin, preserves Netscape empty values, and rejects NBSP / invalid RFC 6265 values', () => {

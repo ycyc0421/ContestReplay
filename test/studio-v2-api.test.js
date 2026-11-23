@@ -2410,10 +2410,10 @@ test('Studio v3 API: probeOjAccountSession and POST /api/oj-accounts/probe detec
   assert.equal(cfGenericRes.authenticated, true);
   assert.equal(cfGenericRes.detected_handle, undefined);
 
-  // 1c. QOJ page where logout is directly inside a generic wrapper alongside a public author MUST NOT grab the author
+  // 1c. QOJ page where logout is inside a generic wrapper or generic <ul> alongside a public author MUST NOT grab the author
   const qojGenericWrapper = mkFetch(
     200,
-    '<html><body><div class="page-wrapper"><a href="/user/profile/public_author">public_author</a><a href="/logout?_token=abc">Logout</a></div></body></html>',
+    '<html><body><div class="page-wrapper"><ul><li><a href="/user/profile/public_author">public_author</a></li><li><a href="/logout?_token=abc">Logout</a></li></ul></div></body></html>',
   );
   const qojGenericRes = await probeOjAccountSession(
     { platform: 'qoj', secret: 'UOJSESSID=qoj-secret-token-789' },

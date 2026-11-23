@@ -215,7 +215,7 @@ function detectQojHandle(html: string, baseUrl: string): { authenticated: boolea
       const resolved = resolveLink(el);
       return Boolean(resolved && /\/logout(?:\/|$|\?)/.test(resolved.pathname));
     },
-    el => el.tagName === 'nav' || el.tagName === 'ul' || matchesContainerMarker(el, QOJ_ACCOUNT_CONTAINER_RE),
+    el => el.tagName === 'nav' || matchesContainerMarker(el, QOJ_ACCOUNT_CONTAINER_RE),
   );
   if (!hasLogout) return { authenticated: false };
 

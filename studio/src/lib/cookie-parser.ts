@@ -260,7 +260,7 @@ function tokenizeShellCommand(text: string): string[] {
       else cur += ch;
       continue;
     }
-    if (/\s/.test(ch)) {
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') {
       if (hasToken) {
         tokens.push(cur);
         cur = '';
@@ -380,14 +380,14 @@ function parseHeaderPairs(raw: string): { entries: RawCookieEntry[]; rejectedCou
   return { entries, rejectedCount };
 }
 
-function parseCurl(text: string): {
+function parseCurl(rawText: string): {
   entries: RawCookieEntry[];
   rejectedCount: number;
   sourceOrigins: string[];
   ambiguousUrl: boolean;
   unknownFlag?: string;
 } | null {
-  const tokens = tokenizeShellCommand(text.trim());
+  const tokens = tokenizeShellCommand(rawText);
   const curlIdx = tokens.findIndex(tok => /^curl$/i.test(tok));
   if (curlIdx < 0) return null;
 
@@ -464,7 +464,14 @@ function parseCurl(text: string): {
     }
     if (!afterDoubleDash && tok.startsWith('-')) {
       if (tok.startsWith('--') && tok.includes('=')) {
-        // Long flag with inline `=value` has self-contained arity (consumes 0 extra tokens)
+        const eqIdx = tok.indexOf('=');
+        const flagName = tok.slice(0, eqIdx);
+        if (CURL_VALUE_FLAGS.has(flagName)) {
+          continue;
+        }
+        // Fail closed on unrecognized --flag=value options (e.g. --expand-url=...) whose effect on target URLs is unknown
+        unknownFlag = flagName;
+        ambiguousUrl = true;
         continue;
       }
       if (isKnownBooleanCurlFlag(tok)) {
@@ -522,7 +529,7 @@ export function parseOjCookieInput(
       entries = json;
       originStatus = entries.some(e => Boolean(e.domain)) ? 'matched' : 'unknown';
     } else {
-      const curl = parseCurl(trimmed);
+      const curl = parseCurl(rawInput);
       if (curl) {
         format = 'curl';
         entries = curl.entries;
