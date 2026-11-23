@@ -207,6 +207,7 @@ function AccountEditor({ editor, onClose }: { editor: Editor; onClose: () => voi
                 value={baseUrl}
                 onChange={event => {
                   setBaseUrl(event.target.value);
+                  setRawCookie('');
                   invalidateProbe();
                 }}
                 placeholder="https://hydro.ac"
@@ -328,6 +329,7 @@ function AccountEditor({ editor, onClose }: { editor: Editor; onClose: () => voi
                     value={baseUrl}
                     onChange={event => {
                       setBaseUrl(event.target.value);
+                      setRawCookie('');
                       invalidateProbe();
                     }}
                     placeholder={`默认 https://${meta.defaultDomain}`}
@@ -339,6 +341,7 @@ function AccountEditor({ editor, onClose }: { editor: Editor; onClose: () => voi
                   value={transport}
                   onValueChange={value => {
                     setTransport(value as Account['transport']);
+                    setRawCookie('');
                     invalidateProbe();
                   }}
                   disabled={!!account}

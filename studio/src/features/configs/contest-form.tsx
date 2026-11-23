@@ -222,6 +222,8 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
     values.domain.trim(),
     values.accountId,
     values.pdf.trim(),
+    values.file.trim(),
+    values.id.trim(),
   ]);
   const latestUpstreamKeyRef = useRef(currentUpstreamKey);
   latestUpstreamKeyRef.current = currentUpstreamKey;
@@ -269,22 +271,31 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
       const reqCfId = getValues('cfId');
       const reqGym = getValues('gym') === 'gym';
       const reqBaseUrl = getValues('baseUrl').trim();
-      const result = await studioApi.previewContest({
-        platform: reqJudge as 'codeforces' | 'qoj' | 'vjudge' | 'hydro',
-        contest_id: reqJudge === 'codeforces' ? Number(reqCfId) : reqCfId,
-        ...(reqJudge === 'codeforces' && reqGym ? { gym: true } : {}),
-        ...(reqBaseUrl ? { base_url: reqBaseUrl } : {}),
-        ...(getValues('domain').trim() ? { domain: getValues('domain').trim() } : {}),
-        ...(getValues('accountId') ? { account_id: getValues('accountId') } : {}),
-        ...(getValues('pdf').trim() ? { pdf_path: getValues('pdf').trim() } : {}),
-        ...(getValues('file').trim() ? { manifest_path: getValues('file').trim() } : {}),
-        ...(getValues('id').trim() ? { manifest_contest_id: getValues('id').trim() } : {}),
-      });
-      return { gen, upstreamKey, reqJudge, reqCfId, reqGym, reqBaseUrl, result };
+      try {
+        const result = await studioApi.previewContest({
+          platform: reqJudge as 'codeforces' | 'qoj' | 'vjudge' | 'hydro',
+          contest_id: reqJudge === 'codeforces' ? Number(reqCfId) : reqCfId,
+          ...(reqJudge === 'codeforces' && reqGym ? { gym: true } : {}),
+          ...(reqBaseUrl ? { base_url: reqBaseUrl } : {}),
+          ...(getValues('domain').trim() ? { domain: getValues('domain').trim() } : {}),
+          ...(getValues('accountId') ? { account_id: getValues('accountId') } : {}),
+          ...(getValues('pdf').trim() ? { pdf_path: getValues('pdf').trim() } : {}),
+          ...(getValues('file').trim() ? { manifest_path: getValues('file').trim() } : {}),
+          ...(getValues('id').trim() ? { manifest_contest_id: getValues('id').trim() } : {}),
+        });
+        return { gen, upstreamKey, ok: true as const, reqJudge, reqCfId, reqGym, reqBaseUrl, result };
+      } catch (err) {
+        return { gen, upstreamKey, ok: false as const, error: err instanceof Error ? err : new Error(String(err)) };
+      }
     },
-    onSuccess: ({ gen, upstreamKey, reqJudge, reqCfId, reqGym, reqBaseUrl, result }) => {
-      // Discard stale preview responses if user changed judge/contest/mirror/PDF while in flight
-      if (previewGenRef.current !== gen || latestUpstreamKeyRef.current !== upstreamKey) return;
+    onSuccess: payload => {
+      // Discard stale preview responses AND stale preview errors if user changed any request input while in flight
+      if (previewGenRef.current !== payload.gen || latestUpstreamKeyRef.current !== payload.upstreamKey) return;
+      if (!payload.ok) {
+        toast.error('无法拉取赛事信息', { description: payload.error.message });
+        return;
+      }
+      const { reqJudge, reqCfId, reqGym, reqBaseUrl, result } = payload;
       if (!getValues('title').trim()) setValue('title', result.preview.title);
       if (result.language_presets.length) {
         setValue('languages', JSON.stringify(Object.fromEntries(result.language_presets.map(language => [language.id, language.remote_id]))));
@@ -309,13 +320,12 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
       });
       toast.success('赛事信息已载入', { description: `${result.preview.problems.length} 道题 · ${result.preview.status}` });
     },
-    onError: (error: Error) => toast.error('无法拉取赛事信息', { description: error.message }),
   });
 
   const goTo = (nextStep: number) => dispatch({ type: 'GO_TO_STEP', step: nextStep });
 
   const next = async () => {
-    if (wizard.step === 0 && !await trigger(['id', 'file', 'sourceName'])) return;
+    if (wizard.step === 0 && !await trigger(['id', 'file', 'sourceName', 'dataVersion'])) return;
     if (wizard.step === 1 && wizard.materialMode === 'upload' && (!wizard.uploaded || wizard.uploaded.path !== values.pdf)) {
       toast.error('请先上传题面 PDF'); return;
     }
@@ -375,9 +385,11 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
         ? computeCodeforcesPointsKnown({
             cfId: form.cfId,
             gym: form.gym === 'gym',
+            baseUrl: form.baseUrl,
             problems: wizard.problems.map(p => ({ id: p.id.trim(), max_points: p.maxPoints })),
             problemMap: parsedProblemMap ?? {},
             preview: wizard.remotePreview,
+            previewBaseUrl: wizard.remotePreviewBaseUrl,
             confirmedSignature: wizard.confirmedWeightsSig,
             isEdit: Boolean(initial),
             sourceJudge,
@@ -460,7 +472,9 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
             setError('languages', { message: issue.message }); markStep(2);
           } else if (joined.includes('problem_map')) {
             setError('problemMap', { message: issue.message }); markStep(2);
-          } else if (joined.includes('handle') || joined.includes('account_id')) {
+          } else if (joined.includes('account_id')) {
+            setError('accountId', { message: issue.message }); markStep(2);
+          } else if (joined.includes('handle')) {
             setError('handle', { message: issue.message }); markStep(2);
           } else if (joined.includes('judge.answers')) {
             setError('answers', { message: issue.message }); markStep(2);
@@ -475,6 +489,19 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
         }
       }
       toast.error('无法保存 Contest', { description: (error as Error).message });
+    }
+  }, fieldErrors => {
+    const stepFields: [number, (keyof Values)[]][] = [
+      [0, ['id', 'title', 'dataVersion', 'sourceName', 'sourceUrl', 'file']],
+      [1, ['pdf']],
+      [2, ['judge', 'answers', 'cfId', 'accountId', 'handle', 'pool', 'baseUrl', 'domain', 'languages', 'problemMap']],
+      [3, ['timeLimitMs', 'maxSubmissions']],
+    ];
+    for (const [stepIdx, fields] of stepFields) {
+      if (fields.some(f => Boolean(fieldErrors[f]))) {
+        if (stepIdx !== wizard.step) goTo(stepIdx);
+        break;
+      }
     }
   });
 
@@ -509,8 +536,8 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
               <div><h3 className="font-semibold">比赛档案</h3><p className="mt-1 text-xs text-muted-foreground">稳定 ID、来源与授权会写入清单，并用于后续数据版本管理。</p></div>
               <div className="grid gap-5 sm:grid-cols-3">
                 <Field label="Contest ID" error={errors.id?.message}><Input placeholder="final-2024" disabled={!!initial} {...register('id')} /></Field>
-                <Field label="赛事标题" hint="可选"><Input placeholder="默认使用 Contest ID" {...register('title')} /></Field>
-                <Field label="数据版本" hint="内容变化时提升"><Input type="number" min="1" {...register('dataVersion', { valueAsNumber: true })} /></Field>
+                <Field label="赛事标题" hint="可选" error={errors.title?.message}><Input placeholder="默认使用 Contest ID" {...register('title')} /></Field>
+                <Field label="数据版本" hint="内容变化时提升" error={errors.dataVersion?.message}><Input type="number" min="1" {...register('dataVersion', { valueAsNumber: true })} /></Field>
               </div>
               <div className="grid gap-5 sm:grid-cols-2">
                 <Field label="来源名称" error={errors.sourceName?.message}><Input {...register('sourceName')} /></Field>
@@ -528,6 +555,7 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
               <div><h3 className="font-semibold">完整比赛材料</h3><p className="mt-1 text-xs text-muted-foreground">默认上传完整 PDF；已有受管理文件也可以直接引用。</p></div>
               <SegmentedTabs
                 id={`contest-mat-${initial?.path ?? 'new'}`}
+                panelIdPrefix={`contest-mat-panel-${initial?.path ?? 'new'}`}
                 size="sm"
                 value={wizard.materialMode}
                 onValueChange={changeMaterialMode}
@@ -536,26 +564,33 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
                   { value: 'path', label: '引用本机路径' },
                 ]}
               />
-              {wizard.materialMode === 'upload' ? <>
-                <MaterialUpload
-                  contestId={getValues('id')}
-                  onUploaded={material => {
-                    dispatch({ type: 'SET_UPLOADED', material });
-                    setValue('pdf', material.path, { shouldValidate: true });
-                  }}
-                />
-                {wizard.uploaded && (
-                  <div className="flex items-center gap-3 rounded-[3px] border border-primary/25 bg-primary/5 p-4">
-                    <Check className="size-4 text-primary" />
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-medium">{wizard.uploaded.name}</div>
-                      <div className="mt-1 font-mono text-[10px] text-muted-foreground">{formatBytes(wizard.uploaded.size)} · {wizard.uploaded.sha256.slice(0, 16)}…</div>
+              <div
+                id={`contest-mat-panel-${initial?.path ?? 'new'}-${wizard.materialMode}`}
+                role="tabpanel"
+                aria-labelledby={`contest-mat-${initial?.path ?? 'new'}-tab-${wizard.materialMode}`}
+                className="space-y-4"
+              >
+                {wizard.materialMode === 'upload' ? <>
+                  <MaterialUpload
+                    contestId={getValues('id')}
+                    onUploaded={material => {
+                      dispatch({ type: 'SET_UPLOADED', material });
+                      setValue('pdf', material.path, { shouldValidate: true });
+                    }}
+                  />
+                  {wizard.uploaded && (
+                    <div className="flex items-center gap-3 rounded-[3px] border border-primary/25 bg-primary/5 p-4">
+                      <Check className="size-4 text-primary" />
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-medium">{wizard.uploaded.name}</div>
+                        <div className="mt-1 font-mono text-[10px] text-muted-foreground">{formatBytes(wizard.uploaded.size)} · {wizard.uploaded.sha256.slice(0, 16)}…</div>
+                      </div>
                     </div>
-                  </div>
+                  )}
+                </> : (
+                  <Field label="题面 PDF" hint="相对于清单" error={errors.pdf?.message}><Input className="font-mono text-xs" {...register('pdf')} /></Field>
                 )}
-              </> : (
-                <Field label="题面 PDF" hint="相对于清单" error={errors.pdf?.message}><Input className="font-mono text-xs" {...register('pdf')} /></Field>
-              )}
+              </div>
               {errors.pdf && <p role="alert" className="text-xs text-danger">{errors.pdf.message}</p>}
               {!capabilities.features.contest_upload && <Note>当前 runner 尚未提供上传接口，因此保留本机路径模式。</Note>}
             </div>
@@ -569,7 +604,7 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
                   <Select value={field.value} onValueChange={value => {
                     field.onChange(value);
                     dispatch({ type: 'JUDGE_CHANGED', judge: value, sourceJudge });
-                    clearErrors(['cfId', 'handle', 'pool', 'baseUrl', 'languages', 'problemMap']);
+                    clearErrors(['cfId', 'accountId', 'handle', 'pool', 'baseUrl', 'languages', 'problemMap']);
                     if (value !== 'local') {
                       const nextLanguages = sourceJudge?.kind === value && sourceJudge.languages ? sourceJudge.languages : defaultLanguagesFor(value, capabilities);
                       setValue('languages', JSON.stringify(nextLanguages));
@@ -588,7 +623,7 @@ function ContestManifestForm({ capabilities, initial, onSaved }: { capabilities:
                       <Field label={values.judge === 'codeforces' ? 'Codeforces 赛事 ID' : `${judgeLabel} 赛事 ID`} error={errors.cfId?.message}>
                         <Input type={values.judge === 'codeforces' ? 'number' : 'text'} min="1" placeholder={values.judge === 'vjudge' ? '可留空，使用上游题目映射' : 'Contest ID'} {...register('cfId')} />
                       </Field>
-                      <Field label="OJ 账号" hint="write-only 凭据引用">
+                      <Field label="OJ 账号" hint="write-only 凭据引用" error={errors.accountId?.message}>
                         <Select value={values.accountId || 'manual'} onValueChange={value => setValue('accountId', value === 'manual' ? '' : value)}>
                           <SelectItem value="manual">手动用户名 / 账号池</SelectItem>
                           {accounts.data?.accounts.filter(account => account.platform === values.judge).map(account => (

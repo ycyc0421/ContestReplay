@@ -80,10 +80,11 @@ const FORMAT_LABELS: Record<CookieInputFormat, string> = {
   header: 'Cookie 请求头',
 };
 
-// RFC 6265 cookie-name token (tchar)
+// RFC 6265 §4.1.1 cookie-name token (tchar)
 const VALID_COOKIE_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
-// Disallow control characters (including CR/LF/NUL/TAB) and ';' in serialized cookie values
-const VALID_COOKIE_VALUE_RE = /^[^\x00-\x1F\x7F;]*$/;
+// RFC 6265 §4.1.1 cookie-octet = %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E
+// (excludes CTLs, whitespace, DQUOTE, comma ',', semicolon ';', backslash '\', and non-ASCII)
+const COOKIE_OCTETS_RE = /^[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]*$/;
 
 interface RawCookieEntry {
   name: string;
@@ -134,8 +135,15 @@ function domainMatches(cookieDomain: string | undefined, hostOnly: boolean | und
   return targetHost === cleaned || targetHost.endsWith(`.${cleaned}`);
 }
 
+function isValidCookieValue(value: string): boolean {
+  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+    return COOKIE_OCTETS_RE.test(value.slice(1, -1));
+  }
+  return COOKIE_OCTETS_RE.test(value);
+}
+
 function isValidPair(name: string, value: string): boolean {
-  return VALID_COOKIE_NAME_RE.test(name) && VALID_COOKIE_VALUE_RE.test(value);
+  return VALID_COOKIE_NAME_RE.test(name) && isValidCookieValue(value);
 }
 
 function parseNetscape(text: string): RawCookieEntry[] | null {
@@ -218,21 +226,88 @@ function parseJsonCookies(text: string): RawCookieEntry[] | null {
   return entries.length > 0 ? entries : null;
 }
 
-function extractCurlOrigin(text: string): string | undefined {
-  // Collapse explicit shell line continuations before scanning URL tokens
+/**
+ * POSIX-style shell tokenizer for Copy-as-cURL commands.
+ * Supports single quotes, double quotes (with escapes), unquoted backslash escapes,
+ * and `\` line continuations.
+ */
+function tokenizeShellCommand(text: string): string[] {
   const flat = text.replace(/\\\r?\n/g, ' ');
-  // Match first http(s) URL argument (quoted or unquoted), skipping header/cookie values
-  const stripped = flat
-    .replace(/(?:-H|--header)\s+(?:'[^']*'|"[^"]*")/g, ' ')
-    .replace(/(?:-b|--cookie)\s+(?:'[^']*'|"[^"]*")/g, ' ');
-  const urlMatch = stripped.match(/(?:^|\s)['"]?(https?:\/\/[^\s'"]+)['"]?/i);
-  if (!urlMatch?.[1]) return undefined;
-  try {
-    return new URL(urlMatch[1]).origin;
-  } catch {
-    return undefined;
+  const tokens: string[] = [];
+  let cur = '';
+  let inSingle = false;
+  let inDouble = false;
+  let hasToken = false;
+
+  for (let i = 0; i < flat.length; i++) {
+    const ch = flat[i]!;
+    if (inSingle) {
+      if (ch === "'") inSingle = false;
+      else cur += ch;
+      continue;
+    }
+    if (inDouble) {
+      if (ch === '\\' && i + 1 < flat.length) {
+        const next = flat[i + 1]!;
+        if (next === '"' || next === '\\' || next === '$' || next === '`') {
+          cur += next;
+          i += 1;
+          continue;
+        }
+      }
+      if (ch === '"') inDouble = false;
+      else cur += ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (hasToken) {
+        tokens.push(cur);
+        cur = '';
+        hasToken = false;
+      }
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = true;
+      hasToken = true;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+      hasToken = true;
+      continue;
+    }
+    if (ch === '\\' && i + 1 < flat.length) {
+      cur += flat[i + 1]!;
+      i += 1;
+      hasToken = true;
+      continue;
+    }
+    cur += ch;
+    hasToken = true;
   }
+  if (hasToken) tokens.push(cur);
+  return tokens;
 }
+
+// Common cURL flags that consume a following argument token (must NOT be misread as request URLs)
+const CURL_VALUE_FLAGS = new Set([
+  '-H', '--header',
+  '-b', '--cookie',
+  '-c', '--cookie-jar',
+  '-e', '--referer',
+  '-A', '--user-agent',
+  '-X', '--request',
+  '-d', '--data', '--data-raw', '--data-binary', '--data-ascii', '--data-urlencode', '--json',
+  '-F', '--form', '--form-string',
+  '-x', '--proxy', '--preproxy', '--noproxy',
+  '-u', '--user', '--proxy-user',
+  '-o', '--output', '-w', '--write-out', '-D', '--dump-header',
+  '-m', '--max-time', '--connect-timeout', '--retry', '--retry-delay',
+  '-K', '--config', '--resolve', '--connect-to', '--interface',
+  '--cacert', '--capath', '--cert', '--key', '--proxy-header', '--oauth2-bearer',
+  '-r', '--range', '-T', '--upload-file',
+]);
 
 function parseHeaderPairs(raw: string): { entries: RawCookieEntry[]; rejectedCount: number } {
   const entries: RawCookieEntry[] = [];
@@ -263,30 +338,98 @@ function parseHeaderPairs(raw: string): { entries: RawCookieEntry[]; rejectedCou
   return { entries, rejectedCount };
 }
 
-function parseCurl(text: string): { entries: RawCookieEntry[]; rejectedCount: number; sourceOrigin?: string } | null {
-  if (!/(^|\s)curl(\s|$)/i.test(text.trim())) return null;
-  const flat = text.replace(/\\\r?\n/g, ' ');
+function parseCurl(text: string): {
+  entries: RawCookieEntry[];
+  rejectedCount: number;
+  sourceOrigins: string[];
+  ambiguousUrl: boolean;
+} | null {
+  const tokens = tokenizeShellCommand(text.trim());
+  const curlIdx = tokens.findIndex(tok => /^curl$/i.test(tok));
+  if (curlIdx < 0) return null;
+
   const rawChunks: string[] = [];
+  const requestOrigins = new Set<string>();
+  let ambiguousUrl = false;
+  let afterDoubleDash = false;
 
-  const headerRe = /(?:-H|--header)\s+(?:'([^']*)'|"([^"]*)")/g;
-  for (const match of flat.matchAll(headerRe)) {
-    const content = match[1] ?? match[2] ?? '';
-    if (/^cookie\s*:/i.test(content.trim())) {
-      rawChunks.push(content.replace(/^cookie\s*:/i, '').trim());
+  const recordUrl = (candidate: string) => {
+    try {
+      const parsed = new URL(candidate);
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+        requestOrigins.add(parsed.origin.toLowerCase());
+      }
+    } catch {
+      ambiguousUrl = true;
     }
-  }
+  };
 
-  const cookieFlagRe = /(?:-b|--cookie)\s+(?:'([^']*)'|"([^"]*)")/g;
-  for (const match of flat.matchAll(cookieFlagRe)) {
-    const content = match[1] ?? match[2] ?? '';
-    if (content.trim()) rawChunks.push(content.trim());
+  for (let i = curlIdx + 1; i < tokens.length; i++) {
+    const tok = tokens[i]!;
+    if (!afterDoubleDash && tok === '--') {
+      afterDoubleDash = true;
+      continue;
+    }
+    if (!afterDoubleDash && (tok === '-H' || tok === '--header')) {
+      const val = tokens[i + 1] ?? '';
+      i += 1;
+      if (/^cookie\s*:/i.test(val.trim())) {
+        rawChunks.push(val.replace(/^cookie\s*:/i, '').trim());
+      }
+      continue;
+    }
+    if (!afterDoubleDash && tok.startsWith('--header=')) {
+      const val = tok.slice('--header='.length);
+      if (/^cookie\s*:/i.test(val.trim())) {
+        rawChunks.push(val.replace(/^cookie\s*:/i, '').trim());
+      }
+      continue;
+    }
+    if (!afterDoubleDash && (tok === '-b' || tok === '--cookie')) {
+      const val = tokens[i + 1] ?? '';
+      i += 1;
+      if (val.trim()) rawChunks.push(val.trim());
+      continue;
+    }
+    if (!afterDoubleDash && tok.startsWith('--cookie=')) {
+      const val = tok.slice('--cookie='.length);
+      if (val.trim()) rawChunks.push(val.trim());
+      continue;
+    }
+    if (!afterDoubleDash && tok === '--url') {
+      const val = tokens[i + 1];
+      i += 1;
+      if (val) recordUrl(val);
+      continue;
+    }
+    if (!afterDoubleDash && tok.startsWith('--url=')) {
+      recordUrl(tok.slice('--url='.length));
+      continue;
+    }
+    if (!afterDoubleDash && CURL_VALUE_FLAGS.has(tok)) {
+      // Skip value of option flags such as --referer, --proxy, --data, etc.
+      i += 1;
+      continue;
+    }
+    if (!afterDoubleDash && tok.startsWith('-')) {
+      // Flag with inline `=` value or boolean flag
+      continue;
+    }
+    if (/^https?:\/\//i.test(tok)) {
+      recordUrl(tok);
+    }
   }
 
   if (!rawChunks.length) return null;
   const combined = rawChunks.join('; ');
   const { entries, rejectedCount } = parseHeaderPairs(combined);
-  const sourceOrigin = extractCurlOrigin(text);
-  return { entries, rejectedCount, sourceOrigin };
+  if (requestOrigins.size > 1) ambiguousUrl = true;
+  return {
+    entries,
+    rejectedCount,
+    sourceOrigins: [...requestOrigins],
+    ambiguousUrl,
+  };
 }
 
 export function parseOjCookieInput(
@@ -305,6 +448,7 @@ export function parseOjCookieInput(
   let initialRejected = 0;
   let originStatus: CookieOriginStatus = 'unknown';
   let sourceOrigin: string | undefined;
+  let ambiguousCurl = false;
 
   const netscape = parseNetscape(trimmed);
   if (netscape) {
@@ -323,9 +467,13 @@ export function parseOjCookieInput(
         format = 'curl';
         entries = curl.entries;
         initialRejected = curl.rejectedCount;
-        sourceOrigin = curl.sourceOrigin;
-        if (sourceOrigin) {
-          originStatus = sourceOrigin.toLowerCase() === target.origin.toLowerCase() ? 'matched' : 'mismatched';
+        ambiguousCurl = curl.ambiguousUrl;
+        if (curl.ambiguousUrl) {
+          originStatus = 'mismatched';
+          sourceOrigin = curl.sourceOrigins.join(', ') || '(ambiguous)';
+        } else if (curl.sourceOrigins.length === 1) {
+          sourceOrigin = curl.sourceOrigins[0];
+          originStatus = sourceOrigin === target.origin.toLowerCase() ? 'matched' : 'mismatched';
         } else {
           originStatus = 'unknown';
         }
@@ -341,8 +489,12 @@ export function parseOjCookieInput(
 
   const warnings: string[] = [];
 
-  if (originStatus === 'mismatched' && sourceOrigin) {
-    warnings.push(`cURL 请求来源为 ${sourceOrigin}，与当前目标站点 ${target.origin} 不一致，已阻止导入以防凭据发送到错误站点。`);
+  if (originStatus === 'mismatched') {
+    warnings.push(
+      ambiguousCurl
+        ? 'cURL 命令包含多个或无法识别的目标站点 URL，已阻止导入以防凭据发送到错误站点。'
+        : `cURL 请求来源为 ${sourceOrigin}，与当前目标站点 ${target.origin} 不一致，已阻止导入以防凭据发送到错误站点。`,
+    );
     return {
       format,
       formatLabel: FORMAT_LABELS[format],
@@ -403,7 +555,7 @@ export function parseOjCookieInput(
     } else if (expiredCount > 0) {
       warnings.push(`解析到的 ${expiredCount} 个 Cookie 均已过期，请重新登录浏览器后导出。`);
     } else if (rejectedCount > 0) {
-      warnings.push('输入包含非法 Cookie 键名、换行符或控制字符，请粘贴单行 Cookie 请求头、cookies.txt、cURL 或 JSON 导出。');
+      warnings.push('输入包含不符合 RFC 6265 的 Cookie 键名、值或控制字符，请粘贴单行 Cookie 请求头、cookies.txt、cURL 或 JSON 导出。');
     } else {
       warnings.push('未能解析出有效的 Cookie 键值对。');
     }

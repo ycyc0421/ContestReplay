@@ -39,10 +39,14 @@ export function CookieImporter({
     [rawValue, platform, baseUrl],
   );
 
-  // Invalidate any in-flight file read when destination changes, and unseal if cleared.
+  // Invalidate any in-flight file read when destination changes or on unmount.
   useEffect(() => {
     readGenRef.current += 1;
   }, [platform, baseUrl]);
+
+  useEffect(() => () => {
+    readGenRef.current += 1;
+  }, []);
 
   useEffect(() => {
     if (!rawValue) setSealed(false);
@@ -54,17 +58,14 @@ export function CookieImporter({
     onRawChange('');
   };
 
-  const applyRaw = (nextRaw: string, shouldSealIfValid: boolean) => {
+  const applyRaw = (nextRaw: string, shouldSeal: boolean) => {
     readGenRef.current += 1;
     onRawChange(nextRaw);
     if (!nextRaw.trim()) {
       setSealed(false);
       return;
     }
-    if (shouldSealIfValid) {
-      const candidate = parseOjCookieInput(nextRaw, platform, baseUrl);
-      if (candidate?.normalizedHeader) setSealed(true);
-    }
+    if (shouldSeal) setSealed(true);
   };
 
   const readFile = async (file?: File) => {
@@ -74,8 +75,8 @@ export function CookieImporter({
     const text = await file.text();
     if (readGenRef.current !== gen) return;
     onRawChange(text);
-    const candidate = parseOjCookieInput(text, platform, baseUrl);
-    setSealed(Boolean(candidate?.normalizedHeader));
+    // Always keep file imports masked so rejected/mismatched exports never render raw secrets in a textarea
+    if (text.trim()) setSealed(true);
   };
 
   const healthy = Boolean(
@@ -84,7 +85,8 @@ export function CookieImporter({
     parsed.originStatus !== 'mismatched' &&
     parsed.missingRecommendedKeys.length === 0,
   );
-  const isMaskedLoaded = sealed && Boolean(parsed?.normalizedHeader);
+  // Once sealed, NEVER reverse masking back into a visible textarea even if diagnostics fail or destination changes.
+  const isMaskedLoaded = sealed && Boolean(rawValue.trim());
 
   return (
     <div className="space-y-2.5">
@@ -166,7 +168,7 @@ export function CookieImporter({
               applyRaw(next, bulkInsert);
             }}
             onBlur={() => {
-              if (parsed?.normalizedHeader) setSealed(true);
+              if (rawValue.trim()) setSealed(true);
             }}
             className="min-h-24 font-mono text-xs leading-5"
             placeholder="直接粘贴或拖入 cookies.txt (Netscape)、DevTools Copy as cURL、Cookie-Editor JSON，或单行 Cookie 请求头 (key=value; ...)"

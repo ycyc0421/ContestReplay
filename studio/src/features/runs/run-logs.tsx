@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type MutableRefObject } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { ArrowDown, Check, Clipboard, FileTerminal, RotateCw } from 'lucide-react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
@@ -12,6 +12,11 @@ import { SPRING_INDICATOR } from '@/design-system/motion';
 
 type LogStream = 'stdout' | 'stderr';
 const STREAMS: readonly LogStream[] = ['stdout', 'stderr'];
+
+interface StreamActionsHandle {
+  getContent: () => string;
+  drain: () => void;
+}
 
 function useIncrementalLog(runId: string, stream: LogStream, active: boolean) {
   const [offset, setOffset] = useState(0);
@@ -31,16 +36,20 @@ function useIncrementalLog(runId: string, stream: LogStream, active: boolean) {
     },
     refetchInterval: active || draining ? 1_000 : false,
   });
+  const refetchRef = useRef(query.refetch);
+  refetchRef.current = query.refetch;
+
   useEffect(() => {
     if (prevActive.current && !active) {
       requiredGen.current = fetchCounter.current + 1;
       setDraining(true);
-      void query.refetch();
+      void refetchRef.current();
     } else if (!prevActive.current && active) {
       setDraining(true);
     }
     prevActive.current = active;
-  }, [active, query.refetch]);
+  }, [active]);
+
   useEffect(() => {
     const data = query.data;
     if (!data) return;
@@ -62,15 +71,20 @@ function useIncrementalLog(runId: string, stream: LogStream, active: boolean) {
       setDraining(false);
     }
   }, [query.data, offset, draining, active, runId, stream]);
+
+  const drain = useCallback(() => {
+    requiredGen.current = fetchCounter.current + 1;
+    setDraining(true);
+    void refetchRef.current();
+  }, []);
+
   return {
-    ...query,
+    isLoading: query.isLoading,
+    isError: query.isError,
+    error: query.error,
     content,
     totalBytes,
-    drain: () => {
-      requiredGen.current = fetchCounter.current + 1;
-      setDraining(true);
-      void query.refetch();
-    },
+    drain,
   };
 }
 
@@ -80,28 +94,40 @@ function LogStreamBody({
   running,
   follow,
   onFollowChange,
-  onRegisterActions,
+  actionsRef,
+  onHasContentChange,
 }: {
   runId: string;
   stream: LogStream;
   running: boolean;
   follow: boolean;
   onFollowChange: (next: boolean) => void;
-  onRegisterActions: (actions: { content: string; drain: () => void }) => void;
+  actionsRef: MutableRefObject<StreamActionsHandle>;
+  onHasContentChange: (hasContent: boolean) => void;
 }) {
   const logRef = useRef<HTMLPreElement>(null);
   const logs = useIncrementalLog(runId, stream, running);
-  const content = logs.content;
+  const contentRef = useRef(logs.content);
+  contentRef.current = logs.content;
 
+  // Register imperative actions in a ref so parent NEVER re-renders on every child render.
   useEffect(() => {
-    onRegisterActions({ content, drain: logs.drain });
-  }, [content, logs.drain, onRegisterActions]);
+    actionsRef.current = {
+      getContent: () => contentRef.current,
+      drain: logs.drain,
+    };
+  }, [actionsRef, logs.drain]);
+
+  const hasContent = logs.content.length > 0;
+  useEffect(() => {
+    onHasContentChange(hasContent);
+  }, [hasContent, onHasContentChange]);
 
   useEffect(() => {
     if (follow && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
-  }, [content, stream, follow]);
+  }, [logs.content, stream, follow]);
 
-  const lines = content ? content.split('\n').length : 0;
+  const lines = logs.content ? logs.content.split('\n').length : 0;
 
   return (
     <div
@@ -118,7 +144,7 @@ function LogStreamBody({
           }}
           className="log-view scrollbar-thin h-[min(64vh,720px)] min-h-[360px] overflow-auto whitespace-pre p-5 font-mono text-xs leading-[1.75] text-[#c4c5c1]"
         >
-          {content || (logs.isLoading ? '正在读取日志…' : logs.isError ? `读取失败：${(logs.error as Error).message}` : `暂无 ${stream} 输出。`)}
+          {logs.content || (logs.isLoading ? '正在读取日志…' : logs.isError ? `读取失败：${(logs.error as Error).message}` : `暂无 ${stream} 输出。`)}
         </pre>
         <div className="pointer-events-none absolute inset-x-0 top-0 h-4 bg-gradient-to-b from-[#141516] to-transparent" />
       </div>
@@ -137,13 +163,16 @@ export function RunLogs({ runId, running }: { runId: string; running: boolean })
   const [stream, setStream] = useState<LogStream>('stdout');
   const [follow, setFollow] = useState(true);
   const [copied, setCopied] = useState(false);
-  const [actions, setActions] = useState<{ content: string; drain: () => void }>({ content: '', drain: () => {} });
+  const [hasContent, setHasContent] = useState(false);
+  const actionsRef = useRef<StreamActionsHandle>({ getContent: () => '', drain: () => {} });
   const tabRefs = useRef<Map<LogStream, HTMLButtonElement>>(new Map());
   const reduced = useReducedMotion();
 
   const copy = async () => {
+    const content = actionsRef.current.getContent();
+    if (!content) return;
     try {
-      await navigator.clipboard.writeText(actions.content);
+      await navigator.clipboard.writeText(content);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
     } catch {
@@ -210,10 +239,10 @@ export function RunLogs({ runId, running }: { runId: string; running: boolean })
           <Button variant="ghost" size="sm" className="text-white/50 hover:bg-white/10 hover:text-white" onClick={() => setFollow(value => !value)}>
             <ArrowDown className={cn('size-3.5 transition-colors', follow && 'text-[#f0f0eb]')} />{follow ? '跟随中' : '跟随'}
           </Button>
-          <Button variant="ghost" size="sm" className="text-white/50 hover:bg-white/10 hover:text-white" onClick={() => actions.drain()}>
+          <Button variant="ghost" size="sm" className="text-white/50 hover:bg-white/10 hover:text-white" onClick={() => actionsRef.current.drain()}>
             <RotateCw className="size-3.5" />刷新
           </Button>
-          <Button variant="ghost" size="sm" className="text-white/50 hover:bg-white/10 hover:text-white" disabled={!actions.content} onClick={() => void copy()}>
+          <Button variant="ghost" size="sm" className="text-white/50 hover:bg-white/10 hover:text-white" disabled={!hasContent} onClick={() => void copy()}>
             <AnimatePresence mode="wait" initial={false}>
               <motion.span key={copied ? 'check' : 'copy'} initial={{ opacity: 0, scale: .7 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: .7 }}>
                 {copied ? <Check className="size-3.5" /> : <Clipboard className="size-3.5" />}
@@ -232,7 +261,8 @@ export function RunLogs({ runId, running }: { runId: string; running: boolean })
         running={running}
         follow={follow}
         onFollowChange={setFollow}
-        onRegisterActions={setActions}
+        actionsRef={actionsRef}
+        onHasContentChange={setHasContent}
       />
     </Card>
   );

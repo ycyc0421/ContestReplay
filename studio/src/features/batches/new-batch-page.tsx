@@ -203,8 +203,16 @@ export function NewBatchPage() {
     let legacyPending: { kind: 'agent' | 'contest'; path: string } | null = null;
     if (legacyRaw) {
       try {
-        const parsed = JSON.parse(legacyRaw) as { kind: 'agent' | 'contest'; path: string };
-        if (parsed?.path) legacyPending = parsed;
+        const parsed = JSON.parse(legacyRaw) as { kind?: unknown; path?: unknown };
+        if (
+          (parsed?.kind === 'agent' || parsed?.kind === 'contest') &&
+          typeof parsed.path === 'string' &&
+          parsed.path.trim().length > 0
+        ) {
+          legacyPending = { kind: parsed.kind, path: parsed.path };
+        } else {
+          sessionStorage.removeItem('cr.batch.pending');
+        }
       } catch {
         sessionStorage.removeItem('cr.batch.pending');
       }
@@ -424,6 +432,7 @@ export function NewBatchPage() {
               </Field>
               <SegmentedTabs
                 id="batch-matrix-view"
+                panelIdPrefix="batch-matrix-panel"
                 size="sm"
                 value={composer.view}
                 onValueChange={view => dispatch({ type: 'SET_VIEW', view })}
@@ -436,7 +445,7 @@ export function NewBatchPage() {
           </div>
           {!selectedCells.size && !compatibleKeys.length && matrix.isLoading
             ? <div className="p-12 text-center text-xs text-muted-foreground">正在校验矩阵兼容性…</div>
-            : <AnimatedPanel panelKey={composer.view}>
+            : <AnimatedPanel panelKey={composer.view} role="tabpanel" id={`batch-matrix-panel-${composer.view}`} ariaLabelledBy={`batch-matrix-view-tab-${composer.view}`}>
                 {composer.view === 'matrix' ? (
                   <div className="scrollbar-thin overflow-auto p-4 sm:p-6">
                     <table className="mx-auto w-auto min-w-[560px] border-collapse text-left">

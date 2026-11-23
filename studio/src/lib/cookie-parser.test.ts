@@ -56,27 +56,42 @@ describe('parseOjCookieInput', () => {
     expect(badRes.normalizedHeader).toBe('');
     expect(badRes.keys).toEqual([]);
     expect(badRes.warnings[0]).toMatch(/不一致/);
+
+    // --referer pointing to codeforces.com MUST NOT disguise a request sent to evil.example.com
+    const refererSpoof = `curl --referer 'https://codeforces.com/' 'https://evil.example.com/steal' -H 'Cookie: JSESSIONID=stolen'`;
+    const spoofRes = parseOjCookieInput(refererSpoof, 'codeforces', undefined, fixedNow)!;
+    expect(spoofRes.originStatus).toBe('mismatched');
+    expect(spoofRes.normalizedHeader).toBe('');
+
+    // Multiple distinct request URLs are rejected as ambiguous
+    const multiUrl = `curl 'https://codeforces.com/' 'https://evil.example.com/' -H 'Cookie: JSESSIONID=abc'`;
+    const multiRes = parseOjCookieInput(multiUrl, 'codeforces', undefined, fixedNow)!;
+    expect(multiRes.originStatus).toBe('mismatched');
+    expect(multiRes.normalizedHeader).toBe('');
   });
 
-  it('marks bare Cookie header as unknown origin and rejects CRLF / semicolon injection in values', () => {
-    const res = parseOjCookieInput('Cookie: JSESSIONID=vj_99; foo=bar', 'vjudge', undefined, fixedNow)!;
+  it('marks bare Cookie header as unknown origin and enforces strict RFC 6265 cookie-value grammar', () => {
+    const res = parseOjCookieInput('Cookie: JSESSIONID="vj_99"; foo=bar', 'vjudge', undefined, fixedNow)!;
     expect(res.format).toBe('header');
     expect(res.originStatus).toBe('unknown');
-    expect(res.normalizedHeader).toBe('JSESSIONID=vj_99; foo=bar');
+    expect(res.normalizedHeader).toBe('JSESSIONID="vj_99"; foo=bar');
 
     // Multiline raw header must be rejected rather than converting newlines into `;`
     const multiline = parseOjCookieInput('JSESSIONID=a\nfoo=b', 'codeforces', undefined, fixedNow)!;
     expect(multiline.normalizedHeader).toBe('');
     expect(multiline.rejectedCount).toBe(1);
 
-    // JSON cookie with `;` inside value or invalid name must be rejected as a unit
+    // RFC 6265 rejects spaces, commas, semicolons, backslashes, and non-ASCII bytes in cookie values
     const injectedJson = JSON.stringify([
       { name: 'bad name', value: 'ok', domain: '.codeforces.com', hostOnly: false },
       { name: 'JSESSIONID', value: 'val; injected=1', domain: '.codeforces.com', hostOnly: false },
+      { name: 'SPACE', value: 'has space', domain: '.codeforces.com', hostOnly: false },
+      { name: 'COMMA', value: 'a,b', domain: '.codeforces.com', hostOnly: false },
+      { name: 'NONASCII', value: '中文值', domain: '.codeforces.com', hostOnly: false },
       { name: '39ce7', value: 'clean', domain: '.codeforces.com', hostOnly: false },
     ]);
     const jsonRes = parseOjCookieInput(injectedJson, 'codeforces', undefined, fixedNow)!;
     expect(jsonRes.keys).toEqual(['39ce7']);
-    expect(jsonRes.rejectedCount).toBe(2);
+    expect(jsonRes.rejectedCount).toBe(5);
   });
 });

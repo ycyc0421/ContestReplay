@@ -2398,6 +2398,18 @@ test('Studio v3 API: probeOjAccountSession and POST /api/oj-accounts/probe detec
   assert.equal(cfRes.origin, 'https://codeforces.com');
   assert.equal(cfOk.calls.length, 1);
 
+  // 1b. Codeforces page where account menu has no profile link MUST NOT climb into enclosing page wrapper and grab a public author
+  const cfNoSelfProfile = mkFetch(
+    200,
+    '<html><body><div class="page-wrapper"><div class="blog"><a href="/profile/public_author">public_author</a></div><div class="lang-chooser"><a href="/1234/logout">Logout</a></div></div></body></html>',
+  );
+  const cfNoSelfRes = await probeOjAccountSession(
+    { platform: 'codeforces', secret: 'JSESSIONID=cf-secret-token-123' },
+    { fetchImpl: cfNoSelfProfile.fn },
+  );
+  assert.equal(cfNoSelfRes.authenticated, true);
+  assert.equal(cfNoSelfRes.detected_handle, undefined);
+
   // 2. QOJ skips malformed percent-encoded profile links cleanly and scopes to account navbar around /logout
   const qojOk = mkFetch(
     200,

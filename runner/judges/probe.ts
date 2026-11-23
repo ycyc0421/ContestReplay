@@ -87,33 +87,45 @@ function buildParentMap(root: HtmlNode): Map<HtmlNode, HtmlNode> {
   return parents;
 }
 
+const CF_ACCOUNT_CONTAINER_RE = /(?:^|[\s_-])(?:lang-chooser|user-box|account|header-account|user-menu)(?:$|[\s_-])/i;
+const QOJ_ACCOUNT_CONTAINER_RE = /(?:^|[\s_-])(?:nav|navbar|dropdown|account|user-menu|user-nav)(?:$|[\s_-])/i;
+
 /**
- * Finds the narrowest ancestor container around the authenticated `/logout` link
- * (e.g., Codeforces `.lang-chooser` / header or QOJ navbar account dropdown)
- * so public author/submission profile links elsewhere in the page are never misread.
+ * Finds ONLY recognized account containers around the authenticated `/logout` link
+ * (never climbing into generic page wrappers that could include public author links).
  */
 function findAccountContainers(
   root: HtmlNode,
   isLogoutLink: (el: HtmlNode) => boolean,
-): HtmlNode[] {
+  isRecognizedAncestor: (el: HtmlNode) => boolean,
+): { hasLogout: boolean; containers: HtmlNode[] } {
   const parents = buildParentMap(root);
   const allNodes = walkHtml(root);
   const logoutNodes = allNodes.filter(node => node.tagName === 'a' && isLogoutLink(node));
-  if (!logoutNodes.length) return [];
+  if (!logoutNodes.length) return { hasLogout: false, containers: [] };
 
   const containers: HtmlNode[] = [];
   for (const logoutLink of logoutNodes) {
-    let cur = parents.get(logoutLink);
-    let depth = 0;
-    while (cur && depth < 3) {
-      if (cur.tagName && !['html', 'body', 'main'].includes(cur.tagName)) {
-        containers.push(cur);
-      }
-      cur = parents.get(cur);
-      depth += 1;
+    const directParent = parents.get(logoutLink);
+    if (!directParent || !directParent.tagName || ['html', 'body', 'main'].includes(directParent.tagName)) continue;
+    containers.push(directParent);
+    const grandParent = parents.get(directParent);
+    if (
+      grandParent &&
+      grandParent.tagName &&
+      !['html', 'body', 'main'].includes(grandParent.tagName) &&
+      isRecognizedAncestor(grandParent)
+    ) {
+      containers.push(grandParent);
     }
   }
-  return containers;
+  return { hasLogout: true, containers };
+}
+
+function matchesContainerMarker(el: HtmlNode, re: RegExp): boolean {
+  const cls = htmlAttr(el, 'class') ?? '';
+  const id = htmlAttr(el, 'id') ?? '';
+  return re.test(cls) || re.test(id);
 }
 
 function detectCodeforcesHandle(html: string, baseUrl: string): { authenticated: boolean; handle?: string } {
@@ -134,13 +146,17 @@ function detectCodeforcesHandle(html: string, baseUrl: string): { authenticated:
     }
   };
 
-  const containers = findAccountContainers(doc, el => {
-    const resolved = resolveLink(el);
-    return Boolean(resolved && resolved.pathname.includes(logoutSuffix));
-  });
-  if (!containers.length) return { authenticated: false };
+  const { hasLogout, containers } = findAccountContainers(
+    doc,
+    el => {
+      const resolved = resolveLink(el);
+      return Boolean(resolved && resolved.pathname.includes(logoutSuffix));
+    },
+    el => matchesContainerMarker(el, CF_ACCOUNT_CONTAINER_RE),
+  );
+  if (!hasLogout) return { authenticated: false };
 
-  // Inspect narrowest container first; accept handle only when unambiguously unique in that container.
+  // Inspect narrowest recognized account container first; accept handle only when unambiguously unique.
   for (const container of containers) {
     const handles = new Set<string>();
     for (const el of walkHtml(container)) {
@@ -189,11 +205,15 @@ function detectQojHandle(html: string, baseUrl: string): { authenticated: boolea
     }
   };
 
-  const containers = findAccountContainers(doc, el => {
-    const resolved = resolveLink(el);
-    return Boolean(resolved && /\/logout(?:\/|$|\?)/.test(resolved.pathname));
-  });
-  if (!containers.length) return { authenticated: false };
+  const { hasLogout, containers } = findAccountContainers(
+    doc,
+    el => {
+      const resolved = resolveLink(el);
+      return Boolean(resolved && /\/logout(?:\/|$|\?)/.test(resolved.pathname));
+    },
+    el => el.tagName === 'nav' || el.tagName === 'ul' || matchesContainerMarker(el, QOJ_ACCOUNT_CONTAINER_RE),
+  );
+  if (!hasLogout) return { authenticated: false };
 
   for (const container of containers) {
     const handles = new Set<string>();
